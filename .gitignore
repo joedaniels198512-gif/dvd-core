@@ -9,6 +9,9 @@
 # safety net in case that tree is ever flattened into this repo.
 # ===========================================================================
 
+# --- CI artifacts downloaded locally (gh run download) ---
+.ci-artifacts/
+
 # --- OS / editor cruft ---
 .DS_Store
 *~
