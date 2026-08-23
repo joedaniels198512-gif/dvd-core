@@ -10,16 +10,25 @@ on:
 jobs:
   compile:
     runs-on: ubuntu-latest
-    # Community Quartus image; the 17.0 tag is v17.0.2.602, matching the
-    # local quartus-mister-rosetta toolchain (MiSTer requires 17.0.x).
-    container: raetro/quartus:17.0
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # The Quartus image is ~15 GB unpacked and does not fit in the default
+      # runner free space, so drop the large preinstalled toolchains first.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h /
+
       - name: Compile DVD core (full Quartus flow)
-        working-directory: fpga
-        run: quartus_sh --flow compile DVD.qpf
+        # Community Quartus image; the 17.0 tag is v17.0.2.602, matching the
+        # local quartus-mister-rosetta toolchain (MiSTer requires 17.0.x).
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE/fpga:/build" -w /build \
+            raetro/quartus:17.0 quartus_sh --flow compile DVD.qpf
 
       - name: Upload DVD.rbf
         uses: actions/upload-artifact@v4
