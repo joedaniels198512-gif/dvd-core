@@ -1,0 +1,40 @@
+---
+description: Critical SuperStation One / MiSTer hardware, toolchain, and architecture constraints for the DVD player core
+alwaysApply: true
+---
+
+# SS1 / MiSTer DVD Core — Non-negotiable Constraints
+
+Target: **SuperStation One (SS1) / MiSTer**. CPU: dual-core ARM **Cortex-A9,
+ARMv7-A, NEON + VFPv3** (⚠️ **no VFPv4 / no fused multiply-add**).
+
+## Toolchain
+
+- ✅ Use `arm-unknown-linux-gnueabihf-gcc`.
+- ❌ **NEVER** use `armv7-unknown-linux-gnueabihf-gcc`. Its runtime emitted VFPv4
+  `VFMA`/`VFMS` instructions → **SIGILL** on the Cortex-A9. This is proven.
+- Compile flags: `-march=armv7-a -mcpu=cortex-a9 -marm -mfpu=neon-vfpv3 -mfloat-abi=hard`.
+- Keep the `objdump` no-VFPv4 gate in `player/build_mac.sh`
+  (`vfma|vfms|vfnma|vfnms` ⇒ refuse to deploy).
+
+## Architecture
+
+- ARM **decodes at native DVD resolution** (720×576 PAL / 720×480 NTSC) and does
+  YUV→BGR0 (~3.5 ms/frame). It must **NOT** do final display scaling
+  (CPU scale ≈ 104 ms/frame — not viable).
+- **Scaling/output is the FPGA's job** via the MiSTer video framework.
+- Before writing custom framebuffer/scaler RTL, **prefer the existing
+  `MISTER_FB` / ASCAL infrastructure** in `fpga/sys/`.
+
+## Do-not-touch / safety
+
+- Do **not** modify files in `fpga/sys/` (framework; updates overwrite it) unless
+  proven absolutely necessary.
+- Do **not** make destructive changes to known-working player code without
+  preserving it in Git first.
+- Prefer scripts and normal source-file edits over generating source via shell
+  heredocs.
+- Do **not** start a Quartus/FPGA compile unless explicitly asked — it runs under
+  Rosetta (Quartus 17.0.2, image `quartus-mister-rosetta`) and is very slow.
+
+See `docs/ARCHITECTURE.md` for full details and measurements.

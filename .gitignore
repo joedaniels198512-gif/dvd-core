@@ -1,0 +1,45 @@
+# ===========================================================================
+# dvd-core root .gitignore
+#
+# Goal: keep source, scripts, docs, rules and the MiSTer core sources tracked,
+# while ignoring large/regenerable build artifacts and OS/editor cruft.
+#
+# NOTE: fpga/ is currently a clone of the official MiSTer Template and carries
+# its own fpga/.gitignore for Quartus artifacts. The fpga/* entries below are a
+# safety net in case that tree is ever flattened into this repo.
+# ===========================================================================
+
+# --- OS / editor cruft ---
+.DS_Store
+*~
+*.swp
+*.swo
+
+# --- Player: build artifacts (regenerable via player/build_mac.sh) ---
+# The FFmpeg source tree + statically built VFPv3-safe libs live here.
+# They are large and reproducible, so they are not tracked.
+player/.build/
+player/dist/
+
+# --- Player: run logs produced on the SS1 / by test scripts ---
+*.log
+player/**/headless-*.log
+
+# --- FPGA / Quartus generated outputs (safety net; see fpga/.gitignore) ---
+fpga/db/
+fpga/incremental_db/
+fpga/output_files/
+fpga/simulation/
+fpga/greybox_tmp/
+fpga/hps_isw_handoff/
+fpga/hc_output/
+fpga/.qsys_edit/
+fpga/build_id.v
+fpga/jtag.cdf
+fpga/*.sof
+fpga/*.rpt
+fpga/*.summary
+fpga/*.done
+fpga/*.pin
+fpga/*.qws
+fpga/*.jdi

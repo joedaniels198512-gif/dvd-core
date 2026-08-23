@@ -1,0 +1,34 @@
+{
+  // Tasks that wrap the EXISTING player scripts. They do not change what the
+  // scripts do; they only make them one-click runnable from the editor.
+  // deploy-test.sh calls ./build_mac.sh and uses relative paths, so all tasks
+  // run with cwd = player/.
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Player: Build (ARM cross-compile)",
+      "type": "shell",
+      "command": "./build_mac.sh",
+      "options": {
+        "cwd": "${workspaceFolder}/player"
+      },
+      "problemMatcher": [],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "detail": "Cross-compile dvdplayer_headless for SS1 (arm-unknown-linux-gnueabihf, VFPv3). Enforces the no-VFPv4 gate."
+    },
+    {
+      "label": "Player: Deploy + Run on SS1",
+      "type": "shell",
+      "command": "./deploy-test.sh",
+      "options": {
+        "cwd": "${workspaceFolder}/player"
+      },
+      "problemMatcher": [],
+      "group": "test",
+      "detail": "Runs build_mac.sh, scp's the binary to the SS1, and runs it against /dev/sr0. Requires SSH access to the SS1."
+    }
+  ]
+}
