@@ -455,6 +455,28 @@ independent of framebuffer geometry).
 
 ---
 
+## 8.6 HARDWARE TEST RESULT (2026-08-24) — core-driven MISTER_FB path PROVEN
+
+The static PoC (tag `working-mister-fb`) was validated on the SS1:
+
+- `DVD.rbf` (built from `fpga/DVD.qpf` at this commit by the GitHub Actions
+  workflow, Quartus 17.0.2, all timing constraints met) was loaded on the SS1.
+- `player/tools/ddr_fb_writer` wrote 720×576 BGR0 colour bars via `/dev/mem`
+  to physical DDR `0x30000000` (after the `/proc/iomem` System-RAM overlap
+  check passed).
+- **The image appeared correctly on HDMI through the MiSTer scaler** — the
+  core's constant `FB_*` outputs (`FB_EN=1`, format `5'b10110`,
+  720×576, stride 2880, base `0x30000000`) programmed ASCAL exactly as
+  analysed in §1/§3, with no Main_MiSTer involvement.
+- The standard core OSD works, including aspect-ratio and TV/video options.
+
+This confirms the full ARM → DDR → ASCAL → HDMI chain end to end. Remaining
+work happens on top of this baseline: double buffering + DDR mailbox (§8.3
+phase 2), NTSC geometry, dynamic aspect ratio, DVD decoder integration, audio,
+and eventually CRT output.
+
+---
+
 ## 9. Summary of conclusions
 
 1. **MISTER_FB/ASCAL is suitable and sufficient** for the HDMI architecture;
