@@ -1,0 +1,39 @@
+name: Build DVD core
+
+on:
+  push:
+    paths:
+      - "fpga/**"
+      - ".github/workflows/build-core.yml"
+  workflow_dispatch:
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    # Community Quartus image; the 17.0 tag is v17.0.2.602, matching the
+    # local quartus-mister-rosetta toolchain (MiSTer requires 17.0.x).
+    container: raetro/quartus:17.0
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compile DVD core (full Quartus flow)
+        working-directory: fpga
+        run: quartus_sh --flow compile DVD.qpf
+
+      - name: Upload DVD.rbf
+        uses: actions/upload-artifact@v4
+        with:
+          name: DVD.rbf
+          path: fpga/output_files/DVD.rbf
+          if-no-files-found: error
+
+      - name: Upload compilation reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quartus-reports
+          path: |
+            fpga/output_files/*.rpt
+            fpga/output_files/*.summary
+          if-no-files-found: ignore
