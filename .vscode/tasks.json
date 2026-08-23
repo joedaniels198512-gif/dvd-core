@@ -64,6 +64,28 @@
       "detail": "Build, scp and run ddr_fb_writer on the SS1. Requires the DVD core (DVD.rbf) to be loaded first."
     },
     {
+      "label": "DVD Frame Test: Build (ARM cross-compile)",
+      "type": "shell",
+      "command": "./build_dvd_frame_test.sh",
+      "options": {
+        "cwd": "${workspaceFolder}/player/tools"
+      },
+      "problemMatcher": [],
+      "group": "build",
+      "detail": "Cross-compile the single-frame DVD -> MISTER_FB test (dvd_frame_test) with the VFPv3-safe toolchain. Requires FFmpeg libs from build_mac.sh."
+    },
+    {
+      "label": "DVD Frame Test: Deploy + Run on SS1",
+      "type": "shell",
+      "command": "./deploy_dvd_frame_test.sh",
+      "options": {
+        "cwd": "${workspaceFolder}/player/tools"
+      },
+      "problemMatcher": [],
+      "group": "test",
+      "detail": "Build, scp and run dvd_frame_test on the SS1. Requires the DVD core loaded and a PAL DVD in /dev/sr0."
+    },
+    {
       "label": "Player: Deploy + Run on SS1",
       "type": "shell",
       "command": "./deploy-test.sh",
