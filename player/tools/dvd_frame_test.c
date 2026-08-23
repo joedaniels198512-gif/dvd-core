@@ -4,9 +4,11 @@
  *
  * Pipeline (one frame only):
  *   /dev/sr0 -> libdvdnav -> custom AVIO -> MPEG-PS demux -> MPEG-2 decode
- *   -> first I-frame -> confirm 720x576 (PAL PoC) -> swscale YUV->BGR0 at
- *   native resolution (NO resizing) -> copy into DDR at 0x30000000
- *   (the framebuffer the DVD core / ASCAL scans out, tag working-mister-fb).
+ *   -> decode normally to frame CAPTURE_FRAME (so all reference frames are
+ *   available and we are past any black fade-in) -> confirm 720x576 (PAL
+ *   PoC) -> swscale YUV->BGR0 at native resolution (NO resizing) -> copy
+ *   into DDR at 0x30000000 (the framebuffer the DVD core / ASCAL scans out,
+ *   tag working-mister-fb).
  *
  * The DVD-side code (DVDIO callback, decoder setup, SAR handling, SIGILL
  * diagnostics) is copied from the proven player/src/dvdplayer_headless.c.
@@ -50,7 +52,11 @@
 #define DVD_SECTOR    2048
 #define AVIO_BUF_SIZE (64 * 1024)
 
-/* Give up if no suitable I-frame appears within this many decoded frames. */
+/* Decode normally and capture this frame (1-based). Frame 1 on many discs
+ * is a black fade-in, which displayed as an all-black screen. */
+#define CAPTURE_FRAME 150
+
+/* Give up if the stream ends before this many decoded frames. */
 #define MAX_DECODED_FRAMES 500
 
 /* Proven MISTER_FB framebuffer geometry (fpga/DVD.sv, tag working-mister-fb). */
@@ -272,6 +278,37 @@ static AVCodecContext *open_video_decoder(AVStream *st)
     return ctx;
 }
 
+/*
+ * Send one parsed packet (or NULL to flush) to the decoder and drain
+ * decoded frames. Returns 1 once the capture-target frame is reached
+ * (the frame is left referenced in *frame), 0 otherwise.
+ */
+static int decode_and_maybe_capture(AVCodecContext *vdec,
+                                    AVPacket *ppkt,
+                                    AVFrame *frame,
+                                    int *decoded,
+                                    int *captured,
+                                    int capture_frame)
+{
+    if (avcodec_send_packet(vdec, ppkt) < 0)
+        return 0;
+
+    while (!*captured &&
+           avcodec_receive_frame(vdec, frame) == 0) {
+
+        (*decoded)++;
+
+        if (*decoded >= capture_frame) {
+            *captured = 1;
+            return 1;               /* keep this frame referenced */
+        }
+
+        av_frame_unref(frame);
+    }
+
+    return 0;
+}
+
 static AVRational frame_sar(AVFrame *frame, AVCodecContext *ctx)
 {
     AVRational sar = frame->sample_aspect_ratio;
@@ -399,7 +436,12 @@ int main(int argc, char **argv)
 
     const char *dvd = argc > 1 ? argv[1] : "/dev/sr0";
 
-    av_log_set_level(AV_LOG_ERROR);
+    /*
+     * Deliberately keep FFmpeg warnings visible for this test: we want to
+     * see whether the "ac-tex damaged" / "MVs not available" / "invalid
+     * cbp" corruption messages disappear with the explicit ES parser.
+     */
+    av_log_set_level(AV_LOG_WARNING);
 
     DVDIO d;
     memset(&d, 0, sizeof(d));
@@ -470,24 +512,31 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "MPEG-PS demuxer opened successfully\n");
 
-    AVPacket *pkt = av_packet_alloc();
+    AVPacket *pkt = av_packet_alloc();   /* demuxed PES payload packets  */
+    AVPacket *ppkt = av_packet_alloc();  /* parser-assembled ES packets  */
     AVFrame *frame = av_frame_alloc();
 
-    if (!pkt || !frame)
+    if (!pkt || !ppkt || !frame)
         return 6;
 
     AVCodecContext *vdec = NULL;
+    AVCodecParserContext *parser = NULL;
 
     int vi = -1;
+
+    unsigned long demux_packets = 0;
+    unsigned long parser_packets = 0;
     int decoded = 0;
-    int have_iframe = 0;
+    int captured = 0;
 
     fprintf(stderr, "\nReading DVD stream...\n"
-                    "Waiting for first MPEG-2 I-frame...\n");
+                    "Routing video payload through the MPEG-2 ES parser,\n"
+                    "capturing frame %d...\n",
+            CAPTURE_FRAME);
 
     stage = 3;
 
-    while (!have_iframe &&
+    while (!captured &&
            decoded < MAX_DECODED_FRAMES &&
            (r = av_read_frame(fmt, pkt)) >= 0) {
 
@@ -514,6 +563,19 @@ int main(int argc, char **argv)
                         return 7;
                     }
 
+                    /*
+                     * Explicit MPEG-2 ES parser: reassembles the PES
+                     * payload chunks into whole access units (one coded
+                     * picture per packet) before they reach the decoder.
+                     */
+                    parser = av_parser_init(AV_CODEC_ID_MPEG2VIDEO);
+
+                    if (!parser) {
+                        fprintf(stderr,
+                                "Could not init MPEG-2 parser\n");
+                        return 7;
+                    }
+
                     break;
                 }
             }
@@ -524,35 +586,112 @@ int main(int argc, char **argv)
             continue;
         }
 
+        demux_packets++;
+
         stage = 5;
 
-        if (avcodec_send_packet(vdec, pkt) < 0) {
-            av_packet_unref(pkt);
-            continue;
+        /*
+         * Feed the entire demuxed payload through the parser. Timestamps
+         * are attached only to the first parse call for this packet; the
+         * parser assigns them to the access unit that starts there.
+         */
+        const uint8_t *in = pkt->data;
+        int in_size = pkt->size;
+
+        int64_t in_pts = pkt->pts;
+        int64_t in_dts = pkt->dts;
+        int64_t in_pos = pkt->pos;
+
+        while (in_size > 0 && !captured) {
+
+            uint8_t *out_data = NULL;
+            int out_size = 0;
+
+            int used = av_parser_parse2(parser, vdec,
+                                        &out_data, &out_size,
+                                        in, in_size,
+                                        in_pts, in_dts, in_pos);
+
+            if (used < 0)
+                break;
+
+            in += used;
+            in_size -= used;
+
+            in_pts = AV_NOPTS_VALUE;
+            in_dts = AV_NOPTS_VALUE;
+            in_pos = -1;
+
+            if (out_size <= 0)
+                continue;
+
+            parser_packets++;
+
+            ppkt->data = out_data;
+            ppkt->size = out_size;
+            ppkt->pts = parser->pts;
+            ppkt->dts = parser->dts;
+
+            decode_and_maybe_capture(vdec, ppkt, frame,
+                                     &decoded, &captured,
+                                     CAPTURE_FRAME);
         }
 
         av_packet_unref(pkt);
-
-        while (avcodec_receive_frame(vdec, frame) == 0) {
-
-            decoded++;
-
-            if (frame->pict_type == AV_PICTURE_TYPE_I) {
-                have_iframe = 1;
-                break;              /* keep this frame referenced */
-            }
-
-            av_frame_unref(frame);
-
-            if (decoded >= MAX_DECODED_FRAMES)
-                break;
-        }
     }
 
-    if (!have_iframe) {
+    /*
+     * EOF (or read error) before the target frame: flush the parser's
+     * buffered access unit, then flush the decoder, so no frame is lost.
+     */
+    if (!captured && vdec && parser) {
+
+        static const uint8_t flush_buf[AV_INPUT_BUFFER_PADDING_SIZE] = {0};
+
+        for (;;) {
+
+            uint8_t *out_data = NULL;
+            int out_size = 0;
+
+            av_parser_parse2(parser, vdec,
+                             &out_data, &out_size,
+                             flush_buf, 0,
+                             AV_NOPTS_VALUE, AV_NOPTS_VALUE, -1);
+
+            if (out_size <= 0)
+                break;
+
+            parser_packets++;
+
+            ppkt->data = out_data;
+            ppkt->size = out_size;
+            ppkt->pts = parser->pts;
+            ppkt->dts = parser->dts;
+
+            if (decode_and_maybe_capture(vdec, ppkt, frame,
+                                         &decoded, &captured,
+                                         CAPTURE_FRAME))
+                break;
+        }
+
+        if (!captured)
+            decode_and_maybe_capture(vdec, NULL, frame,
+                                     &decoded, &captured,
+                                     CAPTURE_FRAME);
+    }
+
+    fprintf(stderr,
+            "\n=== STREAM STATISTICS ===\n"
+            "Demuxed video packets: %lu\n"
+            "Parser output packets: %lu\n"
+            "Decoded frames:        %d\n",
+            demux_packets, parser_packets, decoded);
+
+    if (!captured) {
         fprintf(stderr,
-                "\nFAIL: no I-frame found within %d decoded frames.\n",
-                decoded);
+                "\nFAIL: stream ended after %d decoded frames "
+                "(wanted frame %d).\n",
+                decoded, CAPTURE_FRAME);
         return 9;
     }
 
@@ -565,7 +704,9 @@ int main(int argc, char **argv)
                       ? frame->pts
                       : frame->best_effort_timestamp;
 
-    fprintf(stderr, "\n=== FIRST I-FRAME DECODED ===\n");
+    fprintf(stderr, "\n=== CAPTURED FRAME ===\n");
+    fprintf(stderr, "Frame number:        %d (of %d decoded)\n",
+            CAPTURE_FRAME, decoded);
     fprintf(stderr, "Dimensions:          %dx%d\n",
             frame->width, frame->height);
     fprintf(stderr, "Pixel format:        %s\n",
@@ -582,9 +723,6 @@ int main(int argc, char **argv)
                 pts, tb.num, tb.den, pts * av_q2d(tb));
     else
         fprintf(stderr, "PTS:                 not available\n");
-
-    fprintf(stderr, "Warm-up frames skipped before I-frame: %d\n",
-            decoded - 1);
 
     /* ---- Confirm PAL PoC geometry: must be exactly 720x576 ---- */
 
@@ -633,6 +771,57 @@ int main(int argc, char **argv)
 
     double convert_ms = (double)(t1 - t0) / 1000.0;
 
+    /*
+     * ---- Image statistics of the converted BGR0 frame ----
+     * Establishes whether the source image is already essentially
+     * all-white/black BEFORE it reaches the MISTER_FB buffer.
+     */
+    {
+        unsigned min_r = 255, min_g = 255, min_b = 255;
+        unsigned max_r = 0,   max_g = 0,   max_b = 0;
+
+        uint64_t sum_r = 0, sum_g = 0, sum_b = 0;
+
+        for (int y = 0; y < FB_H; y++) {
+
+            const uint32_t *row =
+                (const uint32_t *)(dst_data[0] +
+                                   (size_t)y * dst_linesize[0]);
+
+            for (int x = 0; x < FB_W; x++) {
+
+                uint32_t v = row[x];
+
+                unsigned pr = (v >> 16) & 0xff;
+                unsigned pg = (v >> 8) & 0xff;
+                unsigned pb = v & 0xff;
+
+                if (pr < min_r) min_r = pr;
+                if (pg < min_g) min_g = pg;
+                if (pb < min_b) min_b = pb;
+
+                if (pr > max_r) max_r = pr;
+                if (pg > max_g) max_g = pg;
+                if (pb > max_b) max_b = pb;
+
+                sum_r += pr;
+                sum_g += pg;
+                sum_b += pb;
+            }
+        }
+
+        double n = (double)FB_W * (double)FB_H;
+
+        fprintf(stderr,
+                "\n=== CONVERTED IMAGE STATISTICS (BGR0) ===\n"
+                "R: min %3u  max %3u  avg %6.1f\n"
+                "G: min %3u  max %3u  avg %6.1f\n"
+                "B: min %3u  max %3u  avg %6.1f\n",
+                min_r, max_r, (double)sum_r / n,
+                min_g, max_g, (double)sum_g / n,
+                min_b, max_b, (double)sum_b / n);
+    }
+
     /* ---- Map the proven MISTER_FB DDR buffer and copy the frame ---- */
 
     int mem_fd = -1;
@@ -680,6 +869,8 @@ int main(int argc, char **argv)
 
     av_frame_free(&frame);
     av_packet_free(&pkt);
+    av_packet_free(&ppkt);
+    av_parser_close(parser);
     avcodec_free_context(&vdec);
     avformat_close_input(&fmt);
     avio_context_free(&avio);
