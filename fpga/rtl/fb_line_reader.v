@@ -1,7 +1,7 @@
-// Stage A: ping-pong line reader for native 480i CRT.
-// Source is a static 720x576 BGR0 framebuffer at 0x30000000, stride 2880.
-// CRT uses source lines 0..479 only (src_y = vc*2 + field).
-// Raster counters are inputs; this module must never stall them.
+// Ping-pong line reader for native 480i CRT.
+// Source is 720x576 BGR0, stride 2880. CRT uses lines 0..479
+// (src_y = vc*2 + field). Raster counters are inputs; never stall them.
+// crt_buf snapshots act_buf once per complete CRT frame (field 1 -> 0).
 
 module fb_line_reader
 (
@@ -11,6 +11,8 @@ module fb_line_reader
 	input  [9:0]  hc,
 	input  [9:0]  vc,
 	input         field,
+	input         ce_pix,
+	input         act_buf,
 
 	input         mb_idle,
 	output        vid_req,
@@ -28,9 +30,11 @@ module fb_line_reader
 );
 
 localparam [28:0] FB_A_ADDR   = 29'h0600_0000; // 0x30000000 >> 3
+localparam [28:0] FB_B_ADDR   = 29'h0604_0000; // 0x30200000 >> 3
 localparam [8:0]  BEATS_LINE  = 9'd360;        // 720 pixels * 4 / 8
 localparam [7:0]  BURST_BEATS = 8'd120;        // 3 bursts per line
 localparam [9:0]  H_ACTIVE    = 10'd720;
+localparam [9:0]  H_LAST      = 10'd857;        // matches mycore wrap; not a raster
 localparam [9:0]  V_ACTIVE    = 10'd240;
 
 localparam [1:0]  ST_IDLE  = 2'd0;
@@ -90,7 +94,19 @@ assign ddr_rd     = ddr_rd_r;
 assign ddr_addr   = line_base + {20'd0, beats_got};
 assign ddr_burstcnt = BURST_BEATS;
 
-wire [28:0] cand_base = FB_A_ADDR + y_cand * 29'd360;
+// Snapshot act_buf before field-1 last active line, where y_cand becomes
+// source line 0 of field 0. Display of line 479 is already in the ping-pong
+// RAM; only subsequent fills (field 0 line 0 onward) use the new base.
+reg         crt_buf;
+wire [28:0] fb_base   = crt_buf ? FB_B_ADDR : FB_A_ADDR;
+wire [28:0] cand_base = fb_base + y_cand * 29'd360;
+
+always @(posedge clk) begin
+	if (reset)
+		crt_buf <= 1'b0;
+	else if (ce_pix && field && (vc == (V_ACTIVE - 10'd2)) && (hc == H_LAST))
+		crt_buf <= act_buf;
+end
 
 always @(posedge clk) begin
 	ddr_rd_r <= 1'b0;

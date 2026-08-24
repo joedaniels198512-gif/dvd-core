@@ -57,8 +57,9 @@ assign BUTTONS = 0;
 // Logical controller state is published separately at 0x30400008
 // (never written to 0x30400000).
 //
-// Stage A CRT scanout reads buffer A (0x30000000) only. It does not
-// follow act_buf. HDMI MISTER_FB still uses FB_BASE / act_buf.
+// CRT scanout snapshots act_buf into crt_buf at the end of field 1's
+// second-to-last active line, before the reader prefetches field-0
+// source line 0. HDMI MISTER_FB still uses live FB_BASE / act_buf.
 //
 assign FB_EN          = 1;
 assign FB_FORMAT      = 5'b10110;      // 32bpp, BGR byte order (XRGB8888/BGR0)
@@ -291,6 +292,8 @@ fb_line_reader fb_line_reader
 	.hc(hc),
 	.vc(vc),
 	.field(field),
+	.ce_pix(ce_pix),
+	.act_buf(act_buf),
 
 	.mb_idle(mb_st == 3'd0),
 	.vid_req(vid_req),
