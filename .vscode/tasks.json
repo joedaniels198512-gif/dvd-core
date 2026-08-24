@@ -240,6 +240,17 @@
       "detail": "Build, scp and run dvd_av_threaded_test on the SS1. Load mailbox DVD.rbf, leave OSD Buffer on A."
     },
     {
+      "label": "DVD Input Test: Build (ARM cross-compile)",
+      "type": "shell",
+      "command": "./build_dvd_input_test.sh",
+      "options": {
+        "cwd": "${workspaceFolder}/player/tools"
+      },
+      "problemMatcher": [],
+      "group": "build",
+      "detail": "Cross-compile dvd_input_test: poll 0x30400008 logical pad edges. Requires controller-bridge DVD.rbf. Does not deploy."
+    },
+    {
       "label": "Player: Deploy + Run on SS1",
       "type": "shell",
       "command": "./deploy-test.sh",

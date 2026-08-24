@@ -55,6 +55,8 @@ assign BUTTONS = 0;
 // 20 MHz clk_sys). mb_bit always holds the latest observed request.
 // On rising FB_VBL, act_buf <= mb_bit | status[8] so FB_BASE changes
 // only at the safe edge. OSD Buffer B still forces B.
+// Logical controller state is published separately at 0x30400008
+// (never written to 0x30400000).
 //
 assign FB_EN          = 1;
 assign FB_FORMAT      = 5'b10110;      // 32bpp, BGR byte order (XRGB8888/BGR0)
@@ -97,7 +99,10 @@ localparam CONF_STR = {
 	"-;",
 	"T[0],Reset;",
 	"R[0],Reset and close OSD;",
-	"v,0;", // [optional] config version 0-99. 
+	// D-pad is implicit: joystick_0[0]=Right [1]=Left [2]=Down [3]=Up.
+	// Named buttons occupy bits 4-9. Do not map OSD/Home (buttons[0]).
+	"J1,Select,Back,Play/Pause,DVD Menu,Previous Chapter,Next Chapter;",
+	"v,0;", // [optional] config version 0-99.
 	        // If CONF_STR options are changed in incompatible way, then change version number too,
 			  // so all options will get default values on first start.
 	"V,v",`BUILD_DATE 
@@ -107,6 +112,7 @@ wire forced_scandoubler;
 wire   [1:0] buttons;
 wire [127:0] status;
 wire  [10:0] ps2_key;
+wire [31:0] joystick_0;
 
 hps_io #(.CONF_STR(CONF_STR)) hps_io
 (
@@ -120,7 +126,8 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 	.buttons(buttons),
 	.status(status),
 	.status_menumask({status[5]}),
-	
+	.joystick_0(joystick_0),
+
 	.ps2_key(ps2_key)
 );
 
@@ -136,21 +143,33 @@ pll pll
 
 // Mailbox at physical 0x30400000. DDRAM_ADDR is byte_addr[31:3].
 // Poll ~0.82 ms (16384 * 50 ns). Publish FB_BASE only on rising FB_VBL.
-localparam [28:0] MB_ADDR   = 29'h0608_0000;
-localparam [13:0] POLL_MAX  = 14'd16383;
+// 0x30400000 bit0 = ARM→FPGA FB A/B request (never RMW / never FPGA-write).
+// 0x30400008       = FPGA→ARM {JOY_MAGIC, joystick_0}.
+// One mailbox-read opportunity is latched every poll tick (poll_due) and
+// always taken from idle before any controller write.
+localparam [28:0] MB_ADDR    = 29'h0608_0000; // 0x30400000
+localparam [28:0] JOY_ADDR   = 29'h0608_0001; // 0x30400008
+localparam [13:0] POLL_MAX   = 14'd16383;
+localparam [31:0] JOY_MAGIC  = 32'h44564431;  // "DVD1"
+localparam [9:0]  JOY_HB_MAX = 10'd1023;      // heartbeat ~0.84 s
 
 reg        mb_rd  = 0;
+reg        mb_we  = 0;
 reg        mb_bit = 0;
 reg        act_buf = 0;
-reg  [1:0] mb_st  = 0; // 0 idle, 1 issue, 2 wait data
+reg  [2:0] mb_st  = 0; // 0 idle, 1 issue rd, 2 wait rd, 3 issue wr, 4 wr hold
 reg [13:0] poll_cnt = 0;
+reg        poll_due = 0;
+reg        joy_pending = 1'b1;
+reg [31:0] joy_sent = 32'hffff_ffff;
+reg  [9:0] joy_hb = 0;
 
 assign DDRAM_CLK      = clk_sys;
 assign DDRAM_BURSTCNT = 8'd1;
-assign DDRAM_ADDR     = MB_ADDR;
-assign DDRAM_DIN      = 64'd0;
+assign DDRAM_ADDR     = (mb_st == 3'd3 || mb_st == 3'd4) ? JOY_ADDR : MB_ADDR;
+assign DDRAM_DIN      = {JOY_MAGIC, joystick_0};
 assign DDRAM_BE       = 8'hFF;
-assign DDRAM_WE       = 1'b0;
+assign DDRAM_WE       = mb_we;
 assign DDRAM_RD       = mb_rd;
 
 always @(posedge clk_sys) begin
@@ -160,24 +179,49 @@ always @(posedge clk_sys) begin
 	vbl_d3 <= vbl_d2;
 
 	mb_rd <= 0;
+	mb_we <= 0;
 	poll_cnt <= poll_cnt + 1'd1;
+
+	if (poll_cnt == POLL_MAX)
+		poll_due <= 1'b1;
 
 	if (vbl_d2 & ~vbl_d3)
 		act_buf <= mb_bit | status[8];
 
 	case (mb_st)
-		0: if (poll_cnt == POLL_MAX)
-				mb_st <= 1;
+		0: if (poll_due) begin
+				poll_due <= 1'b0;
+				joy_hb <= joy_hb + 1'd1;
+				if (joy_hb == JOY_HB_MAX) begin
+					joy_hb <= 10'd0;
+					joy_pending <= 1'b1;
+				end
+				mb_st <= 3'd1;
+			end else if (joy_pending) begin
+				mb_st <= 3'd3;
+			end
 		1: if (!DDRAM_BUSY) begin
 				mb_rd <= 1;
-				mb_st <= 2;
+				mb_st <= 3'd2;
 			end
 		2: if (DDRAM_DOUT_READY) begin
 				mb_bit <= DDRAM_DOUT[0];
-				mb_st  <= 0;
+				mb_st  <= 3'd0;
 			end
-		default: mb_st <= 0;
+		3: if (!DDRAM_BUSY) begin
+				mb_we <= 1;
+				mb_st <= 3'd4;
+			end
+		4: begin
+				joy_sent <= joystick_0;
+				joy_pending <= 1'b0;
+				mb_st <= 3'd0;
+			end
+		default: mb_st <= 3'd0;
 	endcase
+
+	if (joystick_0 != joy_sent)
+		joy_pending <= 1'b1;
 end
 
 assign FB_BASE = act_buf ? 32'h3020_0000 : 32'h3000_0000;
