@@ -85,6 +85,34 @@ reg  [7:0] cos_out;
 wire [5:0] cos_g = cos_out[7:3]+6'd32;
 cos cos(vvc + {vc>>scandouble, 2'b00}, cos_out);
 
-assign video = (cos_g >= rnd_c) ? {cos_g - rnd_c, 2'b00} : 8'd0;
+// Static monochrome test card for the analogue VGA_* path.
+// LFSR/cos remain instantiated (unused) so timing counters stay untouched.
+wire [9:0] vact = pal ? (scandouble ? 10'd601 : 10'd300)
+                      : (scandouble ? 10'd480 : 10'd240);
+
+wire border = (hc < 10'd8) || (hc > 10'd520) ||
+              (vc < 10'd8) || (vc > (vact - 10'd9));
+
+wire [9:0] mid_h = 10'd264;
+wire [9:0] mid_v = vact >> 1;
+wire cross = ((hc >= (mid_h - 10'd1)) && (hc <= (mid_h + 10'd1))) ||
+             ((vc >= (mid_v - 10'd1)) && (vc <= (mid_v + 10'd1)));
+
+wire [7:0] bars =
+	(hc < 10'd66)  ? 8'h00 :
+	(hc < 10'd132) ? 8'h24 :
+	(hc < 10'd198) ? 8'h48 :
+	(hc < 10'd264) ? 8'h6C :
+	(hc < 10'd330) ? 8'h90 :
+	(hc < 10'd396) ? 8'hB4 :
+	(hc < 10'd462) ? 8'hD8 :
+	                 8'hFC;
+
+wire lower = (vc >= (vact - (vact >> 2)));
+wire check = hc[4] ^ vc[4];
+
+assign video = (border | cross) ? 8'hFF :
+               lower            ? (check ? 8'hE0 : 8'h20) :
+                                  bars;
 
 endmodule
