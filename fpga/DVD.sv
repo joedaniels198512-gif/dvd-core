@@ -47,18 +47,18 @@ assign LED_DISK = 0;
 assign LED_POWER = 0;
 assign BUTTONS = 0;
 
-/////////////////  Static HPS-shared framebuffer (MISTER_FB)  ////////////////
+/////////////////  HPS-shared framebuffer (MISTER_FB, double-buffered)  /////
 //
-// The ARM writes a native 720x576 BGR0/XRGB8888 image into reserved DDR at
-// 0x30000000 (outside Linux System RAM and outside all framework regions).
-// ASCAL reads and scales it; aspect ratio comes from VIDEO_ARX/ARY (4:3 by
-// default below). Deliberately static: no double buffering or mailbox yet.
+// Two native 720x576 BGR0/XRGB8888 buffers in reserved DDR:
+//   A = 0x30000000   B = 0x30200000
+// status[8] is the requested buffer (OSD: Buffer, A, B). The request is
+// synchronized onto clk_sys and latched into the active buffer only on
+// rising FB_VBL (HDMI vblank from ASCAL). FB_BASE follows the latched bit.
 //
 assign FB_EN          = 1;
 assign FB_FORMAT      = 5'b10110;      // 32bpp, BGR byte order (XRGB8888/BGR0)
 assign FB_WIDTH       = 12'd720;
 assign FB_HEIGHT      = 12'd576;
-assign FB_BASE        = 32'h3000_0000; // core-private reserved DDR
 assign FB_STRIDE      = 14'd2880;      // 720 pixels * 4 bytes
 assign FB_FORCE_BLANK = 0;
 
@@ -74,6 +74,7 @@ localparam CONF_STR = {
 	"DVD;;",
 	"-;",
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
+	"O[8],Buffer,A,B;",
 	"O[2],TV Mode,NTSC,PAL;",
 	"O[4:3],Noise,White,Red,Green,Blue;",
 	"-;",
@@ -131,6 +132,21 @@ pll pll
 	.rst(0),
 	.outclk_0(clk_sys)
 );
+
+// status[8] = requested buffer. Latch only on rising FB_VBL.
+wire req_buf = status[8];
+reg  act_buf = 1'b0;
+
+always @(posedge clk_sys) begin
+	reg vbl_d, vbl_d2, vbl_d3;
+	vbl_d  <= FB_VBL;
+	vbl_d2 <= vbl_d;
+	vbl_d3 <= vbl_d2;
+	if (vbl_d2 & ~vbl_d3)
+		act_buf <= req_buf;
+end
+
+assign FB_BASE = act_buf ? 32'h3020_0000 : 32'h3000_0000;
 
 wire reset = RESET | status[0] | buttons[1];
 
