@@ -86,6 +86,28 @@
       "detail": "Build, scp and run dvd_frame_test on the SS1. Requires the DVD core loaded and a PAL DVD in /dev/sr0."
     },
     {
+      "label": "DVD Video Test: Build (ARM cross-compile)",
+      "type": "shell",
+      "command": "./build_dvd_video_test.sh",
+      "options": {
+        "cwd": "${workspaceFolder}/player/tools"
+      },
+      "problemMatcher": [],
+      "group": "build",
+      "detail": "Cross-compile the continuous-video DVD -> MISTER_FB throughput test (dvd_video_test) with the VFPv3-safe toolchain."
+    },
+    {
+      "label": "DVD Video Test: Deploy + Run on SS1",
+      "type": "shell",
+      "command": "./deploy_dvd_video_test.sh",
+      "options": {
+        "cwd": "${workspaceFolder}/player/tools"
+      },
+      "problemMatcher": [],
+      "group": "test",
+      "detail": "Build, scp and run dvd_video_test on the SS1: 500 frames unpaced through decode -> BGR0 -> DDR. Requires the DVD core loaded and a PAL DVD in /dev/sr0."
+    },
+    {
       "label": "Player: Deploy + Run on SS1",
       "type": "shell",
       "command": "./deploy-test.sh",
