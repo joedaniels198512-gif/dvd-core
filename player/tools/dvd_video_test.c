@@ -1,25 +1,21 @@
 /*
- * dvd_video_test.c — continuous-video throughput test for the complete
- * DVD -> MISTER_FB path, based on the proven dvd_frame_test.c.
+ * dvd_video_test.c — PTS-paced DVD -> MISTER_FB presentation test.
  *
- * Pipeline (500 consecutive frames, UNPACED — as fast as possible):
+ * Pipeline (500 consecutive frames, PTS-paced):
  *   /dev/sr0 -> libdvdnav -> custom AVIO -> MPEG-PS demux
- *   -> explicit MPEG-2 ES parser (required architecture: reassembles PES
- *      payload chunks into whole access units; without it the decoder sees
- *      broken picture boundaries and produces corrupted output)
- *   -> MPEG-2 decode -> swscale YUV->BGR0 at native 720x576 (NO resizing)
- *   -> row copy into DDR at 0x30000000 (the framebuffer the DVD core /
- *      ASCAL scans out, tag working-mister-fb).
+ *   -> explicit MPEG-2 ES parser (required architecture)
+ *   -> MPEG-2 decode -> wait until the frame's PTS on a monotonic clock
+ *   -> swscale YUV->BGR0 at native 720x576 written DIRECTLY into the
+ *      mapped framebuffer at 0x30000000 (stride 2880).
  *
- * Purpose: establish the TRUE maximum end-to-end throughput of the whole
- * working video path before any optimisation. Reports accumulated timings
- * for demux/parse/decode, YUV->BGR0 conversion, DDR write, total wall
- * time, and achieved frames/second.
+ * Playback clock: first genuine DVD PTS anchors a continuous timeline.
+ * Frames without a PTS are given interpolated timestamps at the detected
+ * MPEG-2 frame duration. A later genuine PTS validates that timeline and
+ * may slew it by at most one frame; it does not jump presentation.
+ * 25 fps is used only if neither frame rate nor timestamps are available.
  *
- * Single buffer, no vsync: tearing during the run is expected and fine.
- *
- * Deliberately NOT implemented: pacing, audio, controls, menus, double
- * buffering, NTSC, synchronization, optimisation.
+ * Deliberately NOT implemented: audio, controls, menus, double
+ * buffering, NTSC, vsync page-flip.
  *
  * Requires: DVD core loaded on the SS1 and a PAL DVD in /dev/sr0.
  */
@@ -34,6 +30,7 @@
 #include <libavutil/avutil.h>
 #include <libavutil/cpu.h>
 #include <libavutil/error.h>
+#include <libavutil/mathematics.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/time.h>
@@ -56,6 +53,9 @@
 
 /* Consecutive decoded frames to push through the full path. */
 #define TARGET_FRAMES 500
+
+/* Used only when a decoded frame has no PTS. */
+#define FALLBACK_FPS  25
 
 /* Proven MISTER_FB framebuffer geometry (fpga/DVD.sv, tag working-mister-fb). */
 #define FB_PHYS_BASE  0x30000000UL
@@ -389,7 +389,7 @@ static uint8_t *map_mister_fb(int *fd_out)
 }
 
 /* ------------------------------------------------------------------ */
-/* Per-frame rendering: convert + DDR write, with accumulated timings  */
+/* Per-frame rendering: swscale writes BGR0 directly into mapped DDR   */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
@@ -402,10 +402,189 @@ typedef struct {
     int rendered;
 
     int64_t convert_us;
-    int64_t copy_us;
+    int64_t wait_us;
+
+    /* PTS / frame-rate timeline (stream time_base). */
+    AVRational tb;
+    AVRational avg_frame_rate;
+    AVRational r_frame_rate;
+    AVRational fps;
+
+    int64_t first_genuine_pts;
+    int64_t timeline_pts;
+    int64_t assigned_pts;
+    int64_t origin_us;
+    int64_t last_target_us;
+
+    int genuine_pts_count;
+    int interpolated_count;
+    int fallback_frames;
+    int64_t max_disc_us;
+
+    int64_t first_present_us;
+    int64_t last_present_us;
+    int64_t first_display_pts;
+    int64_t last_display_pts;
+    int64_t first_convert_us;
+    int64_t wait_us_at_first;
+
+    int late_frames;
+    int64_t late_us_sum;
+    int64_t late_us_max;
 
     int fail;                     /* geometry/setup violation           */
 } Render;
+
+static AVRational detect_fps(const Render *rc, const AVCodecContext *vdec)
+{
+    if (vdec && vdec->framerate.num > 0 && vdec->framerate.den > 0)
+        return vdec->framerate;
+
+    if (vdec && vdec->time_base.num > 0 && vdec->time_base.den > 0 &&
+        vdec->ticks_per_frame > 0) {
+        return av_make_q(vdec->time_base.den,
+                         vdec->time_base.num * vdec->ticks_per_frame);
+    }
+
+    if (rc->avg_frame_rate.num > 0 && rc->avg_frame_rate.den > 0)
+        return rc->avg_frame_rate;
+
+    if (rc->r_frame_rate.num > 0 && rc->r_frame_rate.den > 0)
+        return rc->r_frame_rate;
+
+    return (AVRational){0, 0};
+}
+
+static int64_t frame_duration_tb(const Render *rc)
+{
+    if (rc->fps.num > 0 && rc->fps.den > 0 &&
+        rc->tb.num > 0 && rc->tb.den > 0)
+        return av_rescale_q(1, av_inv_q(rc->fps), rc->tb);
+
+    return 0;
+}
+
+static int64_t tb_to_us(const Render *rc, int64_t ticks)
+{
+    return av_rescale_q(ticks, rc->tb, (AVRational){1, 1000000});
+}
+
+/*
+ * Continuous presentation timeline. The first genuine DVD PTS is the
+ * anchor. Missing timestamps are interpolated at the detected frame
+ * duration. A later genuine PTS is compared to that interpolation and
+ * may slew the clock by at most one frame; presentation is not jumped.
+ */
+static void pace_until_pts(Render *rc, const AVFrame *frame,
+                           const AVCodecContext *vdec)
+{
+    AVRational detected = detect_fps(rc, vdec);
+
+    if (detected.num > 0 && detected.den > 0)
+        rc->fps = detected;
+
+    const int64_t genuine =
+        (frame->pts != AV_NOPTS_VALUE) ? frame->pts : AV_NOPTS_VALUE;
+    const int64_t now = av_gettime_relative();
+    const int64_t dur = frame_duration_tb(rc);
+
+    int64_t timeline = AV_NOPTS_VALUE;
+    int64_t target;
+
+    if (genuine != AV_NOPTS_VALUE && rc->tb.num > 0 && rc->tb.den > 0) {
+
+        rc->genuine_pts_count++;
+
+        if (rc->first_genuine_pts == AV_NOPTS_VALUE) {
+
+            rc->first_genuine_pts = genuine;
+            rc->timeline_pts = genuine;
+            rc->origin_us = now;
+            timeline = genuine;
+            target = now;
+
+        } else if (dur > 0) {
+
+            int64_t expected = rc->timeline_pts + dur;
+            int64_t disc = genuine - expected;
+            int64_t disc_us = tb_to_us(rc, disc);
+
+            if (disc_us < 0)
+                disc_us = -disc_us;
+
+            if (disc_us > rc->max_disc_us)
+                rc->max_disc_us = disc_us;
+
+            /* Show this frame on the interpolated clock (no jump). */
+            timeline = expected;
+
+            if (disc > dur)
+                disc = dur;
+            else if (disc < -dur)
+                disc = -dur;
+
+            rc->timeline_pts = expected + disc;
+
+            target = rc->origin_us +
+                     tb_to_us(rc, timeline - rc->first_genuine_pts);
+
+        } else {
+
+            timeline = genuine;
+            rc->timeline_pts = genuine;
+            target = rc->origin_us +
+                     tb_to_us(rc, genuine - rc->first_genuine_pts);
+        }
+
+    } else if (rc->first_genuine_pts != AV_NOPTS_VALUE && dur > 0) {
+
+        rc->interpolated_count++;
+        timeline = rc->timeline_pts + dur;
+        rc->timeline_pts = timeline;
+        target = rc->origin_us +
+                 tb_to_us(rc, timeline - rc->first_genuine_pts);
+
+    } else if (rc->fps.num > 0 && rc->fps.den > 0) {
+
+        rc->interpolated_count++;
+
+        if (rc->last_target_us > 0)
+            target = rc->last_target_us +
+                     av_rescale_q(1, av_inv_q(rc->fps),
+                                  (AVRational){1, 1000000});
+        else
+            target = now;
+
+    } else if (rc->last_target_us > 0) {
+
+        rc->fallback_frames++;
+        target = rc->last_target_us + 1000000 / FALLBACK_FPS;
+
+    } else {
+
+        rc->fallback_frames++;
+        target = now;
+    }
+
+    rc->assigned_pts = timeline;
+    rc->last_target_us = target;
+
+    if (now < target) {
+
+        av_usleep((unsigned)(target - now));
+        rc->wait_us += av_gettime_relative() - now;
+
+    } else if (now > target) {
+
+        int64_t late = now - target;
+
+        rc->late_frames++;
+        rc->late_us_sum += late;
+
+        if (late > rc->late_us_max)
+            rc->late_us_max = late;
+    }
+}
 
 static void render_frame(Render *rc, AVFrame *frame, AVCodecContext *vdec)
 {
@@ -425,26 +604,30 @@ static void render_frame(Render *rc, AVFrame *frame, AVCodecContext *vdec)
     if (!rc->sws) {
 
         AVRational sar = frame_sar(frame, vdec);
+        AVRational fps0 = detect_fps(rc, vdec);
 
         fprintf(stderr,
                 "\n=== VIDEO PATH STARTING ===\n"
                 "Dimensions:          %dx%d\n"
                 "Pixel format:        %s\n"
                 "Sample aspect ratio: %d:%d\n"
-                "Pushing %d frames unpaced (tearing expected)...\n\n",
+                "swscale dest:        mapped DDR (stride %d)\n"
+                "Detected frame rate: %d/%d (%.3f fps)\n"
+                "Pacing:              continuous PTS + interpolation\n"
+                "Pushing %d paced frames...\n\n",
                 frame->width, frame->height,
                 av_get_pix_fmt_name(frame->format)
                     ? av_get_pix_fmt_name(frame->format)
                     : "unknown",
                 sar.num, sar.den,
+                FB_STRIDE,
+                fps0.num, fps0.den,
+                (fps0.num > 0 && fps0.den > 0) ? av_q2d(fps0) : 0.0,
                 TARGET_FRAMES);
 
-        if (av_image_alloc(rc->dst_data, rc->dst_linesize,
-                           FB_W, FB_H, AV_PIX_FMT_BGR0, 32) < 0) {
-            fprintf(stderr, "Could not allocate BGR0 frame\n");
-            rc->fail = 1;
-            return;
-        }
+        /* Destination is the proven MISTER_FB mapping, not a temp buffer. */
+        rc->dst_data[0] = rc->fb;
+        rc->dst_linesize[0] = FB_STRIDE;
 
         rc->sws = sws_getContext(FB_W, FB_H, frame->format,
                                  FB_W, FB_H, AV_PIX_FMT_BGR0,
@@ -457,6 +640,8 @@ static void render_frame(Render *rc, AVFrame *frame, AVCodecContext *vdec)
         }
     }
 
+    pace_until_pts(rc, frame, vdec);
+
     stage = 7;
 
     int64_t t0 = av_gettime_relative();
@@ -468,17 +653,28 @@ static void render_frame(Render *rc, AVFrame *frame, AVCodecContext *vdec)
 
     int64_t t1 = av_gettime_relative();
 
-    for (int y = 0; y < FB_H; y++)
-        memcpy(rc->fb + (size_t)y * FB_STRIDE,
-               rc->dst_data[0] + (size_t)y * rc->dst_linesize[0],
-               (size_t)FB_W * 4);
-
-    int64_t t2 = av_gettime_relative();
-
     stage = 5;
 
     rc->convert_us += t1 - t0;
-    rc->copy_us += t2 - t1;
+
+    /* Presentation instant = completion of the single-buffer DDR write. */
+    {
+        int64_t display_pts = rc->assigned_pts;
+
+        if (!rc->first_present_us) {
+            rc->first_present_us = t1;
+            rc->first_display_pts = display_pts;
+            rc->first_convert_us = t1 - t0;
+            rc->wait_us_at_first = rc->wait_us;
+        }
+
+        if (rc->first_display_pts == AV_NOPTS_VALUE &&
+            display_pts != AV_NOPTS_VALUE)
+            rc->first_display_pts = display_pts;
+
+        rc->last_present_us = t1;
+        rc->last_display_pts = display_pts;
+    }
 
     rc->rendered++;
 
@@ -520,7 +716,9 @@ int main(int argc, char **argv)
 
     setvbuf(stderr, NULL, _IONBF, 0);
 
-    fprintf(stderr, "=== SS1 DVD -> MISTER_FB CONTINUOUS VIDEO TEST ===\n");
+    const int64_t program_start = av_gettime_relative();
+
+    fprintf(stderr, "=== SS1 DVD -> MISTER_FB PTS-PACED VIDEO TEST ===\n");
     fprintf(stderr, "FFmpeg CPU flags: 0x%x\n", av_get_cpu_flags());
 
     const char *dvd = argc > 1 ? argv[1] : "/dev/sr0";
@@ -602,6 +800,11 @@ int main(int argc, char **argv)
 
     Render rc;
     memset(&rc, 0, sizeof(rc));
+    rc.first_genuine_pts = AV_NOPTS_VALUE;
+    rc.timeline_pts = AV_NOPTS_VALUE;
+    rc.assigned_pts = AV_NOPTS_VALUE;
+    rc.first_display_pts = AV_NOPTS_VALUE;
+    rc.last_display_pts = AV_NOPTS_VALUE;
 
     rc.fb = map_mister_fb(&mem_fd);
 
@@ -626,12 +829,10 @@ int main(int argc, char **argv)
     unsigned long demux_packets = 0;
     unsigned long parser_packets = 0;
 
-    fprintf(stderr, "\nReading DVD stream (unpaced, %d frames)...\n",
+    fprintf(stderr, "\nReading DVD stream (PTS-paced, %d frames)...\n",
             TARGET_FRAMES);
 
     stage = 3;
-
-    int64_t wall_start = av_gettime_relative();
 
     while (rc.rendered < TARGET_FRAMES && !rc.fail &&
            (r = av_read_frame(fmt, pkt)) >= 0) {
@@ -670,6 +871,18 @@ int main(int argc, char **argv)
                         fprintf(stderr, "Could not init MPEG-2 parser\n");
                         return 7;
                     }
+
+                    rc.tb = fmt->streams[vi]->time_base;
+                    rc.avg_frame_rate = fmt->streams[vi]->avg_frame_rate;
+                    rc.r_frame_rate = fmt->streams[vi]->r_frame_rate;
+                    rc.first_genuine_pts = AV_NOPTS_VALUE;
+                    rc.timeline_pts = AV_NOPTS_VALUE;
+
+                    fprintf(stderr, "Video timebase: %d/%d\n",
+                            rc.tb.num, rc.tb.den);
+                    fprintf(stderr, "Stream avg/r frame rate: %d/%d , %d/%d\n",
+                            rc.avg_frame_rate.num, rc.avg_frame_rate.den,
+                            rc.r_frame_rate.num, rc.r_frame_rate.den);
 
                     break;
                 }
@@ -768,40 +981,123 @@ int main(int argc, char **argv)
             decode_and_render(vdec, NULL, frame, &rc);
     }
 
-    int64_t wall_us = av_gettime_relative() - wall_start;
+    int intervals = rc.rendered > 1 ? rc.rendered - 1 : 0;
 
-    /* Everything not spent converting/copying is demux+parse+decode. */
-    int64_t decode_us = wall_us - rc.convert_us - rc.copy_us;
+    double first_pts_s = 0.0;
+    double last_pts_s = 0.0;
+    double source_s = 0.0;
+    int have_pts_span = (rc.first_display_pts != AV_NOPTS_VALUE &&
+                         rc.last_display_pts != AV_NOPTS_VALUE &&
+                         rc.tb.num > 0 && rc.tb.den > 0);
 
-    double wall_s = (double)wall_us / 1e6;
+    if (have_pts_span) {
+        first_pts_s = rc.first_display_pts * av_q2d(rc.tb);
+        last_pts_s = rc.last_display_pts * av_q2d(rc.tb);
+        source_s = last_pts_s - first_pts_s;
+    }
 
-    double per_frame = rc.rendered > 0 ? 1.0 / rc.rendered : 0.0;
+    double startup_s = 0.0;
+    double present_s = 0.0;
+
+    if (rc.first_present_us)
+        startup_s = (double)(rc.first_present_us - program_start) / 1e6;
+
+    if (rc.first_present_us && rc.last_present_us >= rc.first_present_us)
+        present_s = (double)(rc.last_present_us - rc.first_present_us) / 1e6;
+
+    /*
+     * Decode/parser during the presentation window only: startup/pre-roll
+     * (including the first convert and any sleep before first present)
+     * is excluded.
+     */
+    int64_t decode_us = 0;
+
+    if (rc.first_present_us && rc.last_present_us >= rc.first_present_us)
+        decode_us = (rc.last_present_us - rc.first_present_us)
+                    - (rc.convert_us - rc.first_convert_us)
+                    - (rc.wait_us - rc.wait_us_at_first);
 
     fprintf(stderr,
             "\n=== STREAM STATISTICS ===\n"
             "Demuxed video packets: %lu\n"
             "Parser output packets: %lu\n"
             "Frames displayed:      %d\n"
+            "Genuine PTS frames:    %d\n"
+            "Interpolated frames:   %d\n"
+            "25 fps fallback frames:%d\n"
             "DVD NAV packets:       %lu\n"
             "DVD MPEG sectors:      %lu\n",
             demux_packets, parser_packets, rc.rendered,
+            rc.genuine_pts_count, rc.interpolated_count, rc.fallback_frames,
             d.nav_packets, d.mpeg_sectors);
 
+    fprintf(stderr, "\n=== PRESENTATION CADENCE ===\n");
+
+    fprintf(stderr, "Startup/pre-roll:             %8.3f s\n", startup_s);
+
+    if (rc.fps.num > 0 && rc.fps.den > 0)
+        fprintf(stderr, "Detected frame rate:          %d/%d  (%.3f fps)\n",
+                rc.fps.num, rc.fps.den, av_q2d(rc.fps));
+    else
+        fprintf(stderr, "Detected frame rate:          not available\n");
+
+    if (rc.first_genuine_pts != AV_NOPTS_VALUE)
+        fprintf(stderr,
+                "First genuine PTS:            %" PRId64 "  (%.6f s)\n",
+                rc.first_genuine_pts,
+                rc.first_genuine_pts * av_q2d(rc.tb));
+    else
+        fprintf(stderr, "First genuine PTS:            not available\n");
+
     fprintf(stderr,
-            "\n=== THROUGHPUT RESULTS (unpaced) ===\n"
-            "Total wall time:        %8.3f s\n"
-            "Demux/parse/decode:     %8.3f s  (%7.3f ms/frame)\n"
-            "YUV -> BGR0 convert:    %8.3f s  (%7.3f ms/frame)\n"
-            "DDR framebuffer write:  %8.3f s  (%7.3f ms/frame)\n"
-            "End-to-end throughput:  %8.2f fps\n",
-            wall_s,
+            "Max PTS vs interpol. error:   %8.3f ms\n",
+            (double)rc.max_disc_us / 1000.0);
+
+    if (rc.first_display_pts != AV_NOPTS_VALUE)
+        fprintf(stderr,
+                "First displayed frame PTS:    %" PRId64 "  (%.6f s)\n",
+                rc.first_display_pts, first_pts_s);
+    else
+        fprintf(stderr, "First displayed frame PTS:    not available\n");
+
+    if (rc.last_display_pts != AV_NOPTS_VALUE)
+        fprintf(stderr,
+                "Last displayed frame PTS:     %" PRId64 "  (%.6f s)\n",
+                rc.last_display_pts, last_pts_s);
+    else
+        fprintf(stderr, "Last displayed frame PTS:     not available\n");
+
+    fprintf(stderr,
+            "Source duration (last-first): %8.3f s%s\n"
+            "Source fps (%d intervals):    %8.3f\n"
+            "Presentation window:          %8.3f s\n"
+            "Presented fps (%d intervals): %8.3f\n"
+            "Late frames (vs PTS target):  %8d\n"
+            "Average lateness (late only): %8.3f ms\n"
+            "Maximum lateness:             %8.3f ms\n"
+            "Decode/parser (excl. sleep):  %8.3f s  (%7.3f ms/frame)\n"
+            "Direct YUV -> DDR BGR0:       %8.3f s  (%7.3f ms/frame)\n"
+            "Deliberate sleep time:        %8.3f s\n",
+            source_s, have_pts_span ? "" : "  (no PTS span)",
+            intervals,
+            (have_pts_span && source_s > 0.0 && intervals > 0)
+                ? (double)intervals / source_s : 0.0,
+            present_s,
+            intervals,
+            (present_s > 0.0 && intervals > 0)
+                ? (double)intervals / present_s : 0.0,
+            rc.late_frames,
+            rc.late_frames > 0
+                ? (double)rc.late_us_sum / 1000.0 / rc.late_frames
+                : 0.0,
+            (double)rc.late_us_max / 1000.0,
             (double)decode_us / 1e6,
-            (double)decode_us / 1e3 * per_frame,
+            rc.rendered > 0
+                ? (double)decode_us / 1000.0 / rc.rendered : 0.0,
             (double)rc.convert_us / 1e6,
-            (double)rc.convert_us / 1e3 * per_frame,
-            (double)rc.copy_us / 1e6,
-            (double)rc.copy_us / 1e3 * per_frame,
-            rc.rendered > 0 ? (double)rc.rendered / wall_s : 0.0);
+            rc.rendered > 0
+                ? (double)rc.convert_us / 1000.0 / rc.rendered : 0.0,
+            (double)rc.wait_us / 1e6);
 
     /* Cleanup (the last frame stays visible in DDR). */
     munmap(rc.fb, FB_SIZE);
@@ -809,9 +1105,6 @@ int main(int argc, char **argv)
 
     if (rc.sws)
         sws_freeContext(rc.sws);
-
-    if (rc.dst_data[0])
-        av_freep(&rc.dst_data[0]);
 
     av_frame_free(&frame);
     av_packet_free(&pkt);
