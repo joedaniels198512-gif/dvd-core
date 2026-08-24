@@ -196,6 +196,50 @@
       "detail": "Build, scp and run dvd_audio_test on the SS1. Load DVD.rbf so alsa.sv consumes /dev/MrAudio. PAL DVD in /dev/sr0."
     },
     {
+      "label": "DVD A/V Test: Build (ARM cross-compile)",
+      "type": "shell",
+      "command": "./build_dvd_av_test.sh",
+      "options": {
+        "cwd": "${workspaceFolder}/player/tools"
+      },
+      "problemMatcher": [],
+      "group": "build",
+      "detail": "Cross-compile dvd_av_test: ~30 s title-2 A/V with audio-master MrAudio clock. Does not replace the isolated video/audio tests."
+    },
+    {
+      "label": "DVD A/V Test: Deploy + Run on SS1",
+      "type": "shell",
+      "command": "./deploy_dvd_av_test.sh",
+      "options": {
+        "cwd": "${workspaceFolder}/player/tools"
+      },
+      "problemMatcher": [],
+      "group": "test",
+      "detail": "Build, scp and run dvd_av_test on the SS1. Load mailbox DVD.rbf, leave OSD Buffer on A, PAL DVD in /dev/sr0."
+    },
+    {
+      "label": "DVD A/V Threaded Test: Build (ARM cross-compile)",
+      "type": "shell",
+      "command": "./build_dvd_av_threaded_test.sh",
+      "options": {
+        "cwd": "${workspaceFolder}/player/tools"
+      },
+      "problemMatcher": [],
+      "group": "build",
+      "detail": "Cross-compile dvd_av_threaded_test: demux + audio/video worker threads. Leaves dvd_av_test.c as the failed single-thread proof."
+    },
+    {
+      "label": "DVD A/V Threaded Test: Deploy + Run on SS1",
+      "type": "shell",
+      "command": "./deploy_dvd_av_threaded_test.sh",
+      "options": {
+        "cwd": "${workspaceFolder}/player/tools"
+      },
+      "problemMatcher": [],
+      "group": "test",
+      "detail": "Build, scp and run dvd_av_threaded_test on the SS1. Load mailbox DVD.rbf, leave OSD Buffer on A."
+    },
+    {
       "label": "Player: Deploy + Run on SS1",
       "type": "shell",
       "command": "./deploy-test.sh",

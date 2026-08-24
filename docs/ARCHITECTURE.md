@@ -42,6 +42,10 @@ Component-level results validated on real SS1 hardware:
 - ✅ Native FFmpeg **MPEG-PS demux** works (custom AVIO fed by `dvdnav`).
 - ✅ Native **MPEG-2 video decode** works.
 - ✅ **AC-3 audio decode** works.
+- ✅ Isolated **mailbox double-buffer video** (`working-double-buffer-video`).
+- ✅ Isolated **MrAudio hardware-paced AC-3** (`working-audio-mraudio`).
+- ✅ **Threaded A/V together** (`working-threaded-av`): demux + audio/video
+  workers, audio master clock, mailbox presentation. See §7.
 
 ### Measured performance
 
@@ -177,3 +181,47 @@ in the benchmark path.
 
 The next functional milestone is to move from this headless benchmark toward
 handing native-resolution frames to the FPGA framebuffer path described in §4.
+
+---
+
+## 7. Proven threaded A/V (tag `working-threaded-av`)
+
+Isolated video (`working-double-buffer-video`) and isolated audio
+(`working-audio-mraudio`) were combined on SS1 with **one demux thread plus
+separate audio and video consumers**. Audio is the master clock (`/dev/MrAudio`
+rptr/len). Video follows that clock through the proven mailbox A/B path.
+
+Single-thread `player/tools/dvd_av_test.c` is a **failed proof**: MPEG-2 decode
+starved the only loop that could feed MrAudio (fill min/avg/max 0 / 3.6 / 146 ms;
+30 s media took ~146 s wall). Do not patch that scheduler.
+
+`player/tools/dvd_av_threaded_test.c` is the **known-good** combined path. SS1,
+title 2 / chapter 1, ~30 s:
+
+| Measurement | Result |
+|---|---|
+| Visual | Continuous, normal speed, well synchronized |
+| Hardware audio consumed | 30.872 s |
+| MrAudio underruns | 0 |
+| MrAudio fill average | 139.2 ms (target ~150 ms) |
+| Video frames displayed | 771 |
+| Average video−audio offset | −30.9 ms |
+| Frames >80 ms late | 1 |
+
+Do **not** retune queues, A/V clocks, decode, swscale, or mailbox scheduling
+from this baseline.
+
+### Known / non-blocking characteristics (not bugs)
+
+- **−30.9 ms mean offset** is mailbox-VBL presentation versus the audio master
+  clock with no frame dropping. Lip-sync was judged good on hardware.
+- **139.2 ms average fill** versus the 150 ms target is healthy, not starvation.
+- **One late frame in 771** is acceptable for this proof.
+- **MPEG-PS video is ~340 compressed packets/s**, not one packet per displayed
+  frame. `VIDEO_Q_CAP` 384 ≈ 1.1 s. Capacity 64 was ~0.19 s and head-of-line
+  stalled demux for essentially the whole run (periodic whole-player pauses).
+- Audio queue remains 32 packets (~1 s of AC-3). Backpressure still waits when
+  a queue is genuinely full; packets are not dropped.
+
+libdvdnav and the custom AVIO callback run **only on the demux thread**.
+Decoder contexts are not shared across threads.
