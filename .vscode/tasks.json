@@ -174,6 +174,28 @@
       "detail": "Build, scp and run dvd_video_double_test on the SS1. Load the mailbox DVD.rbf, leave OSD Buffer on A, PAL DVD in /dev/sr0."
     },
     {
+      "label": "DVD Audio Test: Build (ARM cross-compile)",
+      "type": "shell",
+      "command": "./build_dvd_audio_test.sh",
+      "options": {
+        "cwd": "${workspaceFolder}/player/tools"
+      },
+      "problemMatcher": [],
+      "group": "build",
+      "detail": "Cross-compile dvd_audio_test: ~20 s of title-2 audio through /dev/MrAudio. Does not modify dvd_video_double_test.c or FPGA."
+    },
+    {
+      "label": "DVD Audio Test: Deploy + Run on SS1",
+      "type": "shell",
+      "command": "./deploy_dvd_audio_test.sh",
+      "options": {
+        "cwd": "${workspaceFolder}/player/tools"
+      },
+      "problemMatcher": [],
+      "group": "test",
+      "detail": "Build, scp and run dvd_audio_test on the SS1. Load DVD.rbf so alsa.sv consumes /dev/MrAudio. PAL DVD in /dev/sr0."
+    },
+    {
       "label": "Player: Deploy + Run on SS1",
       "type": "shell",
       "command": "./deploy-test.sh",
