@@ -95,7 +95,7 @@ wire border = (hc < 10'd8) || (hc > 10'd520) ||
 
 wire [9:0] mid_h = 10'd264;
 wire [9:0] mid_v = vact >> 1;
-wire cross = ((hc >= (mid_h - 10'd1)) && (hc <= (mid_h + 10'd1))) ||
+wire xhair = ((hc >= (mid_h - 10'd1)) && (hc <= (mid_h + 10'd1))) ||
              ((vc >= (mid_v - 10'd1)) && (vc <= (mid_v + 10'd1)));
 
 wire [7:0] bars =
@@ -111,7 +111,7 @@ wire [7:0] bars =
 wire lower = (vc >= (vact - (vact >> 2)));
 wire check = hc[4] ^ vc[4];
 
-assign video = (border | cross) ? 8'hFF :
+assign video = (border | xhair) ? 8'hFF :
                lower            ? (check ? 8'hE0 : 8'h20) :
                                   bars;
 
