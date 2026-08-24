@@ -507,6 +507,18 @@ static void unmap_double_fb(FBPair *fb)
 /* ------------------------------------------------------------------ */
 
 typedef struct {
+    int64_t read_us;              /* av_read_frame / DVD input          */
+    int64_t parse_decode_us;      /* parser + send/receive              */
+    int64_t convert_us;           /* YUV -> DDR                         */
+    int64_t sched_wait_us;        /* dest-free + mailbox-window waits   */
+    int64_t interval_vbl;         /* 0 on the first displayed frame     */
+    int64_t assigned_pts;         /* timeline PTS in stream timebase    */
+    int late_before;              /* ideal VBL already unreachable      */
+    int fresh_miss;               /* this frame missed its PTS VBL      */
+    int carried;                  /* min_k / earlier stall pushed K     */
+} FrameSamp;
+
+typedef struct {
     FBPair *fb;
 
     struct SwsContext *sws;
@@ -525,6 +537,15 @@ typedef struct {
     int64_t convert_us;
     int64_t wait_us;              /* dest-free + mailbox-window waits   */
     int64_t vsync_us;             /* FBIO_WAITFORVSYNC time inside waits */
+
+    /* Per-frame stage times (diagnostics only; do not affect pacing). */
+    int64_t pending_read_us;
+    int64_t pending_parse_us;
+    int64_t work_read_us;
+    int64_t work_parse_decode_us;
+    int fresh_miss;
+    int carried_miss;
+    FrameSamp samp[TARGET_FRAMES];
 
     AVRational tb;
     AVRational avg_frame_rate;
@@ -554,6 +575,23 @@ typedef struct {
     int not_ready;                /* missed PTS-nearest publication VBL */
     int64_t late_us_sum;
     int64_t late_us_max;
+
+    /* Scheduled VBL-to-VBL intervals (diagnostics only). */
+    int n_int_2;
+    int n_int_3;
+    int n_int_other;
+    int miss_2;
+    int miss_3;
+    int miss_other;
+    int64_t late_sum_2;
+    int64_t late_max_2;
+    int64_t late_sum_3;
+    int64_t late_max_3;
+    int64_t late_sum_other;
+    int64_t late_max_other;
+    int other_delta_n[17];        /* [1..15]=delta, [16]=delta>=16     */
+    int other_delta_miss[17];
+    int64_t miss_vbl_sum;         /* sum of (K - PTS-nearest K)        */
 
     int fail;
 } Render;
@@ -738,12 +776,14 @@ static void wait_until(Render *rc, int64_t target)
  * then appears one (or more) HDMI refreshes later.
  */
 static int64_t choose_present_vbl(Render *rc, int64_t pts_target, int64_t now,
-                                  int first)
+                                  int first, int64_t *ideal_out,
+                                  int64_t *late_us_out)
 {
     int64_t min_k = rc->present_vbl + 1;
     int64_t ideal = vbl_nearest(rc->fb, pts_target);
     int64_t k = ideal;
     int64_t margin = rc->fb->margin_us;
+    int64_t late = 0;
 
     if (k < min_k)
         k = min_k;
@@ -752,16 +792,279 @@ static int64_t choose_present_vbl(Render *rc, int64_t pts_target, int64_t now,
         k++;
 
     if (!first && k > ideal) {
-        int64_t late = vbl_time(rc->fb, k) - vbl_time(rc->fb, ideal);
+        late = vbl_time(rc->fb, k) - vbl_time(rc->fb, ideal);
 
         rc->not_ready++;
         rc->late_us_sum += late;
+        rc->miss_vbl_sum += (k - ideal);
 
         if (late > rc->late_us_max)
             rc->late_us_max = late;
     }
 
+    if (ideal_out)
+        *ideal_out = ideal;
+    if (late_us_out)
+        *late_us_out = late;
+
     return k;
+}
+
+static void record_vbl_interval(Render *rc, int64_t delta, int64_t late_us)
+{
+    int missed = (late_us > 0);
+
+    if (delta == 2) {
+        rc->n_int_2++;
+        if (missed) {
+            rc->miss_2++;
+            rc->late_sum_2 += late_us;
+            if (late_us > rc->late_max_2)
+                rc->late_max_2 = late_us;
+        }
+        return;
+    }
+
+    if (delta == 3) {
+        rc->n_int_3++;
+        if (missed) {
+            rc->miss_3++;
+            rc->late_sum_3 += late_us;
+            if (late_us > rc->late_max_3)
+                rc->late_max_3 = late_us;
+        }
+        return;
+    }
+
+    rc->n_int_other++;
+    {
+        int slot = (delta >= 16) ? 16 : (delta < 1 ? 1 : (int)delta);
+
+        rc->other_delta_n[slot]++;
+        if (missed) {
+            rc->miss_other++;
+            rc->other_delta_miss[slot]++;
+            rc->late_sum_other += late_us;
+            if (late_us > rc->late_max_other)
+                rc->late_max_other = late_us;
+        }
+    }
+}
+
+static int cmp_i64(const void *a, const void *b)
+{
+    int64_t x = *(const int64_t *)a;
+    int64_t y = *(const int64_t *)b;
+
+    return (x > y) - (x < y);
+}
+
+/* Nearest-rank percentile of a sorted array: p in 0..100. */
+static int64_t pctile_sorted(const int64_t *sorted, int n, int p)
+{
+    int idx;
+
+    if (n <= 0)
+        return 0;
+
+    idx = (n * p + 99) / 100 - 1;
+    if (idx < 0)
+        idx = 0;
+    if (idx >= n)
+        idx = n - 1;
+
+    return sorted[idx];
+}
+
+static void print_stage_us(const char *label, int64_t *vals, int n)
+{
+    int64_t max_us = 0;
+
+    if (n <= 0) {
+        fprintf(stderr, "%-22s n=0\n", label);
+        return;
+    }
+
+    qsort(vals, (size_t)n, sizeof(vals[0]), cmp_i64);
+    max_us = vals[n - 1];
+
+    fprintf(stderr,
+            "%-22s max %7.3f ms   p95 %7.3f ms   p99 %7.3f ms\n",
+            label,
+            (double)max_us / 1000.0,
+            (double)pctile_sorted(vals, n, 95) / 1000.0,
+            (double)pctile_sorted(vals, n, 99) / 1000.0);
+}
+
+static int us_to_nearest_ms(int64_t us)
+{
+    if (us >= 0)
+        return (int)((us + 500) / 1000);
+    return (int)((us - 500) / 1000);
+}
+
+static void tally_ms(int ms, int *keys, int *cnt, int *nuniq, int cap,
+                     int *overflow)
+{
+    int i;
+
+    for (i = 0; i < *nuniq; i++) {
+        if (keys[i] == ms) {
+            cnt[i]++;
+            return;
+        }
+    }
+
+    if (*nuniq >= cap) {
+        (*overflow)++;
+        return;
+    }
+
+    i = *nuniq;
+    while (i > 0 && keys[i - 1] > ms) {
+        keys[i] = keys[i - 1];
+        cnt[i] = cnt[i - 1];
+        i--;
+    }
+    keys[i] = ms;
+    cnt[i] = 1;
+    (*nuniq)++;
+}
+
+static void print_gap_stage_timeline(const Render *rc, double source_s,
+                                     int have_pts_span)
+{
+    const int n = rc->rendered;
+    const int64_t period = rc->fb->vsync_period_us;
+    int64_t tmp[TARGET_FRAMES];
+    int i;
+    int n_gap = 0;
+    int n_d0 = 0;
+    int n_d40 = 0;
+    int n_dother = 0;
+    int n_dnopts = 0;
+    int other_ms[48];
+    int other_cnt[48];
+    int n_other_uniq = 0;
+    int other_overflow = 0;
+    double fps;
+    double frame_ms;
+    double expect_s;
+    double shortfall_s;
+
+    fprintf(stderr, "\n=== STAGE TIMES (per displayed frame) ===\n");
+
+    for (i = 0; i < n; i++)
+        tmp[i] = rc->samp[i].read_us;
+    print_stage_us("DVD / av_read_frame:", tmp, n);
+
+    for (i = 0; i < n; i++)
+        tmp[i] = rc->samp[i].parse_decode_us;
+    print_stage_us("Parser + decode:", tmp, n);
+
+    for (i = 0; i < n; i++)
+        tmp[i] = rc->samp[i].convert_us;
+    print_stage_us("YUV -> DDR convert:", tmp, n);
+
+    fprintf(stderr,
+            "Deadline misses split:        fresh %d  carried %d  "
+            "(not_ready %d)\n"
+            "  fresh   = this frame was not ready for its PTS-nearest VBL\n"
+            "            (convert finished after that VBL minus poll margin)\n"
+            "  carried = the frame could have hit that VBL, but min_k /\n"
+            "            an earlier stall already put the schedule behind\n",
+            rc->fresh_miss, rc->carried_miss, rc->not_ready);
+
+    fprintf(stderr, "\n=== LONG PRESENTATION GAPS (>= 4 VBL) ===\n");
+
+    for (i = 0; i < n; i++) {
+        const FrameSamp *s = &rc->samp[i];
+
+        if (s->interval_vbl < 4)
+            continue;
+
+        n_gap++;
+        fprintf(stderr,
+                "  frame %4d  interval %2" PRId64 " VBL (%6.1f ms)"
+                "  read %7.3f ms  decode %7.3f ms  convert %7.3f ms"
+                "  sched_wait %7.3f ms  late_before=%s  miss=%s\n",
+                i + 1,
+                s->interval_vbl,
+                (double)s->interval_vbl * (double)period / 1000.0,
+                (double)s->read_us / 1000.0,
+                (double)s->parse_decode_us / 1000.0,
+                (double)s->convert_us / 1000.0,
+                (double)s->sched_wait_us / 1000.0,
+                s->late_before ? "yes" : "no",
+                s->fresh_miss ? "fresh"
+                              : (s->carried ? "carried" : "none"));
+    }
+
+    if (!n_gap)
+        fprintf(stderr, "  none\n");
+    else
+        fprintf(stderr, "  (%d gap(s))\n", n_gap);
+
+    fps = (rc->fps.num > 0 && rc->fps.den > 0) ? av_q2d(rc->fps) : 25.0;
+    frame_ms = (fps > 0.0) ? (1000.0 / fps) : 40.0;
+    expect_s = (n > 1 && fps > 0.0) ? ((double)(n - 1) / fps) : 0.0;
+    shortfall_s = (have_pts_span && expect_s > 0.0) ? (expect_s - source_s)
+                                                    : 0.0;
+
+    fprintf(stderr,
+            "\n=== ASSIGNED TIMELINE DELTAS ===\n"
+            "%d frames at %.3f fps: first-last should span %.3f s"
+            "  (%d x %.3f ms)\n"
+            "Reported source duration:     %8.3f s%s\n",
+            n, fps, expect_s, n > 1 ? n - 1 : 0, frame_ms,
+            source_s, have_pts_span ? "" : "  (no PTS span)");
+
+    if (have_pts_span && expect_s > 0.0) {
+        fprintf(stderr,
+                "Span vs expected:             %+8.3f s  (%.2f frame periods)\n",
+                -shortfall_s,
+                (frame_ms > 0.0) ? (shortfall_s / (frame_ms / 1000.0)) : 0.0);
+    }
+
+    for (i = 1; i < n; i++) {
+        int64_t a = rc->samp[i - 1].assigned_pts;
+        int64_t b = rc->samp[i].assigned_pts;
+        int64_t dus;
+        int ms;
+
+        if (a == AV_NOPTS_VALUE || b == AV_NOPTS_VALUE) {
+            n_dnopts++;
+            continue;
+        }
+
+        dus = tb_to_us(rc, b - a);
+        ms = us_to_nearest_ms(dus);
+
+        if (ms == 0)
+            n_d0++;
+        else if (ms == 40)
+            n_d40++;
+        else {
+            n_dother++;
+            tally_ms(ms, other_ms, other_cnt, &n_other_uniq,
+                     (int)(sizeof(other_ms) / sizeof(other_ms[0])),
+                     &other_overflow);
+        }
+    }
+
+    fprintf(stderr,
+            "Assigned PTS deltas:          %8d  (0 ms: %d,  40 ms: %d,  "
+            "other: %d,  missing PTS: %d)\n",
+            n > 1 ? n - 1 : 0, n_d0, n_d40, n_dother, n_dnopts);
+
+    if (n_dother > 0) {
+        fprintf(stderr, "Other assigned deltas (nearest ms):\n");
+        for (i = 0; i < n_other_uniq; i++)
+            fprintf(stderr, "  %d ms: %d\n", other_ms[i], other_cnt[i]);
+        if (other_overflow)
+            fprintf(stderr, "  (plus %d delta(s) of additional values)\n",
+                    other_overflow);
+    }
 }
 
 static void render_frame(Render *rc, AVFrame *frame, AVCodecContext *vdec)
@@ -818,6 +1121,7 @@ static void render_frame(Render *rc, AVFrame *frame, AVCodecContext *vdec)
     }
 
     int64_t pts_target = assign_pts_target(rc, frame, vdec);
+    int64_t wait0 = rc->wait_us;
 
     /*
      * Decode already finished in the caller. Wait until the previous
@@ -852,7 +1156,35 @@ static void render_frame(Render *rc, AVFrame *frame, AVCodecContext *vdec)
 
     int64_t now = av_gettime_relative();
     int first = (rc->rendered == 0);
-    int64_t k = choose_present_vbl(rc, pts_target, now, first);
+    int64_t prev_k = rc->present_vbl;
+    int64_t ideal_k = 0;
+    int64_t late_us = 0;
+    int64_t k = choose_present_vbl(rc, pts_target, now, first,
+                                   &ideal_k, &late_us);
+
+    /* Diagnostics only: classify why K moved past the PTS-nearest VBL.
+     * late_before uses the same `now` as choose_present_vbl (after convert). */
+    int late_before = 0;
+    int fresh = 0;
+    int carried = 0;
+
+    if (!first) {
+        late_before = (vbl_time(rc->fb, ideal_k) - rc->fb->margin_us < now);
+        if (k > ideal_k) {
+            if (late_before)
+                fresh = 1;
+            else
+                carried = 1;
+        }
+    }
+
+    if (fresh)
+        rc->fresh_miss++;
+    if (carried)
+        rc->carried_miss++;
+
+    if (prev_k >= 0)
+        record_vbl_interval(rc, k - prev_k, late_us);
 
     /* Write mailbox after VBL k-1 so it is not published one VBL early,
      * and at least margin_us before VBL k so the poller has fetched it. */
@@ -893,6 +1225,20 @@ static void render_frame(Render *rc, AVFrame *frame, AVCodecContext *vdec)
         rc->vsync_us_at_last = rc->vsync_us;
     }
 
+    if (rc->rendered < TARGET_FRAMES) {
+        FrameSamp *s = &rc->samp[rc->rendered];
+
+        s->read_us = rc->work_read_us;
+        s->parse_decode_us = rc->work_parse_decode_us;
+        s->convert_us = t1 - t0;
+        s->sched_wait_us = rc->wait_us - wait0;
+        s->interval_vbl = (prev_k >= 0) ? (k - prev_k) : 0;
+        s->assigned_pts = rc->assigned_pts;
+        s->late_before = late_before;
+        s->fresh_miss = fresh;
+        s->carried = carried;
+    }
+
     rc->rendered++;
 
     if ((rc->rendered % 100) == 0)
@@ -907,15 +1253,51 @@ static int decode_and_render(AVCodecContext *vdec,
                              AVFrame *frame,
                              Render *rc)
 {
+    int64_t t0 = av_gettime_relative();
+    int first_out = 1;
+
     if (avcodec_send_packet(vdec, ppkt) < 0)
         return 0;
 
-    while (rc->rendered < TARGET_FRAMES && !rc->fail &&
-           avcodec_receive_frame(vdec, frame) == 0) {
+    {
+        int64_t send_us = av_gettime_relative() - t0;
 
-        render_frame(rc, frame, vdec);
+        for (;;) {
+            int rr;
+            int64_t recv_us;
 
-        av_frame_unref(frame);
+            if (rc->rendered >= TARGET_FRAMES || rc->fail) {
+                if (first_out)
+                    rc->pending_parse_us += send_us;
+                break;
+            }
+
+            t0 = av_gettime_relative();
+            rr = avcodec_receive_frame(vdec, frame);
+            recv_us = av_gettime_relative() - t0;
+
+            if (rr != 0) {
+                rc->pending_parse_us += recv_us;
+                if (first_out)
+                    rc->pending_parse_us += send_us;
+                break;
+            }
+
+            if (first_out) {
+                rc->work_read_us = rc->pending_read_us;
+                rc->work_parse_decode_us =
+                    rc->pending_parse_us + send_us + recv_us;
+                rc->pending_read_us = 0;
+                rc->pending_parse_us = 0;
+                first_out = 0;
+            } else {
+                rc->work_read_us = 0;
+                rc->work_parse_decode_us = recv_us;
+            }
+
+            render_frame(rc, frame, vdec);
+            av_frame_unref(frame);
+        }
     }
 
     return rc->rendered >= TARGET_FRAMES || rc->fail;
@@ -1161,6 +1543,10 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "libdvdnav opened successfully\n");
 
+    cli.title = 2;
+    cli.chapter = 1;
+    fprintf(stderr, "Starting DVD title 2, chapter 1\n");
+
     int32_t ntitles = 0;
     int32_t nparts = -1;
 
@@ -1271,8 +1657,13 @@ int main(int argc, char **argv)
 
     int read_ret = 0;
 
-    while (rc.rendered < TARGET_FRAMES && !rc.fail &&
-           (read_ret = av_read_frame(fmt, pkt)) >= 0) {
+    while (rc.rendered < TARGET_FRAMES && !rc.fail) {
+        int64_t t_read = av_gettime_relative();
+
+        read_ret = av_read_frame(fmt, pkt);
+        rc.pending_read_us += av_gettime_relative() - t_read;
+        if (read_ret < 0)
+            break;
 
         if (vi < 0) {
 
@@ -1341,10 +1732,13 @@ int main(int argc, char **argv)
             uint8_t *out_data = NULL;
             int out_size = 0;
 
+            int64_t t_parse = av_gettime_relative();
             int used = av_parser_parse2(parser, vdec,
                                         &out_data, &out_size,
                                         in, in_size,
                                         in_pts, in_dts, in_pos);
+
+            rc.pending_parse_us += av_gettime_relative() - t_parse;
 
             if (used < 0)
                 break;
@@ -1398,10 +1792,14 @@ int main(int argc, char **argv)
             uint8_t *out_data = NULL;
             int out_size = 0;
 
+            int64_t t_parse = av_gettime_relative();
+
             av_parser_parse2(parser, vdec,
                              &out_data, &out_size,
                              flush_buf, 0,
                              AV_NOPTS_VALUE, AV_NOPTS_VALUE, -1);
+
+            rc.pending_parse_us += av_gettime_relative() - t_parse;
 
             if (out_size <= 0)
                 break;
@@ -1534,7 +1932,7 @@ int main(int argc, char **argv)
             "Source fps (%d intervals):    %8.3f\n"
             "Presentation window:          %8.3f s\n"
             "Presented fps (%d intervals): %8.3f\n"
-            "Not ready by flip deadline:   %8d\n"
+            "Not ready by flip deadline:   %8d  (fresh %d, carried %d)\n"
             "Average request lateness:     %8.3f ms\n"
             "Maximum request lateness:     %8.3f ms\n"
             "Decode/parser (excl. wait):   %8.3f s  (%7.3f ms/frame)\n"
@@ -1550,7 +1948,7 @@ int main(int argc, char **argv)
             intervals,
             (present_s > 0.0 && intervals > 0)
                 ? (double)intervals / present_s : 0.0,
-            rc.not_ready,
+            rc.not_ready, rc.fresh_miss, rc.carried_miss,
             rc.not_ready > 0
                 ? (double)rc.late_us_sum / 1000.0 / rc.not_ready
                 : 0.0,
@@ -1564,6 +1962,59 @@ int main(int argc, char **argv)
             (double)rc.wait_us / 1e6,
             (double)rc.vsync_us / 1e6,
             (double)rc.wait_us / 1e6);
+
+    fprintf(stderr,
+            "\n=== VBL INTERVAL DIAGNOSTICS ===\n"
+            "Request lateness = vbl_time(scheduled K) - vbl_time(PTS-nearest K).\n"
+            "A miss is counted only when scheduled K > PTS-nearest K (poll\n"
+            "margin and/or min spacing vs the previous publish pushed K later).\n"
+            "This is extra HDMI presentation delay, not mailbox-store delay.\n"
+            "First frame is never a miss. 1 VBL ~= %.3f ms.\n",
+            (double)fb.vsync_period_us / 1000.0);
+
+    if (rc.not_ready > 0)
+        fprintf(stderr,
+                "Miss slip in VBL units:       %8.3f avg  (%" PRId64 " total)\n",
+                (double)rc.miss_vbl_sum / (double)rc.not_ready,
+                rc.miss_vbl_sum);
+
+    fprintf(stderr,
+            "2-VBL intervals:              %8d\n"
+            "3-VBL intervals:              %8d\n"
+            "Other interval lengths:       %8d\n"
+            "Misses in 2-VBL intervals:    %8d\n"
+            "Misses in 3-VBL intervals:    %8d\n"
+            "Misses in other intervals:    %8d\n"
+            "2-VBL miss lateness avg/max:  %8.3f / %8.3f ms\n"
+            "3-VBL miss lateness avg/max:  %8.3f / %8.3f ms\n"
+            "Other miss lateness avg/max:  %8.3f / %8.3f ms\n",
+            rc.n_int_2, rc.n_int_3, rc.n_int_other,
+            rc.miss_2, rc.miss_3, rc.miss_other,
+            rc.miss_2 > 0 ? (double)rc.late_sum_2 / 1000.0 / rc.miss_2 : 0.0,
+            (double)rc.late_max_2 / 1000.0,
+            rc.miss_3 > 0 ? (double)rc.late_sum_3 / 1000.0 / rc.miss_3 : 0.0,
+            (double)rc.late_max_3 / 1000.0,
+            rc.miss_other > 0
+                ? (double)rc.late_sum_other / 1000.0 / rc.miss_other : 0.0,
+            (double)rc.late_max_other / 1000.0);
+
+    if (rc.n_int_other > 0) {
+        fprintf(stderr, "Other interval breakdown:\n");
+        for (int d = 1; d <= 16; d++) {
+            if (!rc.other_delta_n[d])
+                continue;
+            if (d < 16)
+                fprintf(stderr, "  %d-VBL: %d interval(s), %d miss(es)\n",
+                        d, rc.other_delta_n[d], rc.other_delta_miss[d]);
+            else
+                fprintf(stderr, "  >=16-VBL: %d interval(s), %d miss(es)\n",
+                        rc.other_delta_n[d], rc.other_delta_miss[d]);
+        }
+    } else {
+        fprintf(stderr, "Other interval lengths:       none\n");
+    }
+
+    print_gap_stage_timeline(&rc, source_s, have_pts_span);
 
     unmap_double_fb(&fb);
 

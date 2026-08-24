@@ -152,6 +152,28 @@
       "detail": "Build, scp and run dvd_video_test on the SS1: 500 frames unpaced through decode -> BGR0 -> DDR. Requires the DVD core loaded and a PAL DVD in /dev/sr0."
     },
     {
+      "label": "DVD Double Video Test: Build (ARM cross-compile)",
+      "type": "shell",
+      "command": "./build_dvd_video_double_test.sh",
+      "options": {
+        "cwd": "${workspaceFolder}/player/tools"
+      },
+      "problemMatcher": [],
+      "group": "build",
+      "detail": "Cross-compile dvd_video_double_test: 500 PTS-paced frames through mailbox A/B. Does not modify dvd_video_test.c."
+    },
+    {
+      "label": "DVD Double Video Test: Deploy + Run on SS1",
+      "type": "shell",
+      "command": "./deploy_dvd_video_double_test.sh",
+      "options": {
+        "cwd": "${workspaceFolder}/player/tools"
+      },
+      "problemMatcher": [],
+      "group": "test",
+      "detail": "Build, scp and run dvd_video_double_test on the SS1. Load the mailbox DVD.rbf, leave OSD Buffer on A, PAL DVD in /dev/sr0."
+    },
+    {
       "label": "Player: Deploy + Run on SS1",
       "type": "shell",
       "command": "./deploy-test.sh",
