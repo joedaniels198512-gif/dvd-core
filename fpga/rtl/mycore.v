@@ -1,7 +1,7 @@
 
 module mycore
 (
-	input         clk,          // 27 MHz CLK_VIDEO
+	input         clk,          // 27 MHz clk_sys / CLK_VIDEO
 	input         reset,
 	
 	input         pal,          // unused: this milestone is NTSC 480i only
@@ -15,8 +15,8 @@ module mycore
 	output reg    VBlank,
 	output reg    VSync,
 	output        field,
-
-	output  [7:0] video
+	output reg [9:0] hc = 0,
+	output reg [9:0] vc = 0
 );
 
 // NTSC BT.601 / DVD 480i at 13.5 MHz (CE_PIXEL = clk/2).
@@ -44,16 +44,7 @@ localparam [9:0] VS_VC1      = 10'd245;
 localparam [9:0] VS_VC1_END  = 10'd248;
 localparam [9:0] VS_HC1      = 10'd307;
 
-reg   [9:0] hc = 0;
-reg   [9:0] vc = 0;
 reg         field_r = 0;
-reg   [9:0] vvc = 0;
-reg  [63:0] rnd_reg;
-
-wire  [5:0] rnd_c = {rnd_reg[0],rnd_reg[1],rnd_reg[2],rnd_reg[2],rnd_reg[2],rnd_reg[2]};
-wire [63:0] rnd;
-
-lfsr random(rnd);
 
 assign field = field_r;
 
@@ -69,18 +60,13 @@ always @(posedge clk) begin
 			if(vc == (field_r ? V_LAST_F1 : V_LAST_F0)) begin
 				vc <= 0;
 				field_r <= ~field_r;
-				vvc <= vvc + 9'd6;
 			end else begin
 				vc <= vc + 1'd1;
 			end
 		end else begin
 			hc <= hc + 1'd1;
 		end
-
-		rnd_reg <= rnd;
 	end
-
-	if(reset) vvc <= 0;
 end
 
 always @(posedge clk) begin
@@ -105,42 +91,5 @@ always @(posedge clk) begin
 		end
 	end
 end
-
-reg  [7:0] cos_out;
-wire [5:0] cos_g = cos_out[7:3]+6'd32;
-cos cos(vvc + {vc[8:0], 2'b00}, cos_out);
-
-// Logical 480-line Y so the two fields weave instead of overwriting.
-wire [8:0] y = {vc[7:0], field_r};
-
-wire border = (hc < 10'd8) || (hc > 10'd711) ||
-              (y  <  9'd8) || (y  >  9'd471);
-
-wire [9:0] mid_h = 10'd360;
-wire [8:0] mid_v = 9'd240;
-wire xhair = ((hc >= (mid_h - 10'd1)) && (hc <= (mid_h + 10'd1))) ||
-             ((y  >= (mid_v -  9'd1)) && (y  <= (mid_v +  9'd1)));
-
-wire [7:0] bars =
-	(hc < 10'd90)  ? 8'h00 :
-	(hc < 10'd180) ? 8'h24 :
-	(hc < 10'd270) ? 8'h48 :
-	(hc < 10'd360) ? 8'h6C :
-	(hc < 10'd450) ? 8'h90 :
-	(hc < 10'd540) ? 8'hB4 :
-	(hc < 10'd630) ? 8'hD8 :
-	                 8'hFC;
-
-wire lower = (y >= 9'd360);
-wire check = hc[4] ^ y[4];
-
-// 1-line on / 1-line off grating on logical Y. True 480i weaves this into
-// a fine horizontal texture; duplicated 240p becomes a solid 30 Hz flash.
-wire stripes = (y >= 9'd64) && (y < 9'd128) && (hc > 10'd8) && (hc < 10'd711);
-
-assign video = (border | xhair) ? 8'hFF :
-               stripes          ? (y[0] ? 8'hFF : 8'h00) :
-               lower            ? (check ? 8'hE0 : 8'h20) :
-                                  bars;
 
 endmodule
