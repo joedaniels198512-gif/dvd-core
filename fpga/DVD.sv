@@ -27,8 +27,7 @@ assign ADC_BUS  = 'Z;
 assign USER_OUT = '1;
 assign {UART_RTS, UART_TXD, UART_DTR} = 0;
 assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
-assign {SDRAM_DQ, SDRAM_A, SDRAM_BA, SDRAM_CLK, SDRAM_CKE, SDRAM_DQML, SDRAM_DQMH, SDRAM_nWE, SDRAM_nCAS, SDRAM_nRAS, SDRAM_nCS} = 'Z;
-assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = '0;  
+assign {SDRAM_DQ, SDRAM_A, SDRAM_BA, SDRAM_CLK, SDRAM_CKE, SDRAM_DQML, SDRAM_DQMH, SDRAM_nWE, SDRAM_nCAS, SDRAM_nRAS, SDRAM_nCS} = 'Z;  
 
 assign VGA_SL = 0;
 assign VGA_F1 = 0;
@@ -51,9 +50,9 @@ assign BUTTONS = 0;
 //
 // Two native 720x576 BGR0/XRGB8888 buffers in reserved DDR:
 //   A = 0x30000000   B = 0x30200000
-// status[8] is the requested buffer (OSD: Buffer, A, B). The request is
-// synchronized onto clk_sys and latched into the active buffer only on
-// rising FB_VBL (HDMI vblank from ASCAL). FB_BASE follows the latched bit.
+// ARM requests a flip by writing bit 0 of the mailbox word at 0x30400000.
+// Once per rising FB_VBL the core publishes the previously fetched bit
+// to FB_BASE (OSD status[8] ORed in), then issues one 64-bit DDRAM read.
 //
 assign FB_EN          = 1;
 assign FB_FORMAT      = 5'b10110;      // 32bpp, BGR byte order (XRGB8888/BGR0)
@@ -133,17 +132,49 @@ pll pll
 	.outclk_0(clk_sys)
 );
 
-// status[8] = requested buffer. Latch only on rising FB_VBL.
-wire req_buf = status[8];
-reg  act_buf = 1'b0;
+// Mailbox at physical 0x30400000. DDRAM_ADDR is byte_addr[31:3].
+// One 64-bit Avalon read per rising FB_VBL (same handshake as ddr_svc).
+// FB_BASE follows the previously fetched bit, latched on that VBL edge
+// so ASCAL's VS-fall sample sees a stable base. OSD status[8] ORs in.
+localparam [28:0] MB_ADDR = 29'h0608_0000;
+
+reg        mb_rd  = 0;
+reg        mb_bit = 0;
+reg        act_buf = 0;
+reg  [1:0] mb_st  = 0; // 0 idle, 1 issue, 2 wait data
+
+assign DDRAM_CLK      = clk_sys;
+assign DDRAM_BURSTCNT = 8'd1;
+assign DDRAM_ADDR     = MB_ADDR;
+assign DDRAM_DIN      = 64'd0;
+assign DDRAM_BE       = 8'hFF;
+assign DDRAM_WE       = 1'b0;
+assign DDRAM_RD       = mb_rd;
 
 always @(posedge clk_sys) begin
 	reg vbl_d, vbl_d2, vbl_d3;
 	vbl_d  <= FB_VBL;
 	vbl_d2 <= vbl_d;
 	vbl_d3 <= vbl_d2;
+
+	mb_rd <= 0;
+
 	if (vbl_d2 & ~vbl_d3)
-		act_buf <= req_buf;
+		act_buf <= mb_bit | status[8];
+
+	case (mb_st)
+		0: if (vbl_d2 & ~vbl_d3)
+				mb_st <= 1;
+		1: if (!DDRAM_BUSY) begin
+				mb_rd <= 1;
+				mb_st <= 2;
+			end
+		2: if (DDRAM_DOUT_READY) begin
+				mb_bit <= DDRAM_DOUT[0];
+				mb_st  <= 0;
+			end
+		default: mb_st <= 0;
+	endcase
 end
 
 assign FB_BASE = act_buf ? 32'h3020_0000 : 32'h3000_0000;

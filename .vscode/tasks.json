@@ -86,6 +86,28 @@
       "detail": "Build, scp and run ddr_fb_double_writer on the SS1. Load DVD.rbf first, then toggle Buffer A/B in the OSD."
     },
     {
+      "label": "DDR Flip Test: Build (ARM cross-compile)",
+      "type": "shell",
+      "command": "./build_ddr_flip_test.sh",
+      "options": {
+        "cwd": "${workspaceFolder}/player/tools"
+      },
+      "problemMatcher": [],
+      "group": "build",
+      "detail": "Cross-compile ddr_fb_flip_test: ~300 ARM mailbox flips between buffers A and B."
+    },
+    {
+      "label": "DDR Flip Test: Deploy + Run on SS1",
+      "type": "shell",
+      "command": "./deploy_ddr_flip_test.sh",
+      "options": {
+        "cwd": "${workspaceFolder}/player/tools"
+      },
+      "problemMatcher": [],
+      "group": "test",
+      "detail": "Build, scp and run ddr_fb_flip_test on the SS1. Load a mailbox-capable DVD.rbf first. Leave OSD Buffer on A."
+    },
+    {
       "label": "DVD Frame Test: Build (ARM cross-compile)",
       "type": "shell",
       "command": "./build_dvd_frame_test.sh",
