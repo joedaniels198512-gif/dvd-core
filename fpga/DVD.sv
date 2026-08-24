@@ -45,30 +45,20 @@ assign LED_DISK = 0;
 assign LED_POWER = 0;
 assign BUTTONS = 0;
 
-/////////////////  HPS-shared framebuffer (MISTER_FB, double-buffered)  /////
+/////////////////  Native scanout (one VGA_* stream for CRT and HDMI)  /////
 //
 // Two native 720x576 BGR0/XRGB8888 buffers in reserved DDR:
 //   A = 0x30000000   B = 0x30200000
 // ARM requests a flip by writing bit 0 of the mailbox word at 0x30400000.
 // The core polls that 64-bit word every 16384 cycles of 27 MHz clk_sys
 // (~0.61 ms). mb_bit always holds the latest observed request.
-// On rising FB_VBL, act_buf <= mb_bit | status[8] so FB_BASE changes
-// only at the safe edge. OSD Buffer B still forces B.
-// Logical controller state is published separately at 0x30400008
-// (never written to 0x30400000).
+// display_buf latches mb_bit (OSD Buffer B still forces B) at the native
+// complete-frame wrap, before field-0 line-0 prefetch. Both analogue
+// fields and ASCAL capture of VGA_* use that one buffer for the frame.
+// Logical controller state is published at 0x30400008
+// (never written to 0x30400000): {JOY_MAGIC, display_buf, joystick_0[30:0]}.
+// joystick bits 0-9 are unchanged. Bit 31 is display_buf (A=0, B=1).
 //
-// CRT scanout snapshots act_buf into crt_buf at the end of field 1's
-// second-to-last active line, before the reader prefetches field-0
-// source line 0. OSD PAL-NTSC selects 576i vs 480i raster only.
-// HDMI MISTER_FB still uses live FB_BASE / act_buf.
-//
-assign FB_EN          = 1;
-assign FB_FORMAT      = 5'b10110;      // 32bpp, BGR byte order (XRGB8888/BGR0)
-assign FB_WIDTH       = 12'd720;
-assign FB_HEIGHT      = 12'd576;
-assign FB_STRIDE      = 14'd2880;      // 720 pixels * 4 bytes
-assign FB_FORCE_BLANK = 0;
-
 //////////////////////////////////////////////////////////////////
 
 wire [1:0] ar = status[122:121];
@@ -148,9 +138,9 @@ pll pll
 );
 
 // Mailbox at physical 0x30400000. DDRAM_ADDR is byte_addr[31:3].
-// Poll 16384 cycles of 27 MHz (~0.61 ms). Publish FB_BASE only on rising FB_VBL.
+// Poll 16384 cycles of 27 MHz (~0.61 ms).
 // 0x30400000 bit0 = ARM→FPGA FB A/B request (never RMW / never FPGA-write).
-// 0x30400008       = FPGA→ARM {JOY_MAGIC, joystick_0}.
+// 0x30400008       = FPGA→ARM {JOY_MAGIC, display_buf, joystick_0[30:0]}.
 // One mailbox-read opportunity is latched every poll tick (poll_due) and
 // always taken from idle before any controller write.
 // Video line-fill has priority on DDRAM; mailbox runs when the reader is idle.
@@ -163,12 +153,12 @@ localparam [9:0]  JOY_HB_MAX = 10'd1023;      // heartbeat ~0.62 s at 27 MHz
 reg        mb_rd  = 0;
 reg        mb_we  = 0;
 reg        mb_bit = 0;
-reg        act_buf = 0;
 reg  [2:0] mb_st  = 0; // 0 idle, 1 issue rd, 2 wait rd, 3 issue wr, 4 wr hold
 reg [13:0] poll_cnt = 0;
 reg        poll_due = 0;
 reg        joy_pending = 1'b1;
 reg [31:0] joy_sent = 32'hffff_ffff;
+reg        disp_sent = 1'b0;
 reg  [9:0] joy_hb = 0;
 
 wire        vid_req;
@@ -177,31 +167,24 @@ wire        vid_rd;
 wire [28:0] vid_addr;
 wire  [7:0] vid_burstcnt;
 wire  [7:0] pix_r, pix_g, pix_b;
+wire        display_buf;
 
 assign DDRAM_CLK      = clk_sys;
 assign DDRAM_BURSTCNT = vid_active ? vid_burstcnt : 8'd1;
 assign DDRAM_ADDR     = vid_active ? vid_addr :
                         ((mb_st == 3'd3 || mb_st == 3'd4) ? JOY_ADDR : MB_ADDR);
-assign DDRAM_DIN      = {JOY_MAGIC, joystick_0};
+assign DDRAM_DIN      = {JOY_MAGIC, display_buf, joystick_0[30:0]};
 assign DDRAM_BE       = 8'hFF;
 assign DDRAM_WE       = vid_active ? 1'b0 : mb_we;
 assign DDRAM_RD       = vid_active ? vid_rd : mb_rd;
 
 always @(posedge clk_sys) begin
-	reg vbl_d, vbl_d2, vbl_d3;
-	vbl_d  <= FB_VBL;
-	vbl_d2 <= vbl_d;
-	vbl_d3 <= vbl_d2;
-
 	mb_rd <= 0;
 	mb_we <= 0;
 	poll_cnt <= poll_cnt + 1'd1;
 
 	if (poll_cnt == POLL_MAX)
 		poll_due <= 1'b1;
-
-	if (vbl_d2 & ~vbl_d3)
-		act_buf <= mb_bit | status[8];
 
 	case (mb_st)
 		0: if (vid_req) begin
@@ -230,7 +213,8 @@ always @(posedge clk_sys) begin
 				mb_st <= 3'd4;
 			end
 		4: begin
-				joy_sent <= joystick_0;
+				joy_sent  <= joystick_0;
+				disp_sent <= display_buf;
 				joy_pending <= 1'b0;
 				mb_st <= 3'd0;
 			end
@@ -239,9 +223,9 @@ always @(posedge clk_sys) begin
 
 	if (joystick_0 != joy_sent)
 		joy_pending <= 1'b1;
+	if (display_buf != disp_sent)
+		joy_pending <= 1'b1;
 end
-
-assign FB_BASE = act_buf ? 32'h3020_0000 : 32'h3000_0000;
 
 wire reset = RESET | status[0] | buttons[1];
 
@@ -294,7 +278,8 @@ fb_line_reader fb_line_reader
 	.vc(vc),
 	.field(field),
 	.ce_pix(ce_pix),
-	.act_buf(act_buf),
+	.req_buf(mb_bit | status[8]),
+	.display_buf(display_buf),
 	.pal(status[2]),
 
 	.mb_idle(mb_st == 3'd0),

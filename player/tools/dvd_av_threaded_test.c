@@ -2,8 +2,9 @@
  * dvd_av_threaded_test.c — FROZEN threaded A/V proof (tag working-threaded-av).
  *
  * SS1, title 2 / chapter 1, ~30 s: continuous playback, normal speed, good
- * lip-sync. Do not retune queues, A/V clocks, decode, swscale, or mailbox
- * scheduling from this file.
+ * lip-sync. Do not retune queues, A/V clocks, decode, or swscale from this
+ * file. A/B presentation uses FPGA display_buf ack (0x30400008 bit 31), not
+ * HDMI FBIO_WAITFORVSYNC.
  *
  * Proven hardware (this tag):
  *   30.872 s audio consumed, 0 MrAudio underruns, avg fill 139.2 ms
@@ -11,8 +12,9 @@
  *   1 frame >80 ms late
  *
  * Known / non-blocking (not bugs; do not "fix"):
- *   −30.9 ms mean offset is mailbox-VBL presentation vs the audio master
- *     clock, with no frame dropping. Sync is visually good.
+ *   −30.9 ms mean offset was mailbox-VBL presentation vs the audio master
+ *     clock, with no frame dropping. Native display_buf ack replaces that
+ *     HDMI vblank grid.
  *   Average fill 139.2 ms vs 150 ms target is healthy, not starvation.
  *   1 late frame in 771 is acceptable for this proof.
  *   MPEG-PS yields ~340 compressed video packets/s, not 1 packet/frame.
@@ -87,6 +89,10 @@
 #define FB_A_PHYS       0x30000000UL
 #define FB_B_PHYS       0x30200000UL
 #define MB_PHYS         0x30400000UL
+#define JOY_OFF         8
+#define JOY_MAGIC       0x44564431u  /* "DVD1" at 0x3040000C */
+#define DISP_BUF_BIT    31           /* display_buf in joystick word */
+#define ACK_TIMEOUT_US  200000
 #define FB_W            720
 #define FB_H            576
 #define FB_STRIDE       2880
@@ -465,7 +471,8 @@ static int map_double_fb(FBPair *fb)
     fb->vbl_origin_us = t1;
     fb->margin_us = MAILBOX_POLL_MARGIN_US;
     fprintf(stderr,
-            "HDMI vsync: %d intervals in %.3f ms  ->  %.3f ms/period (%.3f Hz)\n",
+            "HDMI vsync (diagnostic only, not the flip grid): "
+            "%d intervals in %.3f ms  ->  %.3f ms/period (%.3f Hz)\n",
             VSYNC_SAMPLE_INTERVALS, (double)(t1 - t0) / 1000.0,
             (double)fb->vsync_period_us / 1000.0,
             1e6 / (double)fb->vsync_period_us);
@@ -486,19 +493,18 @@ static void unmap_double_fb(FBPair *fb)
         close(fb->fb_fd);
 }
 
-static int64_t vbl_time(const FBPair *fb, int64_t idx)
+static int read_display_buf(const FBPair *fb, int *out)
 {
-    return fb->vbl_origin_us + idx * fb->vsync_period_us;
-}
+    volatile uint64_t *st =
+        (volatile uint64_t *)((uint8_t *)fb->mbox + JOY_OFF);
+    uint64_t w = *st;
+    uint32_t magic = (uint32_t)(w >> 32);
+    uint32_t joy = (uint32_t)w;
 
-static int64_t vbl_nearest(const FBPair *fb, int64_t t_us)
-{
-    int64_t p = fb->vsync_period_us;
-    if (p <= 0)
-        return 0;
-    if (t_us <= fb->vbl_origin_us)
-        return 0;
-    return (t_us - fb->vbl_origin_us + p / 2) / p;
+    if (magic != JOY_MAGIC)
+        return -1;
+    *out = (int)((joy >> DISP_BUF_BIT) & 1u);
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1224,33 +1230,42 @@ static void assign_video_pts(Player *p, const AVFrame *frame,
     p->assigned_pts = timeline;
 }
 
-static void wait_until(Player *p, int64_t target)
+static int wait_valid_display_buf(Player *p, int *out, int64_t timeout_us)
 {
-    int64_t now = av_gettime_relative();
-    if (now >= target)
-        return;
-    int64_t t0 = now;
-    int64_t remain = target - now;
-    if (remain > 2500)
-        av_usleep((unsigned)(remain - 1500));
-    while (av_gettime_relative() < target) {
-        int64_t v0 = av_gettime_relative();
-        wait_vsync(p->fb->fb_fd);
-        p->vsync_us += av_gettime_relative() - v0;
+    int64_t t0 = av_gettime_relative();
+
+    for (;;) {
+        if (read_display_buf(p->fb, out) == 0)
+            return 0;
+        if (p->fail)
+            return -1;
+        if (av_gettime_relative() - t0 > timeout_us) {
+            fprintf(stderr, "FAIL: no DVD1 display_buf status at 0x30400008\n");
+            return -1;
+        }
+        av_usleep(500);
     }
-    p->wait_us += av_gettime_relative() - t0;
 }
 
-static int64_t choose_present_vbl(Player *p, int64_t pts_target, int64_t now)
+static int wait_display_buf(Player *p, int want, int64_t timeout_us)
 {
-    int64_t min_k = p->present_vbl + 1;
-    int64_t k = vbl_nearest(p->fb, pts_target);
-    int64_t margin = p->fb->margin_us;
-    if (k < min_k)
-        k = min_k;
-    while (vbl_time(p->fb, k) - margin < now)
-        k++;
-    return k;
+    int64_t t0 = av_gettime_relative();
+
+    for (;;) {
+        int cur;
+
+        if (read_display_buf(p->fb, &cur) == 0 && cur == want)
+            return 0;
+        if (p->fail)
+            return -1;
+        if (av_gettime_relative() - t0 > timeout_us) {
+            fprintf(stderr,
+                    "FAIL: display_buf ack timeout (want %c)\n",
+                    want ? 'B' : 'A');
+            return -1;
+        }
+        av_usleep(500);
+    }
 }
 
 static void record_offset(Player *p, int64_t off)
@@ -1295,13 +1310,12 @@ static int present_video_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
         AVRational fps0 = detect_fps(p, vdec);
         fprintf(stderr,
                 "\n=== VIDEO PATH (threaded, audio-master) ===\n"
-                "%dx%d %s  fps %d/%d (%.3f)  vsync %.3f ms\n",
+                "%dx%d %s  fps %d/%d (%.3f)  present=FPGA display_buf ack\n",
                 frame->width, frame->height,
                 av_get_pix_fmt_name(frame->format)
                     ? av_get_pix_fmt_name(frame->format) : "?",
                 fps0.num, fps0.den,
-                (fps0.num > 0 && fps0.den > 0) ? av_q2d(fps0) : 0.0,
-                (double)p->fb->vsync_period_us / 1000.0);
+                (fps0.num > 0 && fps0.den > 0) ? av_q2d(fps0) : 0.0);
         *sws = sws_getContext(FB_W, FB_H, frame->format,
                               FB_W, FB_H, AV_PIX_FMT_BGR0,
                               SWS_FAST_BILINEAR, NULL, NULL, NULL);
@@ -1326,9 +1340,6 @@ static int present_video_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
     if (vpts_us != AV_NOPTS_VALUE)
         p->last_video_pts_us = vpts_us;
 
-    if (p->present_vbl >= 0)
-        wait_until(p, vbl_time(p->fb, p->present_vbl));
-
     if (timed && vpts_us != AV_NOPTS_VALUE) {
         int64_t hold0 = av_gettime_relative();
         for (;;) {
@@ -1350,7 +1361,19 @@ static int present_video_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
         }
     }
 
-    int next = p->displayed ^ 1;
+    int on_screen;
+    if (wait_valid_display_buf(p, &on_screen, ACK_TIMEOUT_US) < 0) {
+        player_abort(p);
+        return -1;
+    }
+
+    int next = on_screen ^ 1;
+    if (next == on_screen) {
+        fprintf(stderr, "FAIL: dest buffer is display_buf\n");
+        player_abort(p);
+        return -1;
+    }
+
     dst_data[0] = next ? p->fb->fb_b : p->fb->fb_a;
     dst_linesize[0] = FB_STRIDE;
     int64_t c0 = av_gettime_relative();
@@ -1359,25 +1382,20 @@ static int present_video_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
     p->convert_us += av_gettime_relative() - c0;
     __sync_synchronize();
 
-    int64_t now = av_gettime_relative();
     int64_t aclk = clock_read(&p->clock, NULL, NULL);
-    int64_t pts_target = now;
-    if (timed && aclk != AV_NOPTS_VALUE && vpts_us != AV_NOPTS_VALUE) {
-        int64_t off = vpts_us - aclk;
-        pts_target = now + off;
-        record_offset(p, off);
-    }
+    if (timed && aclk != AV_NOPTS_VALUE && vpts_us != AV_NOPTS_VALUE)
+        record_offset(p, vpts_us - aclk);
 
-    int64_t k = choose_present_vbl(p, pts_target, now);
-    if (k > 0)
-        wait_until(p, vbl_time(p->fb, k - 1));
     p->fb->mbox[0] = (uint32_t)next;
+    if (wait_display_buf(p, next, ACK_TIMEOUT_US) < 0) {
+        player_abort(p);
+        return -1;
+    }
     if (next)
         p->frames_b++;
     else
         p->frames_a++;
     p->flips++;
-    p->present_vbl = k;
     p->displayed = next;
     p->rendered++;
     return 0;

@@ -3,7 +3,8 @@
 // NTSC: src_y = vc*2 + field for vc 0..239 → lines 0..479.
 // PAL:  src_y = vc*2 + field for vc 0..287 → lines 0..575.
 // Raster counters are inputs; never stall them.
-// crt_buf snapshots act_buf once per complete CRT frame (field 1 -> 0).
+// display_buf snapshots req_buf once per complete native frame (field 1 -> 0).
+// HDMI ASCAL captures the same VGA_* stream; it does not read these DDR buffers.
 
 module fb_line_reader
 (
@@ -14,7 +15,8 @@ module fb_line_reader
 	input  [9:0]  vc,
 	input         field,
 	input         ce_pix,
-	input         act_buf,
+	input         req_buf,
+	output reg    display_buf,
 	input         pal,
 
 	input         mb_idle,
@@ -100,12 +102,11 @@ assign ddr_rd     = ddr_rd_r;
 assign ddr_addr   = line_base + {20'd0, beats_got};
 assign ddr_burstcnt = BURST_BEATS;
 
-// Snapshot act_buf before field-1 last active line, where y_cand becomes
+// Snapshot req_buf before field-1 last active line, where y_cand becomes
 // source line 0 of field 0. Display of the last odd line is already in the
 // ping-pong RAM; only subsequent fills (field 0 line 0 onward) use the new
 // base. PAL uses vc==286 / hc==863; NTSC stays vc==238 / hc==857.
-reg         crt_buf;
-wire [28:0] fb_base   = crt_buf ? FB_B_ADDR : FB_A_ADDR;
+wire [28:0] fb_base   = display_buf ? FB_B_ADDR : FB_A_ADDR;
 wire [28:0] cand_base = fb_base + y_cand * 29'd360;
 
 wire pal_chg = pal_d != pal;
@@ -113,9 +114,9 @@ wire pal_chg = pal_d != pal;
 always @(posedge clk) begin
 	pal_d <= pal;
 	if (reset || pal_chg)
-		crt_buf <= 1'b0;
+		display_buf <= 1'b0;
 	else if (ce_pix && field && (vc == (V_ACTIVE - 10'd2)) && (hc == H_LAST))
-		crt_buf <= act_buf;
+		display_buf <= req_buf;
 end
 
 always @(posedge clk) begin
