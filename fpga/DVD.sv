@@ -30,7 +30,6 @@ assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 assign {SDRAM_DQ, SDRAM_A, SDRAM_BA, SDRAM_CLK, SDRAM_CKE, SDRAM_DQML, SDRAM_DQMH, SDRAM_nWE, SDRAM_nCAS, SDRAM_nRAS, SDRAM_nCS} = 'Z;  
 
 assign VGA_SL = 0;
-assign VGA_F1 = 0;
 assign VGA_SCALER  = 0;
 assign VGA_DISABLE = 0;
 assign HDMI_FREEZE = 0;
@@ -136,11 +135,13 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 ///////////////////////   CLOCKS   ///////////////////////////////
 
 wire clk_sys;
+wire clk_vid;
 pll pll
 (
 	.refclk(CLK_50M),
 	.rst(0),
-	.outclk_0(clk_sys)
+	.outclk_0(clk_sys),
+	.outclk_1(clk_vid)
 );
 
 // Mailbox at physical 0x30400000. DDRAM_ADDR is byte_addr[31:3].
@@ -238,19 +239,20 @@ wire VBlank;
 wire VSync;
 wire ce_pix;
 wire hvcnt_atzero;
+wire field;
 wire [7:0] video;
 
 // Leave H/V sync always on. This stabilizes the video output while the core
 // is in reset. This example releases the reset when H/V counters are at zero.
 reg reset_core = 1;
-always @(posedge clk_sys) begin
+always @(posedge clk_vid) begin
 	if(reset) reset_core <= 1;
 	else if(hvcnt_atzero) reset_core <= 0;
 end
 
 mycore mycore
 (
-	.clk(clk_sys),
+	.clk(clk_vid),
 	.reset(reset_core),
 
 	.pal(status[2]),
@@ -263,12 +265,14 @@ mycore mycore
 	.HSync(HSync),
 	.VBlank(VBlank),
 	.VSync(VSync),
+	.field(field),
 
 	.video(video)
 );
 
-assign CLK_VIDEO = clk_sys;
+assign CLK_VIDEO = clk_vid;
 assign CE_PIXEL = ce_pix;
+assign VGA_F1 = field;
 
 assign VGA_DE = ~(HBlank | VBlank);
 assign VGA_HS = HSync;
