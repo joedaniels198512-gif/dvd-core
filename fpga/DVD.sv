@@ -59,7 +59,8 @@ assign BUTTONS = 0;
 //
 // CRT scanout snapshots act_buf into crt_buf at the end of field 1's
 // second-to-last active line, before the reader prefetches field-0
-// source line 0. HDMI MISTER_FB still uses live FB_BASE / act_buf.
+// source line 0. OSD PAL-NTSC selects 576i vs 480i raster only.
+// HDMI MISTER_FB still uses live FB_BASE / act_buf.
 //
 assign FB_EN          = 1;
 assign FB_FORMAT      = 5'b10110;      // 32bpp, BGR byte order (XRGB8888/BGR0)
@@ -294,6 +295,7 @@ fb_line_reader fb_line_reader
 	.field(field),
 	.ce_pix(ce_pix),
 	.act_buf(act_buf),
+	.pal(status[2]),
 
 	.mb_idle(mb_st == 3'd0),
 	.vid_req(vid_req),

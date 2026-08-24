@@ -1,6 +1,8 @@
-// Ping-pong line reader for native 480i CRT.
-// Source is 720x576 BGR0, stride 2880. CRT uses lines 0..479
-// (src_y = vc*2 + field). Raster counters are inputs; never stall them.
+// Ping-pong line reader for native 480i / 576i CRT.
+// Source is 720x576 BGR0, stride 2880.
+// NTSC: src_y = vc*2 + field for vc 0..239 → lines 0..479.
+// PAL:  src_y = vc*2 + field for vc 0..287 → lines 0..575.
+// Raster counters are inputs; never stall them.
 // crt_buf snapshots act_buf once per complete CRT frame (field 1 -> 0).
 
 module fb_line_reader
@@ -13,6 +15,7 @@ module fb_line_reader
 	input         field,
 	input         ce_pix,
 	input         act_buf,
+	input         pal,
 
 	input         mb_idle,
 	output        vid_req,
@@ -34,24 +37,26 @@ localparam [28:0] FB_B_ADDR   = 29'h0604_0000; // 0x30200000 >> 3
 localparam [8:0]  BEATS_LINE  = 9'd360;        // 720 pixels * 4 / 8
 localparam [7:0]  BURST_BEATS = 8'd120;        // 3 bursts per line
 localparam [9:0]  H_ACTIVE    = 10'd720;
-localparam [9:0]  H_LAST      = 10'd857;        // matches mycore wrap; not a raster
-localparam [9:0]  V_ACTIVE    = 10'd240;
 
 localparam [1:0]  ST_IDLE  = 2'd0;
 localparam [1:0]  ST_ISSUE = 2'd1;
 localparam [1:0]  ST_WAIT  = 2'd2;
 
+// Mode-dependent wrap / field height. NTSC values match proven Stage C.
+wire [9:0] H_LAST   = pal ? 10'd863 : 10'd857;
+wire [9:0] V_ACTIVE = pal ? 10'd288 : 10'd240;
+
 reg  [63:0] line0 [0:359];
 reg  [63:0] line1 [0:359];
 
 reg         buf_ok [0:1];
-reg   [8:0] buf_y  [0:1];
+reg   [9:0] buf_y  [0:1];
 
 wire        next_field    = ~field;
-wire  [8:0] y_disp        = {vc[7:0], field};
-wire  [8:0] y_next_active = {vc[7:0] + 8'd1, field};
-wire  [8:0] y_nf0         = {8'd0, next_field};
-wire  [8:0] y_nf1         = {8'd1, next_field};
+wire  [9:0] y_disp        = {vc[8:0], field};
+wire  [9:0] y_next_active = {vc[8:0] + 9'd1, field};
+wire  [9:0] y_nf0         = {9'd0, next_field};
+wire  [9:0] y_nf1         = {9'd1, next_field};
 
 wire        have0_disp = buf_ok[0] && buf_y[0] == y_disp;
 wire        have1_disp = buf_ok[1] && buf_y[1] == y_disp;
@@ -64,7 +69,7 @@ wire        have_nf0 =
 
 // During the last active line only one RAM is free, so prefetch solely
 // the first line of the next field. The second line waits for VBlank.
-wire  [8:0] y_cand =
+wire  [9:0] y_cand =
 	(vc < (V_ACTIVE - 10'd1)) ? y_next_active :
 	(vc < V_ACTIVE)           ? y_nf0 :
 	have_nf0                  ? y_nf1 : y_nf0;
@@ -82,11 +87,12 @@ wire        fill_sel =
 
 reg   [1:0] st;
 reg         fill_sel_r;
-reg   [8:0] y_fill_r;
+reg   [9:0] y_fill_r;
 reg  [28:0] line_base;
 reg   [8:0] beats_got;
 reg   [7:0] burst_got;
 reg         ddr_rd_r;
+reg         pal_d = 0;
 
 assign vid_req    = (st != ST_IDLE) || fill_need;
 assign vid_active = (st != ST_IDLE);
@@ -95,14 +101,18 @@ assign ddr_addr   = line_base + {20'd0, beats_got};
 assign ddr_burstcnt = BURST_BEATS;
 
 // Snapshot act_buf before field-1 last active line, where y_cand becomes
-// source line 0 of field 0. Display of line 479 is already in the ping-pong
-// RAM; only subsequent fills (field 0 line 0 onward) use the new base.
+// source line 0 of field 0. Display of the last odd line is already in the
+// ping-pong RAM; only subsequent fills (field 0 line 0 onward) use the new
+// base. PAL uses vc==286 / hc==863; NTSC stays vc==238 / hc==857.
 reg         crt_buf;
 wire [28:0] fb_base   = crt_buf ? FB_B_ADDR : FB_A_ADDR;
 wire [28:0] cand_base = fb_base + y_cand * 29'd360;
 
+wire pal_chg = pal_d != pal;
+
 always @(posedge clk) begin
-	if (reset)
+	pal_d <= pal;
+	if (reset || pal_chg)
 		crt_buf <= 1'b0;
 	else if (ce_pix && field && (vc == (V_ACTIVE - 10'd2)) && (hc == H_LAST))
 		crt_buf <= act_buf;
@@ -111,14 +121,14 @@ end
 always @(posedge clk) begin
 	ddr_rd_r <= 1'b0;
 
-	if (reset) begin
+	if (reset || pal_chg) begin
 		st          <= ST_IDLE;
 		buf_ok[0]   <= 1'b0;
 		buf_ok[1]   <= 1'b0;
 		beats_got   <= 9'd0;
 		burst_got   <= 8'd0;
 		fill_sel_r  <= 1'b0;
-		y_fill_r    <= 9'd0;
+		y_fill_r    <= 10'd0;
 		line_base   <= 29'd0;
 	end else begin
 		case (st)
