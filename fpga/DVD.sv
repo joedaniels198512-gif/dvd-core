@@ -102,8 +102,8 @@ localparam CONF_STR = {
 	// D-pad is implicit: joystick_0[0]=Right [1]=Left [2]=Down [3]=Up.
 	// Named buttons occupy bits 4-9. Do not map OSD/Home (buttons[0]).
 	"J1,Select,Back,Play/Pause,DVD Menu,Previous Chapter,Next Chapter;",
-	"jn,Select,B,Start,X,L,R;",
-	"jp,Select,A,Start,Y,L,R;",
+	"jn,A,B,Start,X,L,R;",
+	"jp,A,B,Start,X,L,R;",
 	"v,0;", // [optional] config version 0-99.
 	        // If CONF_STR options are changed in incompatible way, then change version number too,
 			  // so all options will get default values on first start.
