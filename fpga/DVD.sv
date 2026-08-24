@@ -51,8 +51,10 @@ assign BUTTONS = 0;
 // Two native 720x576 BGR0/XRGB8888 buffers in reserved DDR:
 //   A = 0x30000000   B = 0x30200000
 // ARM requests a flip by writing bit 0 of the mailbox word at 0x30400000.
-// Once per rising FB_VBL the core publishes the previously fetched bit
-// to FB_BASE (OSD status[8] ORed in), then issues one 64-bit DDRAM read.
+// The core polls that 64-bit word about every 0.82 ms (16384 cycles of
+// 20 MHz clk_sys). mb_bit always holds the latest observed request.
+// On rising FB_VBL, act_buf <= mb_bit | status[8] so FB_BASE changes
+// only at the safe edge. OSD Buffer B still forces B.
 //
 assign FB_EN          = 1;
 assign FB_FORMAT      = 5'b10110;      // 32bpp, BGR byte order (XRGB8888/BGR0)
@@ -133,15 +135,15 @@ pll pll
 );
 
 // Mailbox at physical 0x30400000. DDRAM_ADDR is byte_addr[31:3].
-// One 64-bit Avalon read per rising FB_VBL (same handshake as ddr_svc).
-// FB_BASE follows the previously fetched bit, latched on that VBL edge
-// so ASCAL's VS-fall sample sees a stable base. OSD status[8] ORs in.
-localparam [28:0] MB_ADDR = 29'h0608_0000;
+// Poll ~0.82 ms (16384 * 50 ns). Publish FB_BASE only on rising FB_VBL.
+localparam [28:0] MB_ADDR   = 29'h0608_0000;
+localparam [13:0] POLL_MAX  = 14'd16383;
 
 reg        mb_rd  = 0;
 reg        mb_bit = 0;
 reg        act_buf = 0;
 reg  [1:0] mb_st  = 0; // 0 idle, 1 issue, 2 wait data
+reg [13:0] poll_cnt = 0;
 
 assign DDRAM_CLK      = clk_sys;
 assign DDRAM_BURSTCNT = 8'd1;
@@ -158,12 +160,13 @@ always @(posedge clk_sys) begin
 	vbl_d3 <= vbl_d2;
 
 	mb_rd <= 0;
+	poll_cnt <= poll_cnt + 1'd1;
 
 	if (vbl_d2 & ~vbl_d3)
 		act_buf <= mb_bit | status[8];
 
 	case (mb_st)
-		0: if (vbl_d2 & ~vbl_d3)
+		0: if (poll_cnt == POLL_MAX)
 				mb_st <= 1;
 		1: if (!DDRAM_BUSY) begin
 				mb_rd <= 1;
