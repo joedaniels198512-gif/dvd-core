@@ -15,6 +15,9 @@
  * MiSTer OSD/Home is buttons[0] and does not appear here.
  *
  *   dvd_input_test [-v]
+ *
+ * -v also prints the raw 32-bit joystick_0 word on every change, plus
+ * unnamed bits 10–31, so default SNES mapping vs missing jn/jp is visible.
  */
 
 #define _GNU_SOURCE
@@ -117,7 +120,7 @@ int main(int argc, char **argv)
             (unsigned long)(MB_PHYS + JOY_OFF), JOY_MAGIC);
     fprintf(stderr, "Press buttons (OSD/Home is MiSTer OSD, not DVD MENU).\n");
     if (verbose)
-        fprintf(stderr, "Verbose: releases printed too.\n");
+        fprintf(stderr, "Verbose: raw joystick_0 on every change; named releases too.\n");
 
     if (check_range(MB_PHYS, MB_MAP_SIZE) < 0)
         return 1;
@@ -166,14 +169,20 @@ int main(int argc, char **argv)
             continue;
         }
         uint32_t changed = now ^ prev;
-        for (i = 0; i < 10; i++) {
+        if (changed && verbose)
+            printf("raw 0x%08x\n", now);
+        for (i = 0; i < 32; i++) {
             uint32_t bit = 1u << i;
             if (!(changed & bit))
                 continue;
-            if (now & bit)
-                printf("%s\n", names[i]);
-            else if (verbose)
-                printf("%s released\n", names[i]);
+            if (i < 10) {
+                if (now & bit)
+                    printf("%s\n", names[i]);
+                else if (verbose)
+                    printf("%s released\n", names[i]);
+            } else if (verbose) {
+                printf("bit %d%s\n", i, (now & bit) ? "" : " released");
+            }
         }
         prev = now;
         usleep(500);
