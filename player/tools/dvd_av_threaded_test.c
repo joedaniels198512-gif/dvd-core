@@ -48,7 +48,9 @@
 #include <libavutil/avutil.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/cpu.h>
+#include <libavutil/dict.h>
 #include <libavutil/error.h>
+#include <libavutil/intreadwrite.h>
 #include <libavutil/mathematics.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/samplefmt.h>
@@ -133,8 +135,13 @@ enum {
 #define CTRL_POLL_US        8000
 #define CTRL_REPEAT_DELAY_US  400000
 #define CTRL_REPEAT_RATE_US   120000
+#define CANCEL_EXIT_HOLD_US   3000000  /* hold B/CANCEL to return to launcher */
 #define NAVQ_CAP            16
 #define HL_BORDER_PX        4
+/* libdvdnav 4.x: btn_coli[][select:0 / action:1] */
+#define HL_MODE_SELECT      0
+#define HL_MODE_ACTION      1
+#define SPU_MAX_PKT         0x10000
 #define NAV_WAIT_FIFO_US    400000
 #define STILL_DRAIN_WAIT_US 750000
 #define VQ_MARK_STILL_BOUNDARY ((void *)(uintptr_t)0x53544c42u) /* STLB */
@@ -148,6 +155,7 @@ enum {
 #define FB_H            FB_H_PAL   /* DDR mmap / allocation height */
 #define FB_STRIDE       2880
 #define FB_SIZE         ((size_t)FB_STRIDE * FB_H)
+#define SPU_IDX_MAX     (FB_W * FB_H)
 #define MB_MAP_SIZE     4096
 
 #define STARTUP_DISPLAY_VBLS     2
@@ -167,12 +175,25 @@ enum {
 static volatile sig_atomic_t stage = 0;
 static volatile sig_atomic_t g_interrupt = 0;
 static int g_debug_stats = 0;
+static int g_debug_spu = 0;
+static int g_debug_yellow_highlight = 0;
 
 static void dbg(const char *fmt, ...)
 {
     va_list ap;
 
     if (!g_debug_stats)
+        return;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
+
+static void spu_dbg(const char *fmt, ...)
+{
+    va_list ap;
+
+    if (!g_debug_spu)
         return;
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
@@ -323,6 +344,7 @@ static void player_wait_still_drain(Player *p, DVDIO *d);
 static void prefill_release(Player *p, const char *reason);
 static int prefill_is_released(Player *p);
 static void navq_post(Player *p, NavCmd cmd);
+static void pause_wake(Player *p);
 static void pause_cancel(Player *p);
 static int pause_is_held(Player *p);
 static int pause_should_hold_audio(Player *p);
@@ -330,6 +352,9 @@ static void pause_wait_unheld(Player *p);
 static int pause_wait_control(Player *p);
 static int navq_count(Player *p);
 static void dvdio_leave_menu(DVDIO *d);
+static int player_active_h(const Player *p);
+static void present_draw_highlight(Player *p, uint8_t *dst, int stride,
+                                   int frame_menu);
 
 static int dvd_read_packet(void *opaque, uint8_t *buf, int buf_size)
 {
@@ -457,6 +482,9 @@ typedef struct {
     int buffered_video;
     int buffered_yuv;
     int debug_stats;
+    int debug_spu;
+    int debug_yellow_highlight;
+    int authored_start;
 } Cli;
 
 static void usage(void)
@@ -469,8 +497,13 @@ static void usage(void)
             "                              [--buffered-video]\n"
             "                              [--buffered-yuv-video]\n"
             "                              [--debug-stats]\n"
+            "                              [--debug-spu]\n"
+            "                              [--debug-yellow-highlight]\n"
+            "                              [--authored-start]\n"
             "       dvd_av_threaded_test [device] --list-titles\n"
             "Defaults to /dev/sr0, title 2 / chapter 1.\n"
+            "--authored-start        skip title/chapter jump; follow the disc\n"
+            "                        First Play / VM (public launcher).\n"
             "--initial-video-skip N  discard N decoded frames after audio is\n"
             "                        ready, then present remaining frames with\n"
             "                        PTS shifted by -N*T (hold and stale).\n"
@@ -490,7 +523,10 @@ static void usage(void)
             "                        inactive DDR. Default path unchanged.\n"
             "--debug-stats           verbose instrumentation (ACK, timings,\n"
             "                        queues, stale distributions, threads).\n"
-            "                        Default off; normal output is compact.\n");
+            "                        Default off; normal output is compact.\n"
+            "--debug-spu             log menu SPU/HLI decode (no per-frame spam).\n"
+            "--debug-yellow-highlight  restore the old yellow button rectangle\n"
+            "                        instead of authored SPU/HLI overlay.\n");
 }
 
 static int parse_positive_int(const char *s, int *out)
@@ -592,6 +628,18 @@ static int parse_cli(int argc, char **argv, Cli *cli)
             cli->debug_stats = 1;
             continue;
         }
+        if (!strcmp(argv[i], "--debug-spu")) {
+            cli->debug_spu = 1;
+            continue;
+        }
+        if (!strcmp(argv[i], "--debug-yellow-highlight")) {
+            cli->debug_yellow_highlight = 1;
+            continue;
+        }
+        if (!strcmp(argv[i], "--authored-start")) {
+            cli->authored_start = 1;
+            continue;
+        }
         if (argv[i][0] == '-') {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             usage();
@@ -599,8 +647,12 @@ static int parse_cli(int argc, char **argv, Cli *cli)
         }
         cli->device = argv[i];
     }
-    if (cli->list_titles && (cli->title || cli->chapter)) {
-        fprintf(stderr, "--list-titles cannot be combined with --title/--chapter\n");
+    if (cli->list_titles && (cli->title || cli->chapter || cli->authored_start)) {
+        fprintf(stderr, "--list-titles cannot be combined with --title/--chapter/--authored-start\n");
+        return -1;
+    }
+    if (cli->authored_start && (cli->title || cli->chapter)) {
+        fprintf(stderr, "--authored-start cannot be combined with --title/--chapter\n");
         return -1;
     }
     if (cli->chapter && !cli->title) {
@@ -848,6 +900,8 @@ typedef struct {
     int primed;
     int64_t dir_held_us[4];
     int64_t dir_last_us[4];
+    int64_t cancel_hold_start_us;
+    int cancel_exit_triggered;
     int magic_ok;
     int magic_logged;
     unsigned long events;
@@ -921,8 +975,29 @@ static void controller_poll(ControllerPad *pad, uint32_t bits, int64_t now_us,
         controller_emit("RIGHT", &pad->events, p, NAVCMD_RIGHT);
     if (now.confirm && !prev.confirm)
         controller_emit("CONFIRM", &pad->events, p, NAVCMD_ACTIVATE);
+    /*
+     * CANCEL is rising-edge only — it is not in the D-pad auto-repeat
+     * loop. A tap posts one NAVCMD_CANCEL. A held B does not flood
+     * dvdnav; after CANCEL_EXIT_HOLD_US it requests the same shutdown
+     * as SIGINT/SIGTERM (g_interrupt).
+     */
     if (now.cancel && !prev.cancel)
         controller_emit("CANCEL", &pad->events, p, NAVCMD_CANCEL);
+    if (now.cancel) {
+        if (!pad->cancel_hold_start_us)
+            pad->cancel_hold_start_us = now_us;
+        if (!pad->cancel_exit_triggered &&
+            now_us - pad->cancel_hold_start_us >= CANCEL_EXIT_HOLD_US) {
+            pad->cancel_exit_triggered = 1;
+            fprintf(stderr, "CONTROLLER: EXIT hold 3000ms\n");
+            fprintf(stderr, "PLAYER: returning to launcher\n");
+            g_interrupt = 1;
+            pause_wake(p);
+        }
+    } else {
+        pad->cancel_hold_start_us = 0;
+        pad->cancel_exit_triggered = 0;
+    }
     if (now.menu && !prev.menu)
         controller_emit("MENU", &pad->events, p, NAVCMD_MENU);
     if (now.play_pause && !prev.play_pause)
@@ -2148,12 +2223,61 @@ struct Player {
         int button;
         int btn_ns;
         int sx, sy, ex, ey;
+        uint32_t palette;
+        uint32_t palette_act;
+        unsigned pci_lbn;
+        int hli_ss;
+        int activated;
         unsigned gen;
         int redraw;
         int in_menu;
         int still;
         int inited;
     } hl;
+    struct {
+        pthread_mutex_t mu;
+        int inited;
+        int valid;
+        unsigned gen;
+        int x, y, w, h;
+        uint8_t color[4];
+        uint8_t alpha[4];
+        uint8_t *idx;
+        uint8_t *acc;
+        int acc_size;
+        int pes_id;
+        int logical;
+        int physical_wide;
+        int physical_letterbox;
+        uint32_t clut[16];
+        uint32_t clut_bgr0[16];
+        int clut_valid;
+        unsigned seen_nb_streams;
+        int decoder_logged;
+        int streams_logged;
+        int tile_dirty;
+        int tile_valid;
+        int tile_n;
+        int tile_cap;
+        int tile_x, tile_y, tile_w, tile_h;
+        struct {
+            uint16_t x, y;
+            uint8_t a8;
+            uint8_t pad;
+            uint32_t bgr;
+        } *tile_px;
+    } spu;
+    struct {
+        unsigned long menu_frames;
+        int64_t sws_sum;
+        int64_t ov_sum;
+        int64_t ov_max;
+        unsigned long still_redraws;
+        int64_t still_sum;
+        uint64_t px_sum;
+        uint64_t bbox_sum;
+        unsigned bbox_max;
+    } spu_perf;
     unsigned nav_gen;
     unsigned codec_gen;
     unsigned frames_this_nav_gen;
@@ -2353,6 +2477,13 @@ static void navq_init(Player *p)
     memset(&p->hl, 0, sizeof(p->hl));
     pthread_mutex_init(&p->hl.mu, NULL);
     p->hl.inited = 1;
+    memset(&p->spu, 0, sizeof(p->spu));
+    pthread_mutex_init(&p->spu.mu, NULL);
+    p->spu.inited = 1;
+    p->spu.pes_id = -1;
+    p->spu.logical = -1;
+    p->spu.physical_wide = -1;
+    p->spu.physical_letterbox = -1;
     p->nav_gen = 1;
     p->codec_gen = 1;
     memset(&p->pause, 0, sizeof(p->pause));
@@ -2380,6 +2511,16 @@ static void navq_destroy(Player *p)
         pthread_mutex_destroy(&p->hl.mu);
         p->hl.inited = 0;
     }
+    if (p->spu.inited) {
+        pthread_mutex_destroy(&p->spu.mu);
+        p->spu.inited = 0;
+    }
+    free(p->spu.idx);
+    p->spu.idx = NULL;
+    free(p->spu.acc);
+    p->spu.acc = NULL;
+    free(p->spu.tile_px);
+    p->spu.tile_px = NULL;
     if (p->pause.inited) {
         pthread_mutex_destroy(&p->pause.mu);
         pthread_cond_destroy(&p->pause.cv);
@@ -3081,6 +3222,558 @@ static void menu_hl_request_redraw(Player *p)
     }
 }
 
+static int menu_spu_ensure_bufs(Player *p)
+{
+    if (!p)
+        return -1;
+    if (!p->spu.idx) {
+        p->spu.idx = malloc(SPU_IDX_MAX);
+        if (!p->spu.idx)
+            return -1;
+    }
+    if (!p->spu.acc) {
+        p->spu.acc = malloc(SPU_MAX_PKT);
+        if (!p->spu.acc)
+            return -1;
+    }
+    return 0;
+}
+
+static void menu_spu_invalidate(Player *p, const char *why)
+{
+    if (!p || !p->spu.inited)
+        return;
+    pthread_mutex_lock(&p->spu.mu);
+    if (p->spu.valid)
+        spu_dbg("SPU: invalidated on nav transition%s%s\n",
+                why && *why ? " (" : "",
+                why && *why ? why : "");
+    p->spu.valid = 0;
+    p->spu.w = p->spu.h = 0;
+    p->spu.acc_size = 0;
+    p->spu.tile_valid = 0;
+    p->spu.tile_n = 0;
+    p->spu.tile_dirty = 1;
+    pthread_mutex_unlock(&p->spu.mu);
+}
+
+static void menu_tile_mark_dirty(Player *p)
+{
+    if (p && p->spu.inited)
+        p->spu.tile_dirty = 1;
+}
+
+static int menu_spu_nibble(const uint8_t *buf, int size, int *bitpos)
+{
+    int byte = *bitpos >> 3;
+    int shift;
+
+    if (byte >= size)
+        return 0;
+    shift = 4 - (*bitpos & 4);
+    *bitpos += 4;
+    return (buf[byte] >> shift) & 0xf;
+}
+
+static int menu_spu_run_2bit(const uint8_t *buf, int size, int *bitpos,
+                             int *color)
+{
+    unsigned v = 0, t;
+
+    for (t = 1; v < t && t <= 0x40; t <<= 2)
+        v = (v << 4) | (unsigned)menu_spu_nibble(buf, size, bitpos);
+    *color = (int)(v & 3);
+    if (v < 4)
+        return 0x7fffffff;
+    return (int)(v >> 2);
+}
+
+static int menu_spu_decode_rle(uint8_t *bitmap, int linesize, int w, int h,
+                               const uint8_t *buf, int start, int buf_size)
+{
+    int bitpos = start * 8;
+    int x = 0, y = 0, len, color, bit_len, i;
+    uint8_t *d;
+
+    if (start < 0 || start >= buf_size || w <= 0 || h <= 0)
+        return -1;
+    bit_len = (buf_size - start) * 8;
+    d = bitmap;
+    for (;;) {
+        if (bitpos - start * 8 > bit_len)
+            return -1;
+        len = menu_spu_run_2bit(buf, buf_size, &bitpos, &color);
+        if (len != 0x7fffffff && len > w - x)
+            return -1;
+        if (len > w - x)
+            len = w - x;
+        for (i = 0; i < len; i++)
+            d[x + i] = (uint8_t)color;
+        x += len;
+        if (x >= w) {
+            y++;
+            if (y >= h)
+                break;
+            d += linesize;
+            x = 0;
+            bitpos = (bitpos + 7) & ~7;
+        }
+    }
+    return 0;
+}
+
+static uint32_t menu_yuv_to_bgr0(uint32_t yuv)
+{
+    int y = (int)((yuv >> 16) & 0xff);
+    int cr = (int)((yuv >> 8) & 0xff) - 128;
+    int cb = (int)(yuv & 0xff) - 128;
+    int r = y + ((351 * cr) >> 8);
+    int g = y - ((179 * cr + 86 * cb) >> 8);
+    int b = y + ((443 * cb) >> 8);
+
+    if (r < 0)
+        r = 0;
+    else if (r > 255)
+        r = 255;
+    if (g < 0)
+        g = 0;
+    else if (g > 255)
+        g = 255;
+    if (b < 0)
+        b = 0;
+    else if (b > 255)
+        b = 255;
+    return (uint32_t)b | ((uint32_t)g << 8) | ((uint32_t)r << 16);
+}
+
+static void menu_clut_store(Player *p, const uint32_t *clut)
+{
+    int i;
+
+    if (!p || !clut)
+        return;
+    pthread_mutex_lock(&p->spu.mu);
+    memcpy(p->spu.clut, clut, 16 * sizeof(uint32_t));
+    for (i = 0; i < 16; i++)
+        p->spu.clut_bgr0[i] = menu_yuv_to_bgr0(clut[i]);
+    p->spu.clut_valid = 1;
+    p->spu.tile_dirty = 1;
+    pthread_mutex_unlock(&p->spu.mu);
+    spu_dbg("SPU: CLUT changed\n");
+}
+
+static int menu_spu_decode_unit(Player *p, const uint8_t *buf, int buf_size,
+                                unsigned gen)
+{
+    int cmd_pos, pos, cmd, x1, y1, x2, y2, next_cmd_pos;
+    uint8_t colormap[4] = {0, 1, 2, 3};
+    uint8_t alpha[4] = {0, 0, 0, 0};
+    int offset1 = -1, offset2 = -1;
+    int w, h, size;
+
+    if (buf_size < 10 || AV_RB16(buf) == 0)
+        return -1;
+    size = AV_RB16(buf);
+    if (size < 10 || size > buf_size)
+        return 1;
+    cmd_pos = AV_RB16(buf + 2);
+    if (cmd_pos < 4 || cmd_pos > buf_size - 4)
+        return -1;
+
+    while (cmd_pos > 0 && cmd_pos < buf_size - 4) {
+        next_cmd_pos = AV_RB16(buf + cmd_pos + 2);
+        pos = cmd_pos + 4;
+        offset1 = offset2 = -1;
+        x1 = y1 = x2 = y2 = 0;
+        while (pos < buf_size) {
+            cmd = buf[pos++];
+            switch (cmd) {
+            case 0x00:
+                break;
+            case 0x01:
+            case 0x02:
+                break;
+            case 0x03:
+                if (buf_size - pos < 2)
+                    return -1;
+                colormap[3] = buf[pos] >> 4;
+                colormap[2] = buf[pos] & 0x0f;
+                colormap[1] = buf[pos + 1] >> 4;
+                colormap[0] = buf[pos + 1] & 0x0f;
+                pos += 2;
+                break;
+            case 0x04:
+                if (buf_size - pos < 2)
+                    return -1;
+                alpha[3] = buf[pos] >> 4;
+                alpha[2] = buf[pos] & 0x0f;
+                alpha[1] = buf[pos + 1] >> 4;
+                alpha[0] = buf[pos + 1] & 0x0f;
+                pos += 2;
+                break;
+            case 0x05:
+                if (buf_size - pos < 6)
+                    return -1;
+                x1 = (buf[pos] << 4) | (buf[pos + 1] >> 4);
+                x2 = ((buf[pos + 1] & 0x0f) << 8) | buf[pos + 2];
+                y1 = (buf[pos + 3] << 4) | (buf[pos + 4] >> 4);
+                y2 = ((buf[pos + 4] & 0x0f) << 8) | buf[pos + 5];
+                pos += 6;
+                break;
+            case 0x06:
+                if (buf_size - pos < 4)
+                    return -1;
+                offset1 = AV_RB16(buf + pos);
+                offset2 = AV_RB16(buf + pos + 2);
+                pos += 4;
+                break;
+            case 0xff:
+                goto cmds_done;
+            default:
+                goto cmds_done;
+            }
+        }
+    cmds_done:
+        if (offset1 >= 0 && offset2 >= 0 && offset1 < buf_size &&
+            offset2 < buf_size) {
+            w = x2 - x1 + 1;
+            h = y2 - y1 + 1;
+            if (w > 0 && h > 1 && w <= FB_W && h <= FB_H) {
+                if (menu_spu_ensure_bufs(p) < 0)
+                    return -1;
+                pthread_mutex_lock(&p->spu.mu);
+                if (menu_spu_decode_rle(p->spu.idx, w * 2, w, (h + 1) / 2,
+                                        buf, offset1, buf_size) < 0 ||
+                    menu_spu_decode_rle(p->spu.idx + w, w * 2, w, h / 2,
+                                        buf, offset2, buf_size) < 0) {
+                    pthread_mutex_unlock(&p->spu.mu);
+                    return -1;
+                }
+                p->spu.x = x1;
+                p->spu.y = y1;
+                p->spu.w = w;
+                p->spu.h = h;
+                memcpy(p->spu.color, colormap, 4);
+                memcpy(p->spu.alpha, alpha, 4);
+                p->spu.gen = gen;
+                p->spu.valid = 1;
+                p->spu.tile_dirty = 1;
+                pthread_mutex_unlock(&p->spu.mu);
+                spu_dbg("SPU: decoded x=%d y=%d w=%d h=%d colors=%d/%d/%d/%d\n",
+                        x1, y1, w, h,
+                        colormap[0], colormap[1], colormap[2], colormap[3]);
+                return 0;
+            }
+        }
+        if (next_cmd_pos <= cmd_pos)
+            break;
+        cmd_pos = next_cmd_pos;
+    }
+    return -1;
+}
+
+static void menu_spu_feed_packet(Player *p, const uint8_t *data, int size,
+                                 unsigned gen)
+{
+    int need, got;
+
+    if (!p || !p->spu.inited || !data || size <= 0)
+        return;
+    if (menu_spu_ensure_bufs(p) < 0)
+        return;
+    if (p->spu.acc_size > 0) {
+        if (p->spu.acc_size + size > SPU_MAX_PKT) {
+            p->spu.acc_size = 0;
+            return;
+        }
+        memcpy(p->spu.acc + p->spu.acc_size, data, (size_t)size);
+        p->spu.acc_size += size;
+        data = p->spu.acc;
+        size = p->spu.acc_size;
+    }
+    if (size < 2)
+        return;
+    need = AV_RB16(data);
+    if (need < 10 || need > SPU_MAX_PKT)
+        return;
+    if (size < need) {
+        if (p->spu.acc_size == 0) {
+            memcpy(p->spu.acc, data, (size_t)size);
+            p->spu.acc_size = size;
+        }
+        return;
+    }
+    got = menu_spu_decode_unit(p, data, size, gen);
+    p->spu.acc_size = 0;
+    if (got == 0)
+        menu_hl_request_redraw(p);
+}
+
+static int menu_spu_packet_wanted(Player *p, AVFormatContext *fmt, AVPacket *pkt)
+{
+    AVStream *st;
+    int pes, want;
+
+    if (!p || !fmt || !pkt || pkt->stream_index < 0 ||
+        (unsigned)pkt->stream_index >= fmt->nb_streams)
+        return 0;
+    st = fmt->streams[pkt->stream_index];
+    if (!st || !st->codecpar)
+        return 0;
+    pes = st->id & 0xff;
+    if (st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+        if (pes < 0x20 || pes > 0x3f)
+            pes = 0x20 + (st->id & 0x1f);
+    } else if (pes < 0x20 || pes > 0x3f) {
+        return 0;
+    }
+    want = p->spu.pes_id;
+    if (want >= 0)
+        return pes == want;
+    return 1;
+}
+
+static void menu_spu_log_streams(Player *p, AVFormatContext *fmt)
+{
+    unsigned i;
+    AVStream *st;
+    AVDictionaryEntry *lang;
+    const char *cname;
+    unsigned bit;
+
+    if (!p || !fmt || !g_debug_spu)
+        return;
+    for (i = 0; i < fmt->nb_streams; i++) {
+        st = fmt->streams[i];
+        if (!st || !st->codecpar)
+            continue;
+        if (st->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE &&
+            ((st->id & 0xff) < 0x20 || (st->id & 0xff) > 0x3f))
+            continue;
+        bit = (i < 32) ? (1u << i) : 0;
+        if (bit && (p->spu.streams_logged & bit))
+            continue;
+        if (bit)
+            p->spu.streams_logged |= bit;
+        lang = av_dict_get(st->metadata, "language", NULL, 0);
+        cname = avcodec_get_name(st->codecpar->codec_id);
+        spu_dbg("SPU STREAM:\n"
+                "  AVStream idx=%u\n"
+                "  codec=%s\n"
+                "  st->id=0x%x\n"
+                "  language %s\n",
+                i,
+                cname ? cname : "?",
+                st->id,
+                lang && lang->value ? lang->value : "(none)");
+        spu_dbg("SPU: AVStream idx=%u id=0x%x\n", i, st->id);
+    }
+}
+
+static void menu_spu_note_decoder(Player *p)
+{
+    const AVCodec *dec;
+
+    if (!p || p->spu.decoder_logged)
+        return;
+    p->spu.decoder_logged = 1;
+    dec = avcodec_find_decoder(AV_CODEC_ID_DVD_SUBTITLE);
+    if (dec)
+        spu_dbg("SPU: decoder=dvdsub\n");
+    else
+        spu_dbg("SPU: decoder=rle (dvdsub not in this FFmpeg build)\n");
+}
+
+static void menu_spu_set_stream(Player *p, int logical, int wide, int letterbox)
+{
+    int phys, old_pes;
+
+    if (!p)
+        return;
+    old_pes = p->spu.pes_id;
+    p->spu.logical = logical;
+    p->spu.physical_wide = wide;
+    p->spu.physical_letterbox = letterbox;
+    phys = wide;
+    if (phys < 0)
+        phys = letterbox;
+    if (phys >= 0)
+        p->spu.pes_id = 0x20 | (phys & 0x1f);
+    if (old_pes != p->spu.pes_id) {
+        pthread_mutex_lock(&p->spu.mu);
+        p->spu.valid = 0;
+        p->spu.acc_size = 0;
+        p->spu.tile_valid = 0;
+        p->spu.tile_n = 0;
+        p->spu.tile_dirty = 1;
+        pthread_mutex_unlock(&p->spu.mu);
+    }
+    spu_dbg("SPU: AVStream id=0x%x logical=%d wide=%d letterbox=%d\n",
+            p->spu.pes_id, logical, wide, letterbox);
+}
+
+static void menu_blend_pixel(uint8_t *dst, uint32_t src_bgr0, int a8)
+{
+    uint32_t d;
+    unsigned ia, b, g, r, db, dg, dr, ua;
+
+    if (a8 <= 0)
+        return;
+    if (a8 >= 255) {
+        *(uint32_t *)dst = src_bgr0;
+        return;
+    }
+    ua = (unsigned)a8;
+    ia = 255u - ua;
+    d = *(uint32_t *)dst;
+    db = d & 0xffu;
+    dg = (d >> 8) & 0xffu;
+    dr = (d >> 16) & 0xffu;
+    b = ((src_bgr0 & 0xffu) * ua + db * ia + 127u) / 255u;
+    g = (((src_bgr0 >> 8) & 0xffu) * ua + dg * ia + 127u) / 255u;
+    r = (((src_bgr0 >> 16) & 0xffu) * ua + dr * ia + 127u) / 255u;
+    *(uint32_t *)dst = b | (g << 8) | (r << 16);
+}
+
+static int menu_tile_grow(Player *p, int need)
+{
+    void *nbuf;
+    int cap = p->spu.tile_cap;
+
+    if (need <= cap)
+        return 0;
+    cap = cap ? cap * 2 : 256;
+    while (cap < need)
+        cap *= 2;
+    nbuf = realloc(p->spu.tile_px, (size_t)cap * sizeof(*p->spu.tile_px));
+    if (!nbuf)
+        return -1;
+    p->spu.tile_px = nbuf;
+    p->spu.tile_cap = cap;
+    return 0;
+}
+
+static void menu_overlay_rebuild_tile(Player *p, int vis, int sx, int sy,
+                                      int ex, int ey, uint32_t pal,
+                                      unsigned gen)
+{
+    int x0, y0, w, h, max_h, ix0, iy0, ix1, iy1, px, py, n;
+    const uint8_t *idx;
+
+    p->spu.tile_valid = 0;
+    p->spu.tile_n = 0;
+    if (!vis || !p->spu.valid || !p->spu.idx || !p->spu.clut_valid)
+        return;
+    if (p->spu.gen != gen)
+        return;
+    if (ex <= sx || ey <= sy || p->spu.w <= 0 || p->spu.h <= 0)
+        return;
+
+    x0 = p->spu.x;
+    y0 = p->spu.y;
+    w = p->spu.w;
+    h = p->spu.h;
+    idx = p->spu.idx;
+    max_h = player_active_h(p);
+
+    ix0 = x0 > sx ? x0 : sx;
+    iy0 = y0 > sy ? y0 : sy;
+    ix1 = (x0 + w - 1) < ex ? (x0 + w - 1) : ex;
+    iy1 = (y0 + h - 1) < ey ? (y0 + h - 1) : ey;
+    if (ix0 < 0)
+        ix0 = 0;
+    if (iy0 < 0)
+        iy0 = 0;
+    if (ix1 >= FB_W)
+        ix1 = FB_W - 1;
+    if (iy1 >= max_h)
+        iy1 = max_h - 1;
+    if (ix1 < ix0 || iy1 < iy0)
+        return;
+
+    n = 0;
+    for (py = iy0; py <= iy1; py++) {
+        for (px = ix0; px <= ix1; px++) {
+            int code = idx[(py - y0) * w + (px - x0)] & 3;
+            int a4 = (int)((pal >> (4 * code)) & 0xf);
+            int ci;
+            uint32_t bgr;
+
+            if (a4 <= 0)
+                continue;
+            if (menu_tile_grow(p, n + 1) < 0)
+                return;
+            ci = (int)((pal >> (16 + 4 * code)) & 0xf);
+            bgr = p->spu.clut_bgr0[ci];
+            p->spu.tile_px[n].x = (uint16_t)px;
+            p->spu.tile_px[n].y = (uint16_t)py;
+            p->spu.tile_px[n].a8 = (uint8_t)(a4 * 17);
+            p->spu.tile_px[n].pad = 0;
+            p->spu.tile_px[n].bgr = bgr;
+            n++;
+        }
+    }
+    p->spu.tile_x = ix0;
+    p->spu.tile_y = iy0;
+    p->spu.tile_w = ix1 - ix0 + 1;
+    p->spu.tile_h = iy1 - iy0 + 1;
+    p->spu.tile_n = n;
+    p->spu.tile_valid = 1;
+    p->spu.tile_dirty = 0;
+}
+
+static void menu_overlay_composite(Player *p, uint8_t *dst, int stride,
+                                   int frame_menu)
+{
+    int vis, in_menu, sx, sy, ex, ey, activated, i, n;
+    unsigned hl_gen;
+    uint32_t pal, pal_act;
+    unsigned bbox;
+
+    if (!p || !dst || g_debug_yellow_highlight)
+        return;
+    if (!p->hl.inited || !p->spu.inited)
+        return;
+
+    pthread_mutex_lock(&p->hl.mu);
+    vis = p->hl.visible;
+    in_menu = p->hl.in_menu;
+    hl_gen = p->hl.gen;
+    sx = p->hl.sx;
+    sy = p->hl.sy;
+    ex = p->hl.ex;
+    ey = p->hl.ey;
+    pal = p->hl.palette;
+    pal_act = p->hl.palette_act;
+    activated = p->hl.activated;
+    pthread_mutex_unlock(&p->hl.mu);
+
+    if (!in_menu || !frame_menu || hl_gen != player_nav_gen(p))
+        return;
+
+    if (activated && pal_act)
+        pal = pal_act;
+
+    pthread_mutex_lock(&p->spu.mu);
+    if (p->spu.tile_dirty || !p->spu.tile_valid)
+        menu_overlay_rebuild_tile(p, vis, sx, sy, ex, ey, pal, hl_gen);
+    n = p->spu.tile_valid ? p->spu.tile_n : 0;
+    bbox = (p->spu.tile_valid && p->spu.tile_w > 0 && p->spu.tile_h > 0)
+           ? (unsigned)p->spu.tile_w * (unsigned)p->spu.tile_h : 0;
+    for (i = 0; i < n; i++) {
+        int px = (int)p->spu.tile_px[i].x;
+        int py = (int)p->spu.tile_px[i].y;
+        menu_blend_pixel(dst + (size_t)py * (size_t)stride + (size_t)px * 4,
+                         p->spu.tile_px[i].bgr, p->spu.tile_px[i].a8);
+    }
+    pthread_mutex_unlock(&p->spu.mu);
+
+    p->spu_perf.px_sum += (uint64_t)n;
+    p->spu_perf.bbox_sum += (uint64_t)bbox;
+    if (bbox > p->spu_perf.bbox_max)
+        p->spu_perf.bbox_max = bbox;
+}
+
 static void menu_hl_clear(Player *p)
 {
     if (!p || !p->hl.inited)
@@ -3091,10 +3784,14 @@ static void menu_hl_clear(Player *p)
     p->hl.redraw = 0;
     p->hl.in_menu = 0;
     p->hl.still = 0;
+    p->hl.activated = 0;
+    p->hl.palette = 0;
+    p->hl.palette_act = 0;
     pthread_mutex_unlock(&p->hl.mu);
     p->in_menu = 0;
     p->still_active = 0;
     p->menu_still_drop = 1;
+    menu_spu_invalidate(p, "menu exit");
 }
 
 static void dvdio_leave_menu(DVDIO *d)
@@ -3124,6 +3821,7 @@ static void dvdio_apply_highlight(DVDIO *d, int log_event)
     Player *p = d->player;
     int32_t button = 0;
     dvdnav_highlight_area_t area;
+    dvdnav_highlight_area_t area_act;
     int btn_ns = 0;
     int in_menu;
 
@@ -3137,12 +3835,16 @@ static void dvdio_apply_highlight(DVDIO *d, int log_event)
     if (dvdnav_get_current_highlight(d->nav, &button) != DVDNAV_STATUS_OK)
         button = 0;
     memset(&area, 0, sizeof(area));
+    memset(&area_act, 0, sizeof(area_act));
     if (d->pci_valid && button > 0 &&
-        dvdnav_get_highlight_area(&d->pci, button, 0, &area) == DVDNAV_STATUS_OK) {
-        /* area filled */
+        dvdnav_get_highlight_area(&d->pci, button, HL_MODE_SELECT, &area)
+            == DVDNAV_STATUS_OK) {
+        /* SELECT area/palette filled from copied PCI, not a live pointer. */
     } else if (button <= 0) {
         memset(&area, 0, sizeof(area));
     }
+    if (d->pci_valid && button > 0)
+        dvdnav_get_highlight_area(&d->pci, button, HL_MODE_ACTION, &area_act);
 
     if (p && p->hl.inited) {
         int changed;
@@ -3151,6 +3853,7 @@ static void dvdio_apply_highlight(DVDIO *d, int log_event)
         changed = (p->hl.button != button) ||
                   (p->hl.sx != (int)area.sx) || (p->hl.sy != (int)area.sy) ||
                   (p->hl.ex != (int)area.ex) || (p->hl.ey != (int)area.ey) ||
+                  (p->hl.palette != area.palette) ||
                   (p->hl.in_menu != in_menu);
         p->hl.visible = in_menu && button > 0 &&
                         (area.ex > area.sx) && (area.ey > area.sy);
@@ -3160,23 +3863,45 @@ static void dvdio_apply_highlight(DVDIO *d, int log_event)
         p->hl.sy = (int)area.sy;
         p->hl.ex = (int)area.ex;
         p->hl.ey = (int)area.ey;
+        p->hl.palette = area.palette;
+        p->hl.palette_act = area_act.palette;
+        p->hl.pci_lbn = d->pci_valid ? d->pci_lbn : 0;
+        p->hl.hli_ss = d->pci_valid ? (int)(d->pci.hli.hl_gi.hli_ss & 0x03) : 0;
+        p->hl.activated = 0;
         p->hl.gen = player_nav_gen(p);
         p->hl.in_menu = in_menu;
         p->hl.still = d->still_len != 0;
         pthread_mutex_unlock(&p->hl.mu);
         p->in_menu = in_menu;
         p->still_active = d->still_len != 0;
-        if (in_menu && d->still_len && changed)
+        if (in_menu && changed) {
+            menu_tile_mark_dirty(p);
             menu_hl_request_redraw(p);
+            spu_dbg("HLI: buttons=%d selected=%d\n"
+                    "HLI: select area=(%u,%u)-(%u,%u) palette=%08x\n"
+                    "HLI: redraw selected=%d\n",
+                    btn_ns, (int)button,
+                    (unsigned)area.sx, (unsigned)area.sy,
+                    (unsigned)area.ex, (unsigned)area.ey,
+                    (unsigned)area.palette,
+                    (int)button);
+        }
     }
 
-    if (log_event)
+    if (log_event) {
         dbg("DVD MENU HIGHLIGHT:\n"
             "  button=%d\n"
             "  area=(%u,%u)-(%u,%u)\n",
             (int)button,
             (unsigned)area.sx, (unsigned)area.sy,
             (unsigned)area.ex, (unsigned)area.ey);
+        spu_dbg("HLI: buttons=%d selected=%d\n"
+                "HLI: select area=(%u,%u)-(%u,%u) palette=%08x\n",
+                btn_ns, (int)button,
+                (unsigned)area.sx, (unsigned)area.sy,
+                (unsigned)area.ex, (unsigned)area.ey,
+                (unsigned)area.palette);
+    }
 }
 
 static void player_nav_discontinuity(Player *p, const char *why)
@@ -3240,6 +3965,7 @@ static void player_nav_discontinuity(Player *p, const char *why)
         "  nav_gen=%u  codec_gen=%u  flush qA=%d qV=%d yuv=%d  "
         "total_flushes=%u\n",
         why ? why : "hop", gen, player_codec_gen(p), n_a, n_v, n_y, p->flush_n);
+    menu_spu_invalidate(p, why);
 }
 
 static void player_nav_soft_reset(Player *p, const char *reason,
@@ -3299,6 +4025,7 @@ static void player_nav_soft_reset(Player *p, const char *reason,
         "  nav_gen=%u  codec_gen=%u (unchanged)  flush qV=%d yuv=%d  "
         "(parser/decoder preserved)\n",
         gen, player_codec_gen(p), n_v, n_y);
+    menu_spu_invalidate(p, reason);
 }
 
 static void dvdio_snapshot_pci(DVDIO *d)
@@ -3404,6 +4131,20 @@ static void dvdio_activate_button(DVDIO *d)
     }
     btn_ns = (int)(pci.hli.hl_gi.btn_ns & 0x3f);
     hli_ss = (int)(pci.hli.hl_gi.hli_ss & 0x03);
+    if (d->player && d->player->hl.inited && button > 0) {
+        dvdnav_highlight_area_t area_act;
+
+        memset(&area_act, 0, sizeof(area_act));
+        if (dvdnav_get_highlight_area(&pci, button, HL_MODE_ACTION, &area_act)
+                == DVDNAV_STATUS_OK) {
+            pthread_mutex_lock(&d->player->hl.mu);
+            d->player->hl.activated = 1;
+            d->player->hl.palette_act = area_act.palette;
+            pthread_mutex_unlock(&d->player->hl.mu);
+            menu_tile_mark_dirty(d->player);
+            menu_hl_request_redraw(d->player);
+        }
+    }
     if (button <= 0) {
         fprintf(stderr, "DVD MENU: activate ERR: no selected button\n");
         return;
@@ -3904,8 +4645,12 @@ static int dvdio_pump(DVDIO *d, int32_t event, int32_t len)
                 d->hl_leave_logged = 0;
                 d->menu_exiting = 0;
             }
-            if (in_menu && !d->menu_exiting)
+            if (in_menu && !d->menu_exiting) {
+                int8_t active = dvdnav_get_active_spu_stream(d->nav);
+                if (d->player->spu.pes_id < 0 && active >= 0)
+                    menu_spu_set_stream(d->player, -1, active & 0x1f, -1);
                 dvdio_apply_highlight(d, 0);
+            }
         }
         return 0;
     case DVDNAV_BLOCK_OK:
@@ -4083,16 +4828,27 @@ static int dvdio_pump(DVDIO *d, int32_t event, int32_t len)
     case DVDNAV_SPU_STREAM_CHANGE: {
         dvdnav_spu_stream_change_event_t *ev =
             (dvdnav_spu_stream_change_event_t *)d->sector;
+        int8_t active = d->nav ? dvdnav_get_active_spu_stream(d->nav) : -1;
+        int wide = ev ? ev->physical_wide : -1;
+        int letter = ev ? ev->physical_letterbox : -1;
+        int logical = ev ? ev->logical : -1;
+
+        if (wide < 0 && active >= 0)
+            wide = active & 0x1f;
+        if (d->player)
+            menu_spu_set_stream(d->player, logical, wide, letter);
         dbg("DVDNAV_SPU_STREAM_CHANGE  logical=%d wide=%d letterbox=%d "
-            "pan_scan=%d  (SPU decode not implemented)\n",
-            ev ? ev->logical : -1,
-            ev ? ev->physical_wide : -1,
-            ev ? ev->physical_letterbox : -1,
-            ev ? ev->physical_pan_scan : -1);
+            "pan_scan=%d active=%d\n",
+            logical, wide, letter,
+            ev ? ev->physical_pan_scan : -1,
+            (int)active);
         return 0;
     }
     case DVDNAV_SPU_CLUT_CHANGE:
-        dbg("DVDNAV_SPU_CLUT_CHANGE  (SPU decode not implemented)\n");
+        if (d->player)
+            menu_clut_store(d->player, (const uint32_t *)d->sector);
+        else
+            dbg("DVDNAV_SPU_CLUT_CHANGE\n");
         return 0;
     case DVDNAV_AUDIO_STREAM_CHANGE: {
         dvdnav_audio_stream_change_event_t *ev =
@@ -4161,6 +4917,7 @@ static void *input_thread(void *opaque)
     memset(&pad, 0, sizeof(pad));
     note_unpinned_cpu("input", &p->sched_input_cpu);
     fprintf(stderr, "DVD menu navigation: enabled\n");
+    fprintf(stderr, "Hold CANCEL/B 3000 ms to return to launcher.\n");
     dbg("Controller: FPGA status 0x30400008  "
         "{DVD1, display_buf, joystick_0[30:0]}\n"
         "  bits: 0 Right  1 Left  2 Down  3 Up\n"
@@ -5725,6 +6482,8 @@ static int present_video_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
     int64_t sws_wall = av_gettime_relative() - c0;
     int64_t cpu1 = (p->sws_cpu_ok && cpu0 >= 0) ? thread_cpu_us() : -1;
     p->convert_us += sws_wall;
+    if (p->in_menu || g_debug_yellow_highlight)
+        present_draw_highlight(p, dst_data[0], dst_linesize[0], p->in_menu);
     __sync_synchronize();
     int64_t conv_done = av_gettime_relative();
 
@@ -6351,8 +7110,13 @@ static void present_draw_highlight(Player *p, uint8_t *dst, int stride,
     ex = p->hl.ex;
     ey = p->hl.ey;
     pthread_mutex_unlock(&p->hl.mu);
-    if (vis && in_menu && frame_menu && gen == player_nav_gen(p))
-        draw_highlight_border(dst, stride, sx, sy, ex, ey, player_active_h(p));
+    if (g_debug_yellow_highlight) {
+        if (vis && in_menu && frame_menu && gen == player_nav_gen(p))
+            draw_highlight_border(dst, stride, sx, sy, ex, ey,
+                                  player_active_h(p));
+        return;
+    }
+    menu_overlay_composite(p, dst, stride, frame_menu);
 }
 
 static int present_menu_skip_clock(Player *p, int ui_redraw, int frame_menu)
@@ -6462,7 +7226,26 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
     int64_t sws_wall = av_gettime_relative() - c0;
     int64_t cpu1 = (p->sws_cpu_ok && cpu0 >= 0) ? thread_cpu_us() : -1;
     p->convert_us += sws_wall;
-    present_draw_highlight(p, dst_data[0], dst_linesize[0], frame_menu);
+    {
+        int64_t ov0 = av_gettime_relative();
+        int64_t ov_us;
+
+        if (frame_menu || p->in_menu || g_debug_yellow_highlight)
+            present_draw_highlight(p, dst_data[0], dst_linesize[0],
+                                   frame_menu);
+        ov_us = av_gettime_relative() - ov0;
+        if (frame_menu || p->in_menu) {
+            p->spu_perf.menu_frames++;
+            p->spu_perf.sws_sum += sws_wall;
+            p->spu_perf.ov_sum += ov_us;
+            if (ov_us > p->spu_perf.ov_max)
+                p->spu_perf.ov_max = ov_us;
+            if (ui_redraw) {
+                p->spu_perf.still_redraws++;
+                p->spu_perf.still_sum += sws_wall + ov_us;
+            }
+        }
+    }
     __sync_synchronize();
     int64_t conv_done = av_gettime_relative();
 
@@ -7169,6 +7952,8 @@ int main(int argc, char **argv)
     if (parse_cli(argc, argv, &cli) < 0)
         return 1;
     g_debug_stats = cli.debug_stats;
+    g_debug_spu = cli.debug_spu;
+    g_debug_yellow_highlight = cli.debug_yellow_highlight;
     if (cli.list_titles) {
         dvdnav_t *nav = NULL;
         fprintf(stderr, "=== DVD TITLE LIST ===\nDevice: %s\n", cli.device);
@@ -7206,6 +7991,16 @@ int main(int argc, char **argv)
         AUDIO_Q_CAP, VIDEO_Q_CAP);
     if (g_debug_stats)
         fprintf(stderr, "Debug stats: on\n");
+    if (g_debug_spu) {
+        const AVCodec *dec = avcodec_find_decoder(AV_CODEC_ID_DVD_SUBTITLE);
+        if (dec)
+            fprintf(stderr, "SPU: decoder=dvdsub\n");
+        else
+            fprintf(stderr,
+                    "SPU: decoder=rle (dvdsub not in this FFmpeg build)\n");
+        if (g_debug_yellow_highlight)
+            fprintf(stderr, "SPU: yellow debug rectangle enabled\n");
+    }
 
     av_log_set_level(AV_LOG_WARNING);
 
@@ -7231,17 +8026,21 @@ int main(int argc, char **argv)
     dvdnav_menu_language_select(d.nav, "en");
     dvdnav_audio_language_select(d.nav, "en");
     dvdnav_spu_language_select(d.nav, "en");
-    if (!cli.title) {
-        cli.title = 2;
-        cli.chapter = 1;
+    if (cli.authored_start) {
+        fprintf(stderr, "Start: authored DVD navigation (First Play)\n");
+    } else {
+        if (!cli.title) {
+            cli.title = 2;
+            cli.chapter = 1;
+        }
+        fprintf(stderr, "Title %d, chapter %d\n",
+                cli.title, cli.chapter ? cli.chapter : 1);
+        int32_t ntitles = 0;
+        dvdnav_get_number_of_titles(d.nav, &ntitles);
+        dbg("Titles on disc: %d\n", (int)ntitles);
+        if (jump_to_title(d.nav, &cli, ntitles) < 0)
+            return 1;
     }
-    fprintf(stderr, "Title %d, chapter %d\n",
-            cli.title, cli.chapter ? cli.chapter : 1);
-    int32_t ntitles = 0;
-    dvdnav_get_number_of_titles(d.nav, &ntitles);
-    dbg("Titles on disc: %d\n", (int)ntitles);
-    if (jump_to_title(d.nav, &cli, ntitles) < 0)
-        return 1;
 
     const AVInputFormat *mpeg = av_find_input_format("mpeg");
     if (!mpeg)
@@ -7418,6 +8217,9 @@ int main(int argc, char **argv)
             }
         }
 
+        if (p.in_menu)
+            menu_spu_log_streams(&p, fmt);
+
         if (p.ai >= 0 && p.acp && !p.audio_started && !p.uncapped_bench) {
             if (pthread_create(&ath, NULL, audio_thread, &p) != 0) {
                 fprintf(stderr, "pthread_create(audio) failed\n");
@@ -7465,6 +8267,15 @@ int main(int argc, char **argv)
                     player_nav_gen(&p), pkt->size);
             }
             player_pktq_push(&p, &p.vq, pkt);
+        } else if (p.in_menu && pkt->data && pkt->size > 0) {
+            menu_spu_note_decoder(&p);
+            menu_spu_log_streams(&p, fmt);
+            if (menu_spu_packet_wanted(&p, fmt, pkt)) {
+                if (p.spu.pes_id < 0)
+                    p.spu.pes_id = fmt->streams[pkt->stream_index]->id & 0xff;
+                menu_spu_feed_packet(&p, pkt->data, pkt->size,
+                                     player_nav_gen(&p));
+            }
         }
 
         av_packet_unref(pkt);
@@ -7777,6 +8588,29 @@ int main(int argc, char **argv)
                 "Missed native boundaries:   %u\n"
                 "Stop reason:                %s\n",
                 p.miss_total, stop_reason);
+        if (g_debug_spu || p.spu_perf.menu_frames) {
+            unsigned long n = p.spu_perf.menu_frames;
+            unsigned long sr = p.spu_perf.still_redraws;
+            double avg_sws = n ? (double)p.spu_perf.sws_sum / (double)n : 0.0;
+            double avg_ov = n ? (double)p.spu_perf.ov_sum / (double)n : 0.0;
+            double avg_still = sr ? (double)p.spu_perf.still_sum / (double)sr
+                                  : 0.0;
+            double avg_px = n ? (double)p.spu_perf.px_sum / (double)n : 0.0;
+            double avg_bbox = n ? (double)p.spu_perf.bbox_sum / (double)n : 0.0;
+
+            fprintf(stderr,
+                    "SPU PERF:\n"
+                    "  menu frames=%lu\n"
+                    "  avg sws_us=%.1f\n"
+                    "  avg overlay_us=%.1f\n"
+                    "  max overlay_us=%" PRId64 "\n"
+                    "  still redraws=%lu\n"
+                    "  avg still_redraw_us=%.1f\n"
+                    "  overlay pixels/frame avg=%.1f\n"
+                    "  overlay bbox avg=%.1f max=%u\n",
+                    n, avg_sws, avg_ov, p.spu_perf.ov_max,
+                    sr, avg_still, avg_px, avg_bbox, p.spu_perf.bbox_max);
+        }
 
     if (g_debug_stats) {
     fprintf(stderr,
