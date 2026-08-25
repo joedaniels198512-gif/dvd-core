@@ -73,7 +73,7 @@ localparam CONF_STR = {
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[8],Buffer,A,B;",
 	"O[2],TV Mode,NTSC,PAL;",
-	"O[9],CRT Field Test,Normal,Duplicate Even;",
+	"O[12:11],CRT Field Test,Normal,Duplicate Even,Duplicate Odd;",
 	"O[4:3],Noise,White,Red,Green,Blue;",
 	"-;",
 	"P1,Test Page 1;",
@@ -282,7 +282,7 @@ fb_line_reader fb_line_reader
 	.req_buf(mb_bit | status[8]),
 	.display_buf(display_buf),
 	.pal(status[2]),
-	.dup_even(status[9]),
+	.crt_field_test(status[12:11]),
 
 	.mb_idle(mb_st == 3'd0),
 	.vid_req(vid_req),
