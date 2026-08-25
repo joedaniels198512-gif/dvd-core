@@ -86,7 +86,18 @@
 #define WRITE_CHUNK     4096
 #define TARGET_FILL     (BYTES_PER_SEC * 150 / 1000)  /* 28800 bytes      */
 #define READY_FILL      (BYTES_PER_SEC * 100 / 1000)  /* 19200 bytes      */
+#define PAUSE_DRAIN_THRESH 8  /* one alsa.sv 64-bit fetch; 2 samples = 41.7 µs */
+#define PAUSE_STUCK_US     500000
 #define PRIME_BYTES     256
+
+enum {
+    THR_RUN = 0,
+    THR_PAUSE,
+    THR_QFULL,
+    THR_QEMPTY,
+    THR_PREFILL,
+    THR_CLOCK
+};
 
 #define AUDIO_Q_CAP     32
 #define VIDEO_Q_CAP     384
@@ -258,7 +269,8 @@ typedef enum {
     NAVCMD_RIGHT,
     NAVCMD_ACTIVATE,
     NAVCMD_PREVIOUS_CHAPTER,
-    NAVCMD_NEXT_CHAPTER
+    NAVCMD_NEXT_CHAPTER,
+    NAVCMD_PLAY_PAUSE
 } NavCmd;
 
 /* ------------------------------------------------------------------ */
@@ -311,6 +323,12 @@ static void player_wait_still_drain(Player *p, DVDIO *d);
 static void prefill_release(Player *p, const char *reason);
 static int prefill_is_released(Player *p);
 static void navq_post(Player *p, NavCmd cmd);
+static void pause_cancel(Player *p);
+static int pause_is_held(Player *p);
+static int pause_should_hold_audio(Player *p);
+static void pause_wait_unheld(Player *p);
+static int pause_wait_control(Player *p);
+static int navq_count(Player *p);
 static void dvdio_leave_menu(DVDIO *d);
 
 static int dvd_read_packet(void *opaque, uint8_t *buf, int buf_size)
@@ -359,6 +377,14 @@ static int dvd_read_packet(void *opaque, uint8_t *buf, int buf_size)
             memcpy(buf + out, d->sector + d->sector_pos, (size_t)take);
             d->sector_pos += take;
             out += take;
+            continue;
+        }
+        if (d->player && pause_is_held(d->player)) {
+            if (out > 0) {
+                dvdio_note_mpeg_return(d, out);
+                return out;
+            }
+            pause_wait_control(d->player);
             continue;
         }
         /*
@@ -900,7 +926,7 @@ static void controller_poll(ControllerPad *pad, uint32_t bits, int64_t now_us,
     if (now.menu && !prev.menu)
         controller_emit("MENU", &pad->events, p, NAVCMD_MENU);
     if (now.play_pause && !prev.play_pause)
-        controller_emit("PLAY_PAUSE", &pad->events, p, NAVCMD_NONE);
+        controller_emit("PLAY_PAUSE", &pad->events, p, NAVCMD_PLAY_PAUSE);
     if (now.next && !prev.next)
         controller_emit("NEXT", &pad->events, p, NAVCMD_NEXT_CHAPTER);
     if (now.previous && !prev.previous)
@@ -977,6 +1003,35 @@ static void pktq_note_depth(PktQ *q)
         q->depth_max = q->count;
     q->depth_sum += q->count;
     q->depth_n++;
+}
+
+static void pause_thr_set(int *slot, int st)
+{
+    if (slot)
+        __atomic_store_n(slot, st, __ATOMIC_RELAXED);
+}
+
+static int pause_thr_get(const int *slot)
+{
+    return slot ? __atomic_load_n(slot, __ATOMIC_RELAXED) : THR_RUN;
+}
+
+static const char *pause_thr_name(int st)
+{
+    switch (st) {
+    case THR_PAUSE:
+        return "wait-pause";
+    case THR_QFULL:
+        return "wait-queue-full";
+    case THR_QEMPTY:
+        return "wait-queue-empty";
+    case THR_PREFILL:
+        return "wait-prefill";
+    case THR_CLOCK:
+        return "wait-clock";
+    default:
+        return "run";
+    }
 }
 
 static void pktq_wait_timeout(pthread_cond_t *cv, pthread_mutex_t *mu)
@@ -1219,7 +1274,7 @@ static int vidring_count(VidRing *r)
 }
 
 /* 1 = slot reserved for produce (not yet visible to consumer). */
-static int vidring_begin_produce(VidRing *r, int *idx_out)
+static int vidring_begin_produce(VidRing *r, int *idx_out, Player *p)
 {
     int64_t t0 = 0;
 
@@ -1228,6 +1283,12 @@ static int vidring_begin_produce(VidRing *r, int *idx_out)
         if (!t0) {
             t0 = av_gettime_relative();
             r->full_n++;
+        }
+        if (p && pause_is_held(p)) {
+            pthread_mutex_unlock(&r->mu);
+            pause_wait_unheld(p);
+            pthread_mutex_lock(&r->mu);
+            continue;
         }
         pktq_wait_timeout(&r->not_full, &r->mu);
     }
@@ -1431,7 +1492,8 @@ static int yuvring_count(YuvRing *r)
     return n;
 }
 
-static int yuvring_begin_produce(YuvRing *r, int *idx_out, unsigned *epoch_out)
+static int yuvring_begin_produce(YuvRing *r, int *idx_out, unsigned *epoch_out,
+                                 Player *p)
 {
     int64_t t0 = 0;
 
@@ -1440,6 +1502,12 @@ static int yuvring_begin_produce(YuvRing *r, int *idx_out, unsigned *epoch_out)
         if (!t0) {
             t0 = av_gettime_relative();
             r->full_n++;
+        }
+        if (p && pause_is_held(p)) {
+            pthread_mutex_unlock(&r->mu);
+            pause_wait_unheld(p);
+            pthread_mutex_lock(&r->mu);
+            continue;
         }
         pktq_wait_timeout(&r->not_full, &r->mu);
     }
@@ -1692,6 +1760,16 @@ static int64_t clock_read(AudioClock *c, int64_t *apts_out, int *fill_out)
         *fill_out = c->fill;
     pthread_mutex_unlock(&c->mu);
     return clk;
+}
+
+static int clock_is_ready(AudioClock *c)
+{
+    int r;
+
+    pthread_mutex_lock(&c->mu);
+    r = c->ready;
+    pthread_mutex_unlock(&c->mu);
+    return r;
 }
 
 static void mraudio_note_fill(MrAudio *a)
@@ -2099,6 +2177,40 @@ struct Player {
     unsigned long nav_flush_pkts;
     unsigned long nav_flush_yuv;
 
+    /* Title play/pause. Input posts NAVCMD_PLAY_PAUSE; audio owns drain. */
+    struct {
+        pthread_mutex_t mu;
+        pthread_cond_t cv;
+        int inited;
+        int mode; /* 0 off, 1 pending drain, 2 held */
+        unsigned events;
+        int64_t req_us;
+        int64_t drain_us;
+        int fill_at_req;
+        int fill_at_held;
+        int64_t consumed_at_req;
+        int64_t consumed_at_held;
+        int64_t clock_at_req;
+        int64_t clock_at_held;
+        int64_t clock_at_resume;
+        int64_t resume_us;
+        int64_t first_vpts_resume;
+        int64_t first_audio_write_resume;
+        int64_t av_off_at_req;
+        int64_t av_off_at_held;
+        int64_t av_off_at_resume;
+        int stale_at_req;
+        int stale_at_resume;
+        int aq_at_held;
+        int vq_at_held;
+        int yuv_at_held;
+        int need_resume_vpts;
+        int need_resume_audio;
+        unsigned wake_gen;
+        int st_demux, st_audio, st_video, st_present;
+        int stuck_logged;
+    } pause;
+
     /* --uncapped-video-benchmark only. Default playback never reads these. */
     int uncapped_bench;
     int bench_active_buf;
@@ -2183,6 +2295,7 @@ static int buffered_queue_count(Player *p)
 static void player_abort(Player *p)
 {
     p->fail = 1;
+    pause_cancel(p);
     pktq_quit(&p->aq);
     pktq_quit(&p->vq);
     if (player_buffered(p)) {
@@ -2242,6 +2355,19 @@ static void navq_init(Player *p)
     p->hl.inited = 1;
     p->nav_gen = 1;
     p->codec_gen = 1;
+    memset(&p->pause, 0, sizeof(p->pause));
+    pthread_mutex_init(&p->pause.mu, NULL);
+    pthread_cond_init(&p->pause.cv, NULL);
+    p->pause.inited = 1;
+    p->pause.first_vpts_resume = AV_NOPTS_VALUE;
+    p->pause.clock_at_req = AV_NOPTS_VALUE;
+    p->pause.clock_at_held = AV_NOPTS_VALUE;
+    p->pause.clock_at_resume = AV_NOPTS_VALUE;
+    p->pause.resume_us = AV_NOPTS_VALUE;
+    p->pause.first_audio_write_resume = AV_NOPTS_VALUE;
+    p->pause.av_off_at_req = AV_NOPTS_VALUE;
+    p->pause.av_off_at_held = AV_NOPTS_VALUE;
+    p->pause.av_off_at_resume = AV_NOPTS_VALUE;
 }
 
 static void navq_destroy(Player *p)
@@ -2253,6 +2379,11 @@ static void navq_destroy(Player *p)
     if (p->hl.inited) {
         pthread_mutex_destroy(&p->hl.mu);
         p->hl.inited = 0;
+    }
+    if (p->pause.inited) {
+        pthread_mutex_destroy(&p->pause.mu);
+        pthread_cond_destroy(&p->pause.cv);
+        p->pause.inited = 0;
     }
 }
 
@@ -2267,6 +2398,13 @@ static void navq_post(Player *p, NavCmd cmd)
         p->navq.count++;
     }
     pthread_mutex_unlock(&p->navq.mu);
+    /* Wake demux immediately — do not wait for a media-queue timeout. */
+    if (p->pause.inited) {
+        pthread_mutex_lock(&p->pause.mu);
+        p->pause.wake_gen++;
+        pthread_cond_broadcast(&p->pause.cv);
+        pthread_mutex_unlock(&p->pause.mu);
+    }
 }
 
 static NavCmd navq_pop(Player *p)
@@ -2283,6 +2421,368 @@ static NavCmd navq_pop(Player *p)
     }
     pthread_mutex_unlock(&p->navq.mu);
     return cmd;
+}
+
+static int navq_count(Player *p)
+{
+    int n;
+
+    if (!p || !p->navq.inited)
+        return 0;
+    pthread_mutex_lock(&p->navq.mu);
+    n = p->navq.count;
+    pthread_mutex_unlock(&p->navq.mu);
+    return n;
+}
+
+enum {
+    PAUSE_OFF = 0,
+    PAUSE_PENDING = 1,
+    PAUSE_HELD = 2
+};
+
+static void pause_wake(Player *p)
+{
+    if (!p || !p->pause.inited)
+        return;
+    pthread_mutex_lock(&p->pause.mu);
+    p->pause.wake_gen++;
+    pthread_cond_broadcast(&p->pause.cv);
+    pthread_mutex_unlock(&p->pause.mu);
+    if (p->aq.pkts) {
+        pthread_mutex_lock(&p->aq.mu);
+        pthread_cond_broadcast(&p->aq.not_empty);
+        pthread_cond_broadcast(&p->aq.not_full);
+        pthread_mutex_unlock(&p->aq.mu);
+    }
+    if (p->vq.pkts) {
+        pthread_mutex_lock(&p->vq.mu);
+        pthread_cond_broadcast(&p->vq.not_empty);
+        pthread_cond_broadcast(&p->vq.not_full);
+        pthread_mutex_unlock(&p->vq.mu);
+    }
+    if (p->buffered_yuv && p->yuvring.inited) {
+        pthread_mutex_lock(&p->yuvring.mu);
+        pthread_cond_broadcast(&p->yuvring.not_empty);
+        pthread_cond_broadcast(&p->yuvring.not_full);
+        pthread_mutex_unlock(&p->yuvring.mu);
+    }
+    if (p->buffered_video && p->vring.inited) {
+        pthread_mutex_lock(&p->vring.mu);
+        pthread_cond_broadcast(&p->vring.not_empty);
+        pthread_cond_broadcast(&p->vring.not_full);
+        pthread_mutex_unlock(&p->vring.mu);
+    }
+}
+
+static int pause_mode(Player *p)
+{
+    int m;
+
+    if (!p || !p->pause.inited)
+        return PAUSE_OFF;
+    pthread_mutex_lock(&p->pause.mu);
+    m = p->pause.mode;
+    pthread_mutex_unlock(&p->pause.mu);
+    return m;
+}
+
+static int pause_should_hold_audio(Player *p)
+{
+    int m = pause_mode(p);
+    return m == PAUSE_PENDING || m == PAUSE_HELD;
+}
+
+static int pause_is_held(Player *p)
+{
+    return pause_mode(p) == PAUSE_HELD;
+}
+
+static void pause_wait_unheld(Player *p)
+{
+    if (!p || !p->pause.inited)
+        return;
+    pthread_mutex_lock(&p->pause.mu);
+    while (p->pause.mode == PAUSE_HELD && !p->fail && !g_interrupt)
+        pthread_cond_wait(&p->pause.cv, &p->pause.mu);
+    pthread_mutex_unlock(&p->pause.mu);
+}
+
+static int pause_wait_control(Player *p)
+{
+    unsigned gen;
+
+    if (!p || !p->pause.inited)
+        return 0;
+    pause_thr_set(&p->pause.st_demux, THR_PAUSE);
+    pthread_mutex_lock(&p->pause.mu);
+    while (p->pause.mode != PAUSE_OFF && !p->fail && !g_interrupt) {
+        gen = p->pause.wake_gen;
+        pthread_mutex_unlock(&p->pause.mu);
+        if (navq_count(p) > 0) {
+            pause_thr_set(&p->pause.st_demux, THR_RUN);
+            return 1;
+        }
+        pthread_mutex_lock(&p->pause.mu);
+        if (p->pause.mode == PAUSE_OFF || p->fail || g_interrupt)
+            break;
+        if (p->pause.wake_gen != gen)
+            continue;
+        pthread_cond_wait(&p->pause.cv, &p->pause.mu);
+    }
+    pthread_mutex_unlock(&p->pause.mu);
+    pause_thr_set(&p->pause.st_demux, THR_RUN);
+    return 0;
+}
+
+static void pause_debug_threads(Player *p, const char *why)
+{
+    if (!p || !g_debug_stats)
+        return;
+    fprintf(stderr,
+            "PAUSE thread state%s%s:\n"
+            "  demux=%s\n"
+            "  audio=%s\n"
+            "  video producer=%s\n"
+            "  presenter=%s\n"
+            "  aq count=%d\n"
+            "  vq count=%d\n"
+            "  yuv count=%d\n"
+            "  pending nav commands=%d\n",
+            why && why[0] ? " (" : "",
+            why && why[0] ? why : "",
+            pause_thr_name(pause_thr_get(&p->pause.st_demux)),
+            pause_thr_name(pause_thr_get(&p->pause.st_audio)),
+            pause_thr_name(pause_thr_get(&p->pause.st_video)),
+            pause_thr_name(pause_thr_get(&p->pause.st_present)),
+            pktq_count(&p->aq),
+            pktq_count(&p->vq),
+            (p->buffered_yuv && p->yuvring.inited)
+                ? yuvring_count(&p->yuvring) : 0,
+            navq_count(p));
+}
+
+/* 1 = pushed, 0 = not pushed (quit, interrupt, or pending nav). */
+static int player_pktq_push(Player *p, PktQ *q, AVPacket *src)
+{
+    int64_t t0 = 0;
+    const char *qname;
+
+    if (!p || !q || !src)
+        return 0;
+    qname = (q == &p->aq) ? "audio" : (q == &p->vq) ? "video" : "packet";
+    pthread_mutex_lock(&q->mu);
+    while (q->count >= q->cap && !q->quit && !g_interrupt) {
+        if (!t0) {
+            t0 = av_gettime_relative();
+            q->full_n++;
+            pause_thr_set(&p->pause.st_demux, THR_QFULL);
+        }
+        if (navq_count(p) > 0) {
+            if (t0)
+                q->block_us += av_gettime_relative() - t0;
+            pthread_mutex_unlock(&q->mu);
+            pause_thr_set(&p->pause.st_demux, THR_RUN);
+            return 0;
+        }
+        if (pause_should_hold_audio(p)) {
+            if (g_debug_stats && !p->pause.stuck_logged &&
+                av_gettime_relative() - t0 >= PAUSE_STUCK_US) {
+                p->pause.stuck_logged = 1;
+                fprintf(stderr,
+                        "DVD PAUSE: demux blocked on %s queue >500ms\n",
+                        qname);
+            }
+            pthread_mutex_unlock(&q->mu);
+            pause_wait_control(p);
+            pthread_mutex_lock(&q->mu);
+            continue;
+        }
+        pktq_wait_timeout(&q->not_full, &q->mu);
+    }
+    if (g_interrupt)
+        q->quit = 1;
+    if (t0)
+        q->block_us += av_gettime_relative() - t0;
+    pause_thr_set(&p->pause.st_demux, THR_RUN);
+    if (q->quit) {
+        pthread_mutex_unlock(&q->mu);
+        return 0;
+    }
+    av_packet_ref(&q->pkts[q->tail], src);
+    q->pkts[q->tail].opaque = src->opaque;
+    q->tail = (q->tail + 1) % q->cap;
+    q->count++;
+    q->pushed++;
+    pktq_note_depth(q);
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->mu);
+    return 1;
+}
+
+static void pause_request_toggle(Player *p)
+{
+    int mode;
+    int fill = 0;
+    int ready;
+    int64_t clk;
+
+    if (!p || !p->pause.inited)
+        return;
+    clk = clock_read(&p->clock, NULL, &fill);
+    ready = clock_is_ready(&p->clock);
+    pthread_mutex_lock(&p->pause.mu);
+    mode = p->pause.mode;
+    if (mode == PAUSE_OFF) {
+        if (!ready || p->in_menu || p->still_active) {
+            pthread_mutex_unlock(&p->pause.mu);
+            if (p->in_menu || p->still_active)
+                fprintf(stderr, "DVD PAUSE: unavailable in menu\n");
+            else
+                fprintf(stderr, "DVD PAUSE: unavailable until playback\n");
+            return;
+        }
+        p->pause.mode = PAUSE_PENDING;
+        p->pause.events++;
+        p->pause.req_us = av_gettime_relative();
+        p->pause.clock_at_req = clk;
+        p->pause.fill_at_req = fill;
+        p->pause.stale_at_req = p->stale_dropped;
+        p->pause.av_off_at_req = p->last_offset;
+        p->pause.av_off_at_held = AV_NOPTS_VALUE;
+        p->pause.av_off_at_resume = AV_NOPTS_VALUE;
+        p->pause.need_resume_vpts = 0;
+        p->pause.need_resume_audio = 0;
+        p->pause.first_vpts_resume = AV_NOPTS_VALUE;
+        p->pause.first_audio_write_resume = AV_NOPTS_VALUE;
+        p->pause.stuck_logged = 0;
+        pthread_mutex_unlock(&p->pause.mu);
+        fprintf(stderr, "DVD PAUSE: pending\n");
+        pause_wake(p);
+        return;
+    }
+    p->pause.mode = PAUSE_OFF;
+    p->pause.clock_at_resume = clk;
+    p->pause.resume_us = av_gettime_relative();
+    p->pause.stale_at_resume = p->stale_dropped;
+    p->pause.need_resume_vpts = 1;
+    p->pause.need_resume_audio = 1;
+    pthread_mutex_unlock(&p->pause.mu);
+    fprintf(stderr, "DVD PAUSE: resumed\n");
+    pause_wake(p);
+}
+
+static void pause_cancel(Player *p)
+{
+    int mode;
+
+    if (!p || !p->pause.inited)
+        return;
+    pthread_mutex_lock(&p->pause.mu);
+    mode = p->pause.mode;
+    p->pause.mode = PAUSE_OFF;
+    p->pause.need_resume_vpts = 0;
+    p->pause.need_resume_audio = 0;
+    pthread_mutex_unlock(&p->pause.mu);
+    if (mode != PAUSE_OFF)
+        pause_wake(p);
+}
+
+static void pause_enter_held(Player *p, MrAudio *mr, int64_t drain_us)
+{
+    int64_t clk = clock_read(&p->clock, NULL, NULL);
+
+    pthread_mutex_lock(&p->pause.mu);
+    if (p->pause.mode == PAUSE_PENDING) {
+        p->pause.mode = PAUSE_HELD;
+        p->pause.drain_us = drain_us;
+        p->pause.clock_at_held = clk;
+        p->pause.av_off_at_held = p->last_offset;
+        if (mr) {
+            p->pause.consumed_at_held = mraudio_consumed(mr);
+            p->pause.fill_at_held = mr->fill > 0 ? mr->fill : 0;
+        }
+        p->pause.aq_at_held = pktq_count(&p->aq);
+        p->pause.vq_at_held = pktq_count(&p->vq);
+        p->pause.yuv_at_held = (p->buffered_yuv && p->yuvring.inited)
+                               ? yuvring_count(&p->yuvring) : 0;
+        pthread_mutex_unlock(&p->pause.mu);
+        fprintf(stderr, "DVD PAUSE: paused after %dms drain\n",
+                (int)((drain_us + 500) / 1000));
+        pause_wake(p);
+        pause_debug_threads(p, "held");
+        return;
+    }
+    pthread_mutex_unlock(&p->pause.mu);
+}
+
+static void pause_service_audio(Player *p, MrAudio *mr, int64_t first_pts_us,
+                                unsigned clock_epoch)
+{
+    int64_t t0, consumed0;
+
+    if (!pause_should_hold_audio(p))
+        return;
+
+    pause_thr_set(&p->pause.st_audio, THR_PAUSE);
+    if (pause_mode(p) == PAUSE_PENDING) {
+        t0 = av_gettime_relative();
+        if (mr->hw_pace)
+            mraudio_poll(mr);
+        consumed0 = mraudio_consumed(mr);
+        pthread_mutex_lock(&p->pause.mu);
+        p->pause.consumed_at_req = consumed0;
+        pthread_mutex_unlock(&p->pause.mu);
+        mr->playing = 0;
+        while (pause_mode(p) == PAUSE_PENDING && !p->fail && !g_interrupt) {
+            if (p->audio_reset_req)
+                break;
+            if (mr->hw_pace)
+                mraudio_poll(mr);
+            clock_publish(&p->clock, first_pts_us, mraudio_elapsed_us(mr),
+                          p->last_audio_pts_us, mr->fill, mr->hw_pace,
+                          first_pts_us != AV_NOPTS_VALUE &&
+                          (player_buffered(p) ? p->buf_mraudio_started : 1),
+                          clock_epoch);
+            if (!mr->hw_pace || mr->fill <= PAUSE_DRAIN_THRESH) {
+                pause_enter_held(p, mr, av_gettime_relative() - t0);
+                break;
+            }
+            av_usleep(mr->fill <= TARGET_FILL / 4 ? 2000 : 10000);
+        }
+    }
+
+    while (pause_is_held(p) && !p->fail && !g_interrupt) {
+        if (p->audio_reset_req)
+            break;
+        pause_wait_unheld(p);
+    }
+    pause_thr_set(&p->pause.st_audio, THR_RUN);
+}
+
+static void pause_note_resume_video_pts(Player *p, int64_t vpts_us)
+{
+    if (!p || !p->pause.inited || vpts_us == AV_NOPTS_VALUE)
+        return;
+    pthread_mutex_lock(&p->pause.mu);
+    if (p->pause.need_resume_vpts) {
+        p->pause.first_vpts_resume = vpts_us;
+        p->pause.av_off_at_resume = p->last_offset;
+        p->pause.need_resume_vpts = 0;
+    }
+    pthread_mutex_unlock(&p->pause.mu);
+}
+
+static void pause_note_resume_audio_write(Player *p)
+{
+    if (!p || !p->pause.inited)
+        return;
+    pthread_mutex_lock(&p->pause.mu);
+    if (p->pause.need_resume_audio) {
+        p->pause.first_audio_write_resume = av_gettime_relative();
+        p->pause.need_resume_audio = 0;
+    }
+    pthread_mutex_unlock(&p->pause.mu);
 }
 
 static const char *dvd_menu_id_name(int32_t part)
@@ -2686,6 +3186,7 @@ static void player_nav_discontinuity(Player *p, const char *why)
 
     if (!p)
         return;
+    pause_cancel(p);
     gen = __atomic_add_fetch(&p->nav_gen, 1, __ATOMIC_SEQ_CST);
     __atomic_add_fetch(&p->codec_gen, 1, __ATOMIC_SEQ_CST);
     __atomic_store_n(&p->frames_this_nav_gen, 0, __ATOMIC_SEQ_CST);
@@ -2750,6 +3251,7 @@ static void player_nav_soft_reset(Player *p, const char *reason,
 
     if (!p)
         return;
+    pause_cancel(p);
     gen = __atomic_add_fetch(&p->nav_gen, 1, __ATOMIC_SEQ_CST);
     __atomic_store_n(&p->frames_this_nav_gen, 0, __ATOMIC_SEQ_CST);
     p->still_drain_req = 0;
@@ -3064,7 +3566,37 @@ static void dvdio_exec_nav_cmd(DVDIO *d, NavCmd cmd)
     in_menu = dvdio_detect_menu(d);
 
     switch (cmd) {
+    case NAVCMD_NONE:
+        break;
+    case NAVCMD_PLAY_PAUSE:
+        if (in_menu || (d->player && (d->player->in_menu || d->player->still_active))) {
+            fprintf(stderr, "DVD PAUSE: unavailable in menu\n");
+            break;
+        }
+        if (d->player) {
+            int was = pause_mode(d->player);
+
+            if (was != PAUSE_OFF && g_debug_stats) {
+                fprintf(stderr, "PAUSE wake: command=RESUME\n");
+                pause_debug_threads(d->player, "resume");
+            }
+            pause_request_toggle(d->player);
+            if (was != PAUSE_OFF && g_debug_stats)
+                fprintf(stderr, "demux wake OK\n");
+        }
+        break;
     case NAVCMD_MENU:
+        if (d->player) {
+            int was = pause_mode(d->player);
+
+            if (was != PAUSE_OFF && g_debug_stats) {
+                fprintf(stderr, "PAUSE wake: command=MENU\n");
+                pause_debug_threads(d->player, "menu");
+            }
+            pause_cancel(d->player);
+            if (was != PAUSE_OFF && g_debug_stats)
+                fprintf(stderr, "demux wake OK\n");
+        }
         if (in_menu) {
             dvdio_menu_resume(d);
         } else {
@@ -3718,7 +4250,7 @@ static AVCodecContext *open_decoder(const AVCodecParameters *cp, AVRational tb,
     return ctx;
 }
 
-static int emit_pcm(MrAudio *mr, uint8_t *chunk, int *used,
+static int emit_pcm(Player *p, MrAudio *mr, uint8_t *chunk, int *used,
                     const uint8_t *src, int remain)
 {
     while (remain > 0) {
@@ -3733,6 +4265,8 @@ static int emit_pcm(MrAudio *mr, uint8_t *chunk, int *used,
             if (mraudio_write_all(mr, chunk, WRITE_CHUNK) < 0)
                 return -1;
             mr->playing = 1;
+            if (p)
+                pause_note_resume_audio_write(p);
             *used = 0;
         }
     }
@@ -3878,7 +4412,7 @@ static int buffered_start_mraudio(Player *p, MrAudio *mr, uint8_t *chunk,
         }
         p->pcm_hold_used = flush_n;
         written0 = mr->bytes_written;
-        if (emit_pcm(mr, chunk, chunk_used, p->pcm_hold, flush_n) < 0)
+        if (emit_pcm(p, mr, chunk, chunk_used, p->pcm_hold, flush_n) < 0)
             return -1;
         dbg("MrAudio held-PCM flush bytes: %" PRId64
             "  (%.1f ms used for prime/fill)\n",
@@ -3903,11 +4437,16 @@ static int buffered_start_mraudio(Player *p, MrAudio *mr, uint8_t *chunk,
 /*
  * 1 = packet, 0 = eof/quit, 2 = prefill gate opened while queue was empty
  * (audio must start MrAudio immediately, then retry the pop).
+ * 3 = audio_reset_req. 4 = pause drain/hold (do not consume a packet).
  */
 static int pktq_pop_or_prefill_gate(PktQ *q, AVPacket *dst, Player *p)
 {
     pthread_mutex_lock(&q->mu);
     for (;;) {
+        if (pause_should_hold_audio(p)) {
+            pthread_mutex_unlock(&q->mu);
+            return 4;
+        }
         if (q->count > 0)
             break;
         if (q->eof || q->quit || g_interrupt)
@@ -3981,7 +4520,7 @@ static int buffered_emit_pcm(Player *p, MrAudio *mr, uint8_t *chunk,
     }
     if (buffered_start_mraudio(p, mr, chunk, chunk_used) < 0)
         return -1;
-    return emit_pcm(mr, chunk, chunk_used, src, remain);
+    return emit_pcm(p, mr, chunk, chunk_used, src, remain);
 }
 
 static void *audio_thread(void *opaque)
@@ -4056,6 +4595,13 @@ static void *audio_thread(void *opaque)
                 player_nav_gen(p), mr.bytes_origin);
         }
 
+        if (pause_should_hold_audio(p)) {
+            pause_service_audio(p, &mr, first_pts_us, clock_epoch);
+            if (p->fail || g_interrupt)
+                break;
+            continue;
+        }
+
         if (player_buffered(p)) {
             if (buffered_try_start_mraudio(p, &mr, chunk, &chunk_used,
                                            first_pts_us, clock_epoch) < 0) {
@@ -4077,14 +4623,28 @@ static void *audio_thread(void *opaque)
                 continue;
             }
             got_pkt = pktq_pop_or_prefill_gate(&p->aq, pkt, p);
-            if (got_pkt == 2)
+            if (got_pkt == 2 || got_pkt == 3)
                 continue;
-            if (got_pkt == 3)
+            if (got_pkt == 4) {
+                pause_service_audio(p, &mr, first_pts_us, clock_epoch);
+                if (p->fail || g_interrupt)
+                    break;
                 continue;
+            }
             if (got_pkt == 0)
                 break;
-        } else if (!pktq_pop(&p->aq, pkt)) {
-            break;
+        } else {
+            got_pkt = pktq_pop_or_prefill_gate(&p->aq, pkt, p);
+            if (got_pkt == 2 || got_pkt == 3)
+                continue;
+            if (got_pkt == 4) {
+                pause_service_audio(p, &mr, first_pts_us, clock_epoch);
+                if (p->fail || g_interrupt)
+                    break;
+                continue;
+            }
+            if (got_pkt == 0)
+                break;
         }
         p->audio_packets++;
         if (avcodec_send_packet(adec, pkt) < 0) {
@@ -4166,7 +4726,7 @@ static void *audio_thread(void *opaque)
                             av_frame_unref(frame);
                             goto done;
                         }
-                    } else if (emit_pcm(&mr, chunk, &chunk_used, out_data[0],
+                    } else if (emit_pcm(p, &mr, chunk, &chunk_used, out_data[0],
                                         got * OUT_BYTES) < 0) {
                         player_abort(p);
                         av_frame_unref(frame);
@@ -4209,7 +4769,8 @@ static void *audio_thread(void *opaque)
         while (chunk_used & 3)
             chunk[chunk_used++] = 0;
         mraudio_wait_fill(&mr, chunk_used);
-        mraudio_write_all(&mr, chunk, chunk_used);
+        if (mraudio_write_all(&mr, chunk, chunk_used) == 0)
+            pause_note_resume_audio_write(p);
         mr.playing = 1;
     }
     mraudio_drain(&mr);
@@ -4851,6 +5412,8 @@ static int frame_is_stale(Player *p, int64_t vpts_us, int timed, int64_t *off_ou
 
     if (off_out)
         *off_out = 0;
+    if (pause_is_held(p))
+        return 0;
     if (!timed || vpts_us == AV_NOPTS_VALUE)
         return 0;
     T = frame_duration_us(p);
@@ -4997,6 +5560,51 @@ static int bench_convert_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
     return 0;
 }
 
+static void present_block_if_held(Player *p)
+{
+    while (pause_is_held(p) && !p->fail && !g_interrupt) {
+        pause_thr_set(&p->pause.st_present, THR_PAUSE);
+        pause_wait_unheld(p);
+        pause_thr_set(&p->pause.st_present, THR_RUN);
+    }
+}
+
+static void present_wait_pts(Player *p, int64_t pvpts_us)
+{
+    int64_t hold0;
+
+    if (pvpts_us == AV_NOPTS_VALUE)
+        return;
+    hold0 = av_gettime_relative();
+    for (;;) {
+        int64_t aclk;
+        int64_t remain;
+
+        if (pause_is_held(p)) {
+            pause_wait_unheld(p);
+            hold0 = av_gettime_relative();
+            if (p->fail || g_interrupt)
+                return;
+            continue;
+        }
+        aclk = clock_read(&p->clock, NULL, NULL);
+        if (aclk == AV_NOPTS_VALUE)
+            break;
+        if (pvpts_us <= aclk + EARLY_SLACK_US)
+            break;
+        if (av_gettime_relative() - hold0 > MAX_HOLD_US)
+            break;
+        if (p->fail || g_interrupt)
+            break;
+        remain = pvpts_us - aclk;
+        if (remain > 5000)
+            remain = 5000;
+        if (remain < 500)
+            remain = 500;
+        av_usleep((unsigned)remain);
+    }
+}
+
 static int present_video_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
                                struct SwsContext **sws, int timed)
 {
@@ -5021,6 +5629,10 @@ static int present_video_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
         p->last_video_pts_us = vpts_us;
 
     int64_t pvpts_us = presentation_vpts_from_raw(p, vpts_us);
+
+    present_block_if_held(p);
+    if (p->fail || g_interrupt)
+        return -1;
 
     {
         int64_t stale_off = 0;
@@ -5116,28 +5728,8 @@ static int present_video_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
     __sync_synchronize();
     int64_t conv_done = av_gettime_relative();
 
-    if (timed && pvpts_us != AV_NOPTS_VALUE) {
-        int64_t hold0 = av_gettime_relative();
-        for (;;) {
-            int64_t aclk = clock_read(&p->clock, NULL, NULL);
-            if (aclk == AV_NOPTS_VALUE)
-                break;
-            if (pvpts_us <= aclk + EARLY_SLACK_US)
-                break;
-            if (av_gettime_relative() - hold0 > MAX_HOLD_US)
-                break;
-            if (p->fail || g_interrupt)
-                break;
-            {
-                int64_t remain = pvpts_us - aclk;
-                if (remain > 5000)
-                    remain = 5000;
-                if (remain < 500)
-                    remain = 500;
-                av_usleep((unsigned)remain);
-            }
-        }
-    }
+    if (timed && pvpts_us != AV_NOPTS_VALUE)
+        present_wait_pts(p, pvpts_us);
 
     int64_t aclk = clock_read(&p->clock, NULL, NULL);
     int64_t av_off = 0;
@@ -5158,6 +5750,7 @@ static int present_video_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
     p->rendered++;
     p->stale_run = 0;
     p->last_present_end_us = p->last_mbox_wall_us;
+    pause_note_resume_video_pts(p, vpts_us);
 
     /* Path stats after mailbox so they cannot delay the FPGA request. */
     {
@@ -5337,8 +5930,12 @@ static int producer_enqueue_frame(Player *p, AVFrame *frame, AVCodecContext *vde
         }
     }
 
-    if (!vidring_begin_produce(&p->vring, &idx))
+    pause_thr_set(&p->pause.st_video, THR_QFULL);
+    if (!vidring_begin_produce(&p->vring, &idx, p)) {
+        pause_thr_set(&p->pause.st_video, THR_RUN);
         return p->fail ? -1 : 1;
+    }
+    pause_thr_set(&p->pause.st_video, THR_RUN);
     if (p->fail)
         return -1;
 
@@ -5429,8 +6026,12 @@ static int producer_enqueue_yuv(Player *p, AVFrame *frame, AVCodecContext *vdec,
             VIDEO_BUFFER_FRAMES, VIDEO_PREFILL_FRAMES);
     }
 
-    if (!yuvring_begin_produce(&p->yuvring, &idx, &epoch))
+    pause_thr_set(&p->pause.st_video, THR_QFULL);
+    if (!yuvring_begin_produce(&p->yuvring, &idx, &epoch, p)) {
+        pause_thr_set(&p->pause.st_video, THR_RUN);
         return p->fail ? -1 : 1;
+    }
+    pause_thr_set(&p->pause.st_video, THR_RUN);
     if (p->fail)
         return -1;
 
@@ -5483,6 +6084,10 @@ static int present_cached_frame(Player *p, uint8_t *src, int64_t vpts_us)
 {
     int64_t pvpts_us = presentation_vpts_from_raw(p, vpts_us);
     int64_t stale_off = 0;
+
+    present_block_if_held(p);
+    if (p->fail || g_interrupt)
+        return -1;
 
     if (frame_is_stale(p, pvpts_us, 1, &stale_off)) {
         record_stale_drop(p, stale_off);
@@ -5547,28 +6152,8 @@ static int present_cached_frame(Player *p, uint8_t *src, int64_t vpts_us)
     __sync_synchronize();
     int64_t conv_done = av_gettime_relative();
 
-    if (pvpts_us != AV_NOPTS_VALUE) {
-        int64_t hold0 = av_gettime_relative();
-        for (;;) {
-            int64_t aclk = clock_read(&p->clock, NULL, NULL);
-            if (aclk == AV_NOPTS_VALUE)
-                break;
-            if (pvpts_us <= aclk + EARLY_SLACK_US)
-                break;
-            if (av_gettime_relative() - hold0 > MAX_HOLD_US)
-                break;
-            if (p->fail || g_interrupt)
-                break;
-            {
-                int64_t remain = pvpts_us - aclk;
-                if (remain > 5000)
-                    remain = 5000;
-                if (remain < 500)
-                    remain = 500;
-                av_usleep((unsigned)remain);
-            }
-        }
-    }
+    if (pvpts_us != AV_NOPTS_VALUE)
+        present_wait_pts(p, pvpts_us);
 
     int64_t aclk = clock_read(&p->clock, NULL, NULL);
     int64_t av_off = 0;
@@ -5589,6 +6174,7 @@ static int present_cached_frame(Player *p, uint8_t *src, int64_t vpts_us)
     p->rendered++;
     p->stale_run = 0;
     p->last_present_end_us = p->last_mbox_wall_us;
+    pause_note_resume_video_pts(p, vpts_us);
 
     {
         int64_t a2m = p->last_mbox_wall_us - own0;
@@ -5791,9 +6377,14 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
     if (player_accept_video_frame(p, frame, NULL) < 0)
         return -1;
 
-    if (!skip_clock && frame_is_stale(p, pvpts_us, 1, &stale_off)) {
-        record_stale_drop(p, stale_off);
-        return 1;
+    if (!skip_clock) {
+        present_block_if_held(p);
+        if (p->fail || g_interrupt)
+            return -1;
+        if (frame_is_stale(p, pvpts_us, 1, &stale_off)) {
+            record_stale_drop(p, stale_off);
+            return 1;
+        }
     }
 
     if (p->rendered == 0) {
@@ -5875,28 +6466,8 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
     __sync_synchronize();
     int64_t conv_done = av_gettime_relative();
 
-    if (!skip_clock && pvpts_us != AV_NOPTS_VALUE) {
-        int64_t hold0 = av_gettime_relative();
-        for (;;) {
-            int64_t aclk = clock_read(&p->clock, NULL, NULL);
-            if (aclk == AV_NOPTS_VALUE)
-                break;
-            if (pvpts_us <= aclk + EARLY_SLACK_US)
-                break;
-            if (av_gettime_relative() - hold0 > MAX_HOLD_US)
-                break;
-            if (p->fail || g_interrupt)
-                break;
-            {
-                int64_t remain = pvpts_us - aclk;
-                if (remain > 5000)
-                    remain = 5000;
-                if (remain < 500)
-                    remain = 500;
-                av_usleep((unsigned)remain);
-            }
-        }
-    }
+    if (!skip_clock && pvpts_us != AV_NOPTS_VALUE)
+        present_wait_pts(p, pvpts_us);
 
     int64_t aclk = clock_read(&p->clock, NULL, NULL);
     int64_t av_off = 0;
@@ -5917,6 +6488,8 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
     p->rendered++;
     p->stale_run = 0;
     p->last_present_end_us = p->last_mbox_wall_us;
+    if (!skip_clock)
+        pause_note_resume_video_pts(p, vpts_us);
 
     {
         int64_t a2m = p->last_mbox_wall_us - own0;
@@ -6109,6 +6682,15 @@ static void *present_thread(void *opaque)
             pr = present_yuv_frame(p, menu_hold, AV_NOPTS_VALUE, &sws, 1, 1);
             p->menu_redraws++;
             if (pr < 0)
+                break;
+            continue;
+        }
+
+        if (pause_is_held(p)) {
+            pause_thr_set(&p->pause.st_present, THR_PAUSE);
+            pause_wait_unheld(p);
+            pause_thr_set(&p->pause.st_present, THR_RUN);
+            if (p->fail || g_interrupt)
                 break;
             continue;
         }
@@ -6764,6 +7346,13 @@ int main(int argc, char **argv)
     for (;;) {
         if (p.fail || g_interrupt)
             break;
+        dvdio_process_nav_cmds(&d);
+        if (d.stopped)
+            break;
+        if (pause_is_held(&p) && !d.hop_pending && !p.demux_reopen_req) {
+            pause_wait_control(&p);
+            continue;
+        }
         read_ret = av_read_frame(fmt, pkt);
         if (read_ret < 0) {
             if (!p.fail && !g_interrupt && !d.stopped &&
@@ -6866,7 +7455,7 @@ int main(int argc, char **argv)
         if (p.uncapped_bench && p.ai >= 0 && pkt->stream_index == p.ai) {
             p.bench_audio_discarded++;
         } else if (p.audio_started && pkt->stream_index == p.ai) {
-            pktq_push(&p.aq, pkt);
+            player_pktq_push(&p, &p.aq, pkt);
         } else if (p.video_started && pkt->stream_index == p.vi) {
             if (p.soft_log_pkt &&
                 player_nav_gen(&p) == p.soft_nav_gen) {
@@ -6875,7 +7464,7 @@ int main(int argc, char **argv)
                     "gen=%u size=%d\n",
                     player_nav_gen(&p), pkt->size);
             }
-            pktq_push(&p.vq, pkt);
+            player_pktq_push(&p, &p.vq, pkt);
         }
 
         av_packet_unref(pkt);
@@ -7279,6 +7868,67 @@ int main(int argc, char **argv)
             p.demux_cpu_us / 1e6, p.audio_cpu_us / 1e6, p.video_cpu_us / 1e6,
             p.present_cpu_us / 1e6, p.input_cpu_us / 1e6,
             mr->hw_pace ? "hardware FPGA rptr/len" : "DEGRADED wall-clock");
+
+    fprintf(stderr,
+            "\n=== DVD PAUSE ===\n"
+            "Pause events:               %u\n"
+            "Last request fill:          %d bytes  (%.1f ms)\n"
+            "Consumed during drain:      %" PRId64 " bytes  (%.1f ms)\n"
+            "Drain duration:             %.1f ms\n"
+            "A/V offset at request:      %s%+.2f ms\n"
+            "A/V offset at held:         %s%+.2f ms\n"
+            "MrAudio fill at held:       %d bytes  (%.3f ms)\n"
+            "Clock at request:           %s%.6f s\n"
+            "Clock at held:              %s%.6f s\n"
+            "Clock at resume:            %s%.6f s\n"
+            "First video PTS after resume: %s%.6f s\n"
+            "First A/V offset after resume: %s%+.2f ms\n"
+            "First audio write after resume: %s%.1f ms after resume\n"
+            "Stale at request / resume / end: %d / %d / %d  "
+            "(after resume %d)\n"
+            "Queues at held aq/vq/yuv:   %d / %d / %d\n",
+            p.pause.events,
+            p.pause.fill_at_req,
+            p.pause.fill_at_req * 1000.0 / (double)BYTES_PER_SEC,
+            p.pause.consumed_at_held - p.pause.consumed_at_req,
+            (p.pause.consumed_at_held - p.pause.consumed_at_req) *
+                1000.0 / (double)BYTES_PER_SEC,
+            p.pause.drain_us / 1000.0,
+            p.pause.av_off_at_req == AV_NOPTS_VALUE ? "(none) " : "",
+            p.pause.av_off_at_req == AV_NOPTS_VALUE ? 0.0
+                : p.pause.av_off_at_req / 1000.0,
+            p.pause.av_off_at_held == AV_NOPTS_VALUE ? "(none) " : "",
+            p.pause.av_off_at_held == AV_NOPTS_VALUE ? 0.0
+                : p.pause.av_off_at_held / 1000.0,
+            p.pause.fill_at_held,
+            p.pause.fill_at_held * 1000.0 / (double)BYTES_PER_SEC,
+            p.pause.clock_at_req == AV_NOPTS_VALUE ? "(none) " : "",
+            p.pause.clock_at_req == AV_NOPTS_VALUE ? 0.0
+                : p.pause.clock_at_req / 1e6,
+            p.pause.clock_at_held == AV_NOPTS_VALUE ? "(none) " : "",
+            p.pause.clock_at_held == AV_NOPTS_VALUE ? 0.0
+                : p.pause.clock_at_held / 1e6,
+            p.pause.clock_at_resume == AV_NOPTS_VALUE ? "(none) " : "",
+            p.pause.clock_at_resume == AV_NOPTS_VALUE ? 0.0
+                : p.pause.clock_at_resume / 1e6,
+            p.pause.first_vpts_resume == AV_NOPTS_VALUE ? "(none) " : "",
+            p.pause.first_vpts_resume == AV_NOPTS_VALUE ? 0.0
+                : p.pause.first_vpts_resume / 1e6,
+            p.pause.av_off_at_resume == AV_NOPTS_VALUE ? "(none) " : "",
+            p.pause.av_off_at_resume == AV_NOPTS_VALUE ? 0.0
+                : p.pause.av_off_at_resume / 1000.0,
+            (p.pause.first_audio_write_resume == AV_NOPTS_VALUE ||
+             p.pause.resume_us == AV_NOPTS_VALUE ||
+             p.pause.resume_us == 0) ? "(none) " : "",
+            (p.pause.first_audio_write_resume == AV_NOPTS_VALUE ||
+             p.pause.resume_us == AV_NOPTS_VALUE ||
+             p.pause.resume_us == 0)
+                ? 0.0
+                : (p.pause.first_audio_write_resume - p.pause.resume_us) /
+                  1000.0,
+            p.pause.stale_at_req, p.pause.stale_at_resume, p.stale_dropped,
+            p.stale_dropped - p.pause.stale_at_resume,
+            p.pause.aq_at_held, p.pause.vq_at_held, p.pause.yuv_at_held);
 
     {
         fprintf(stderr, "\n=== THREAD SCHEDULING ===\n");
