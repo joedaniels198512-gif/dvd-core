@@ -5,6 +5,11 @@
 // Raster counters are inputs; never stall them.
 // display_buf snapshots req_buf once per complete native frame (field 1 -> 0).
 // HDMI ASCAL captures the same VGA_* stream; it does not read these DDR buffers.
+//
+// crt_stab: 0/3=Off (true even/odd weave), 1=Gentle (75/25 pair blend),
+//           2=Strong (duplicate even). Off/Strong use pe0/pe1 as the
+// original two-line ping-pong (one DDR line per output line). Gentle uses
+// two E/O pairs in M10K (four line RAMs, two DDR lines per output line).
 
 module fb_line_reader
 (
@@ -18,7 +23,7 @@ module fb_line_reader
 	input         req_buf,
 	output reg    display_buf,
 	input         pal,
-	input         dup_even,
+	input   [1:0] crt_stab,
 
 	input         mb_idle,
 	output        vid_req,
@@ -49,17 +54,29 @@ localparam [1:0]  ST_WAIT  = 2'd2;
 wire [9:0] H_LAST   = pal ? 10'd863 : 10'd857;
 wire [9:0] V_ACTIVE = pal ? 10'd288 : 10'd240;
 
-reg  [63:0] line0 [0:359];
-reg  [63:0] line1 [0:359];
+wire        gentle = (crt_stab == 2'd1);
+wire        strong = (crt_stab == 2'd2);
+
+// Off/Strong use pe0/pe1 as the original two-line ping-pong.
+// Gentle uses both pairs (pe/po × 0/1). Read+write share one clocked
+// always so Quartus infers M10K instead of LAB RAM.
+(* ramstyle = "M10K" *) reg [63:0] pe0 [0:359];
+(* ramstyle = "M10K" *) reg [63:0] po0 [0:359];
+(* ramstyle = "M10K" *) reg [63:0] pe1 [0:359];
+(* ramstyle = "M10K" *) reg [63:0] po1 [0:359];
+reg [63:0] pe0_q, po0_q, pe1_q, po1_q;
 
 reg         buf_ok [0:1];
 reg   [9:0] buf_y  [0:1];
+reg         pe_ok [0:1];
+reg         po_ok [0:1];
+reg   [9:0] pe_y  [0:1];
+reg   [9:0] po_y  [0:1];
 
-// Normal: src_field follows the raster field (even/odd weave).
-// Duplicate Even: both output fields read even source lines only.
-// Raster timing / VGA_F1 / display_buf latch still use `field`.
-wire        src_field      = dup_even ? 1'b0 : field;
-wire        src_next_field = dup_even ? 1'b0 : ~field;
+// Off: src_field follows the raster field. Strong: both fields read even.
+// Gentle does not use these wires for DDR/display.
+wire        src_field      = strong ? 1'b0 : field;
+wire        src_next_field = strong ? 1'b0 : ~field;
 wire  [9:0] y_disp         = {vc[8:0], src_field};
 wire  [9:0] y_next_active  = {vc[8:0] + 9'd1, src_field};
 wire  [9:0] y_nf0          = {9'd0, src_next_field};
@@ -67,8 +84,8 @@ wire  [9:0] y_nf1          = {9'd1, src_next_field};
 
 wire        have0_disp = buf_ok[0] && buf_y[0] == y_disp;
 wire        have1_disp = buf_ok[1] && buf_y[1] == y_disp;
-wire        disp_ok    = (vc < V_ACTIVE) && (have0_disp || have1_disp);
-wire        disp_sel   = have1_disp && !have0_disp;
+wire        off_disp_ok = (vc < V_ACTIVE) && (have0_disp || have1_disp);
+wire        disp_sel    = have1_disp && !have0_disp;
 
 wire        have_nf0 =
 	(buf_ok[0] && buf_y[0] == y_nf0) ||
@@ -85,21 +102,66 @@ wire        have_cand =
 	(buf_ok[0] && buf_y[0] == y_cand) ||
 	(buf_ok[1] && buf_y[1] == y_cand);
 
-wire        fill_need = !have_cand;
+wire        off_fill_need = !have_cand;
 
 // Do not overwrite the line currently on screen. In VBlank, keep nf0.
 wire        fill_sel =
 	((vc < V_ACTIVE) && have0_disp) ||
 	((vc >= V_ACTIVE) && buf_ok[0] && buf_y[0] == y_nf0);
 
+// ---- Gentle pair fetch: E=2*vc, O=2*vc+1. Never 576/577 or 480/481. ----
+wire        in_pic   = (vc < V_ACTIVE);
+wire        last_pic = (vc == (V_ACTIVE - 10'd1));
+wire  [9:0] y_e_disp = {vc[8:0], 1'b0};
+wire  [9:0] y_o_disp = {vc[8:0], 1'b1};
+
+wire g_have0_disp = in_pic && pe_ok[0] && po_ok[0] &&
+	pe_y[0] == y_e_disp && po_y[0] == y_o_disp;
+wire g_have1_disp = in_pic && pe_ok[1] && po_ok[1] &&
+	pe_y[1] == y_e_disp && po_y[1] == y_o_disp;
+wire g_disp_ok   = g_have0_disp || g_have1_disp;
+wire g_disp_pair = g_have1_disp && !g_have0_disp;
+
+// Current pair if display not ready; else next pair, or 0/1 after last line.
+wire [9:0] y_e_need = !in_pic ? 10'd0 :
+	(!g_disp_ok ? y_e_disp :
+	 (last_pic  ? 10'd0 : {vc[8:0] + 9'd1, 1'b0}));
+wire [9:0] y_o_need = !in_pic ? 10'd1 :
+	(!g_disp_ok ? y_o_disp :
+	 (last_pic  ? 10'd1 : {vc[8:0] + 9'd1, 1'b1}));
+
+wire g_have_need =
+	(pe_ok[0] && po_ok[0] && pe_y[0] == y_e_need && po_y[0] == y_o_need) ||
+	(pe_ok[1] && po_ok[1] && pe_y[1] == y_e_need && po_y[1] == y_o_need);
+
+wire g_fill_need = !g_have_need;
+
+// Do not overwrite the pair currently on screen.
+wire g_fill_pair = g_have0_disp ? 1'b1 :
+                   g_have1_disp ? 1'b0 :
+                   (pe_ok[0] && po_ok[0] &&
+                    pe_y[0] == y_e_need && po_y[0] == y_o_need) ? 1'b1 : 1'b0;
+
+wire g_have_fill_e = pe_ok[g_fill_pair] && pe_y[g_fill_pair] == y_e_need;
+wire g_fill_odd    = g_have_fill_e;
+wire [9:0] y_g_fill = g_fill_odd ? y_o_need : y_e_need;
+
+wire        fill_need = gentle ? g_fill_need : off_fill_need;
+wire [9:0]  y_issue   = gentle ? y_g_fill    : y_cand;
+wire [8:0]  rd_beat   = (hc < H_ACTIVE) ? hc[9:1] : 9'd0;
+
 reg   [1:0] st;
 reg         fill_sel_r;
+reg         gentle_fill_r;
+reg         fill_pair_r;
+reg         fill_odd_r;
 reg   [9:0] y_fill_r;
 reg  [28:0] line_base;
 reg   [8:0] beats_got;
 reg   [7:0] burst_got;
 reg         ddr_rd_r;
 reg         pal_d = 0;
+reg   [1:0] stab_d = 0;
 
 assign vid_req    = (st != ST_IDLE) || fill_need;
 assign vid_active = (st != ST_IDLE);
@@ -111,13 +173,15 @@ assign ddr_burstcnt = BURST_BEATS;
 // source line 0 of field 0. Display of the last odd line is already in the
 // ping-pong RAM; only subsequent fills (field 0 line 0 onward) use the new
 // base. PAL uses vc==286 / hc==863; NTSC stays vc==238 / hc==857.
-wire [28:0] fb_base   = display_buf ? FB_B_ADDR : FB_A_ADDR;
-wire [28:0] cand_base = fb_base + y_cand * 29'd360;
+wire [28:0] fb_base    = display_buf ? FB_B_ADDR : FB_A_ADDR;
+wire [28:0] issue_base = fb_base + y_issue * 29'd360;
 
-wire pal_chg = pal_d != pal;
+wire pal_chg  = pal_d != pal;
+wire stab_chg = stab_d != crt_stab;
 
 always @(posedge clk) begin
-	pal_d <= pal;
+	pal_d  <= pal;
+	stab_d <= crt_stab;
 	if (reset || pal_chg)
 		display_buf <= 1'b0;
 	else if (ce_pix && field && (vc == (V_ACTIVE - 10'd2)) && (hc == H_LAST))
@@ -127,24 +191,40 @@ end
 always @(posedge clk) begin
 	ddr_rd_r <= 1'b0;
 
-	if (reset || pal_chg) begin
-		st          <= ST_IDLE;
-		buf_ok[0]   <= 1'b0;
-		buf_ok[1]   <= 1'b0;
-		beats_got   <= 9'd0;
-		burst_got   <= 8'd0;
-		fill_sel_r  <= 1'b0;
-		y_fill_r    <= 10'd0;
-		line_base   <= 29'd0;
+	if (reset || pal_chg || stab_chg) begin
+		st            <= ST_IDLE;
+		buf_ok[0]     <= 1'b0;
+		buf_ok[1]     <= 1'b0;
+		pe_ok[0]      <= 1'b0;
+		pe_ok[1]      <= 1'b0;
+		po_ok[0]      <= 1'b0;
+		po_ok[1]      <= 1'b0;
+		beats_got     <= 9'd0;
+		burst_got     <= 8'd0;
+		fill_sel_r    <= 1'b0;
+		gentle_fill_r <= 1'b0;
+		fill_pair_r   <= 1'b0;
+		fill_odd_r    <= 1'b0;
+		y_fill_r      <= 10'd0;
+		line_base     <= 29'd0;
 	end else begin
 		case (st)
 			ST_IDLE: if (fill_need && mb_idle) begin
+					gentle_fill_r  <= gentle;
 					fill_sel_r     <= fill_sel;
-					y_fill_r       <= y_cand;
-					line_base      <= cand_base;
+					fill_pair_r    <= g_fill_pair;
+					fill_odd_r     <= g_fill_odd;
+					y_fill_r       <= y_issue;
+					line_base      <= issue_base;
 					beats_got      <= 9'd0;
 					burst_got      <= 8'd0;
-					buf_ok[fill_sel] <= 1'b0;
+					if (gentle) begin
+						if (g_fill_odd)
+							po_ok[g_fill_pair] <= 1'b0;
+						else
+							pe_ok[g_fill_pair] <= 1'b0;
+					end else
+						buf_ok[fill_sel] <= 1'b0;
 					st             <= ST_ISSUE;
 				end
 
@@ -158,14 +238,19 @@ always @(posedge clk) begin
 
 			ST_WAIT: begin
 				if (DDRAM_DOUT_READY) begin
-					if (fill_sel_r)
-						line1[beats_got] <= DDRAM_DOUT;
-					else
-						line0[beats_got] <= DDRAM_DOUT;
-
 					if (beats_got == (BEATS_LINE - 9'd1)) begin
-						buf_ok[fill_sel_r] <= 1'b1;
-						buf_y[fill_sel_r]  <= y_fill_r;
+						if (gentle_fill_r) begin
+							if (fill_odd_r) begin
+								po_ok[fill_pair_r] <= 1'b1;
+								po_y[fill_pair_r]  <= y_fill_r;
+							end else begin
+								pe_ok[fill_pair_r] <= 1'b1;
+								pe_y[fill_pair_r]  <= y_fill_r;
+							end
+						end else begin
+							buf_ok[fill_sel_r] <= 1'b1;
+							buf_y[fill_sel_r]  <= y_fill_r;
+						end
 						beats_got          <= 9'd0;
 						burst_got          <= 8'd0;
 						st                 <= ST_IDLE;
@@ -183,27 +268,75 @@ always @(posedge clk) begin
 			default: st <= ST_IDLE;
 		endcase
 	end
+
+	// Simple dual-port template: write and registered read in this block.
+	if (st == ST_WAIT && DDRAM_DOUT_READY) begin
+		if (gentle_fill_r) begin
+			if (fill_pair_r &&  fill_odd_r) po1[beats_got] <= DDRAM_DOUT;
+			if (fill_pair_r && !fill_odd_r) pe1[beats_got] <= DDRAM_DOUT;
+			if (!fill_pair_r &&  fill_odd_r) po0[beats_got] <= DDRAM_DOUT;
+			if (!fill_pair_r && !fill_odd_r) pe0[beats_got] <= DDRAM_DOUT;
+		end else begin
+			if (fill_sel_r) pe1[beats_got] <= DDRAM_DOUT;
+			else            pe0[beats_got] <= DDRAM_DOUT;
+		end
+	end
+	pe0_q <= pe0[rd_beat];
+	po0_q <= po0[rd_beat];
+	pe1_q <= pe1[rd_beat];
+	po1_q <= po1[rd_beat];
 end
 
-reg  [63:0] pair_d;
 reg         hc0_d;
 reg         pix_ok_d;
 reg         h_active_d;
+reg         gentle_d;
+reg         field_d;
+reg         disp_sel_d;
+reg         g_disp_pair_d;
 
-wire [8:0] rd_beat = (hc < H_ACTIVE) ? hc[9:1] : 9'd0;
+wire       disp_ok = gentle ? g_disp_ok : off_disp_ok;
 
 always @(posedge clk) begin
-	pair_d     <= disp_sel ? line1[rd_beat] : line0[rd_beat];
-	hc0_d      <= hc[0];
-	pix_ok_d   <= disp_ok;
-	h_active_d <= (hc < H_ACTIVE);
+	disp_sel_d    <= disp_sel;
+	g_disp_pair_d <= g_disp_pair;
+	hc0_d         <= hc[0];
+	pix_ok_d      <= disp_ok;
+	h_active_d    <= (hc < H_ACTIVE);
+	gentle_d      <= gentle;
+	field_d       <= field;
 end
 
+wire [63:0] pair_d   = disp_sel_d    ? pe1_q : pe0_q;
+wire [63:0] pair_e_d = g_disp_pair_d ? pe1_q : pe0_q;
+wire [63:0] pair_o_d = g_disp_pair_d ? po1_q : po0_q;
+
 wire [31:0] pix32 = hc0_d ? pair_d[63:32] : pair_d[31:0];
+wire [31:0] pix_e = hc0_d ? pair_e_d[63:32] : pair_e_d[31:0];
+wire [31:0] pix_o = hc0_d ? pair_o_d[63:32] : pair_o_d[31:0];
 wire        pix_en = pix_ok_d && h_active_d;
 
-assign pix_b = pix_en ? pix32[7:0]   : 8'd0;
-assign pix_g = pix_en ? pix32[15:8]  : 8'd0;
-assign pix_r = pix_en ? pix32[23:16] : 8'd0;
+wire [7:0] e_b = pix_e[7:0];
+wire [7:0] e_g = pix_e[15:8];
+wire [7:0] e_r = pix_e[23:16];
+wire [7:0] o_b = pix_o[7:0];
+wire [7:0] o_g = pix_o[15:8];
+wire [7:0] o_r = pix_o[23:16];
+
+// Gentle field 0: (3*E + O + 2) >> 2; field 1: (E + 3*O + 2) >> 2.
+wire [9:0] mix0_r = {1'b0, e_r, 1'b0} + {2'b0, e_r} + {2'b0, o_r} + 10'd2;
+wire [9:0] mix0_g = {1'b0, e_g, 1'b0} + {2'b0, e_g} + {2'b0, o_g} + 10'd2;
+wire [9:0] mix0_b = {1'b0, e_b, 1'b0} + {2'b0, e_b} + {2'b0, o_b} + 10'd2;
+wire [9:0] mix1_r = {1'b0, o_r, 1'b0} + {2'b0, o_r} + {2'b0, e_r} + 10'd2;
+wire [9:0] mix1_g = {1'b0, o_g, 1'b0} + {2'b0, o_g} + {2'b0, e_g} + 10'd2;
+wire [9:0] mix1_b = {1'b0, o_b, 1'b0} + {2'b0, o_b} + {2'b0, e_b} + 10'd2;
+
+wire [7:0] g_r = field_d ? mix1_r[9:2] : mix0_r[9:2];
+wire [7:0] g_g = field_d ? mix1_g[9:2] : mix0_g[9:2];
+wire [7:0] g_b = field_d ? mix1_b[9:2] : mix0_b[9:2];
+
+assign pix_b = pix_en ? (gentle_d ? g_b : pix32[7:0])   : 8'd0;
+assign pix_g = pix_en ? (gentle_d ? g_g : pix32[15:8])  : 8'd0;
+assign pix_r = pix_en ? (gentle_d ? g_r : pix32[23:16]) : 8'd0;
 
 endmodule
