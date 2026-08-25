@@ -18,6 +18,7 @@ module fb_line_reader
 	input         req_buf,
 	output reg    display_buf,
 	input         pal,
+	input         dup_even,
 
 	input         mb_idle,
 	output        vid_req,
@@ -54,11 +55,15 @@ reg  [63:0] line1 [0:359];
 reg         buf_ok [0:1];
 reg   [9:0] buf_y  [0:1];
 
-wire        next_field    = ~field;
-wire  [9:0] y_disp        = {vc[8:0], field};
-wire  [9:0] y_next_active = {vc[8:0] + 9'd1, field};
-wire  [9:0] y_nf0         = {9'd0, next_field};
-wire  [9:0] y_nf1         = {9'd1, next_field};
+// Normal: src_field follows the raster field (even/odd weave).
+// Duplicate Even: both output fields read even source lines only.
+// Raster timing / VGA_F1 / display_buf latch still use `field`.
+wire        src_field      = dup_even ? 1'b0 : field;
+wire        src_next_field = dup_even ? 1'b0 : ~field;
+wire  [9:0] y_disp         = {vc[8:0], src_field};
+wire  [9:0] y_next_active  = {vc[8:0] + 9'd1, src_field};
+wire  [9:0] y_nf0          = {9'd0, src_next_field};
+wire  [9:0] y_nf1          = {9'd1, src_next_field};
 
 wire        have0_disp = buf_ok[0] && buf_y[0] == y_disp;
 wire        have1_disp = buf_ok[1] && buf_y[1] == y_disp;
