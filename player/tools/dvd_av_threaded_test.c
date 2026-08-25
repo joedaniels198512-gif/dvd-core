@@ -127,9 +127,14 @@
 #define NAV_WAIT_FIFO_US    400000
 #define STILL_DRAIN_WAIT_US 750000
 #define VQ_MARK_STILL_BOUNDARY ((void *)(uintptr_t)0x53544c42u) /* STLB */
-#define ACK_TIMEOUT_US  200000
+#define ACK_TIMEOUT_US       200000   /* warning; keep waiting for ownership */
+#define ACK_HARD_TIMEOUT_US  2000000  /* stuck FPGA / forced Buffer B / etc */
+#define ACK_REISSUE_MIN_US   25000
+#define ACK_REISSUE_MAX_US   40000
 #define FB_W            720
-#define FB_H            576
+#define FB_H_PAL        576
+#define FB_H_NTSC       480
+#define FB_H            FB_H_PAL   /* DDR mmap / allocation height */
 #define FB_STRIDE       2880
 #define FB_SIZE         ((size_t)FB_STRIDE * FB_H)
 #define MB_MAP_SIZE     4096
@@ -788,11 +793,16 @@ static void unmap_double_fb(FBPair *fb)
         close(fb->fb_fd);
 }
 
-static int read_display_buf(const FBPair *fb, int *out)
+static uint64_t peek_mbox_status(const FBPair *fb)
 {
     volatile uint64_t *st =
         (volatile uint64_t *)((uint8_t *)fb->mbox + JOY_OFF);
-    uint64_t w = *st;
+    return *st;
+}
+
+static int read_display_buf(const FBPair *fb, int *out)
+{
+    uint64_t w = peek_mbox_status(fb);
     uint32_t magic = (uint32_t)(w >> 32);
     uint32_t joy = (uint32_t)w;
 
@@ -1382,7 +1392,7 @@ static int yuvring_init(YuvRing *r)
     }
     r->inited = 1;
     dbg("Decoded YUV ring: %d AVFrame refs  (no plane copies; "
-        "~%.1f MiB if 720x576 yuv420p)\n",
+        "~%.1f MiB if 720x576 yuv420p; NTSC uses 720x480 of the same slots)\n",
         r->cap,
         (r->cap * 720.0 * 576.0 * 1.5) / (1024.0 * 1024.0));
     return 0;
@@ -1876,11 +1886,19 @@ static void mraudio_close(MrAudio *a)
 /* Shared player                                                       */
 /* ------------------------------------------------------------------ */
 
+typedef enum {
+    DVD_VIDEO_UNKNOWN = 0,
+    DVD_VIDEO_PAL,
+    DVD_VIDEO_NTSC
+} DvdVideoStd;
+
 struct Player {
     FBPair *fb;
     PktQ aq, vq;
     AudioClock clock;
     AVRational atb, vtb, fps, avg_fr, r_fr;
+    DvdVideoStd dvd_std;
+    int video_w, video_h;
     int ai, vi;
     int fail;
     int audio_started, video_started;
@@ -1959,6 +1977,18 @@ struct Player {
     unsigned long ackw_n, ackw_instant;
     int64_t ackw_sum, ackw_min, ackw_max;
     unsigned long ackw_gt5, ackw_gt10, ackw_gt20, ackw_gt30, ackw_gt40;
+    unsigned long ackw_gt1t, ackw_gt2t, ackw_gt3t, ackw_gt200;
+    unsigned long ack_reissue_total;
+    unsigned long ack_wait_reissued;
+    unsigned long ack_late_n;
+    unsigned long ack_recovered_late_n;
+    int last_ack_want;
+    int last_ack_valid_buf;
+    int last_ack_valid_ok;
+    uint64_t last_ack_raw;
+    int last_ack_magic_ok;
+    unsigned last_ack_reissues;
+    int64_t last_ack_T_us;
 
     unsigned long sws_n;
     int64_t sws_sum, sws_min, sws_max;
@@ -4280,6 +4310,106 @@ static int64_t frame_duration_us(const Player *p)
     return 0;
 }
 
+static int player_active_h(const Player *p)
+{
+    if (p && p->video_h > 0)
+        return p->video_h;
+    return FB_H;
+}
+
+static size_t player_active_fb_bytes(const Player *p)
+{
+    return (size_t)FB_STRIDE * (size_t)player_active_h(p);
+}
+
+static const char *dvd_std_name(DvdVideoStd std)
+{
+    switch (std) {
+    case DVD_VIDEO_PAL:  return "PAL";
+    case DVD_VIDEO_NTSC: return "NTSC";
+    default:             return "unknown";
+    }
+}
+
+static int fps_is_pal(AVRational fps)
+{
+    double f;
+
+    if (fps.num <= 0 || fps.den <= 0)
+        return 1;
+    f = av_q2d(fps);
+    return f >= 24.5 && f <= 25.5;
+}
+
+static int fps_is_ntsc(AVRational fps)
+{
+    double f;
+
+    if (fps.num <= 0 || fps.den <= 0)
+        return 1;
+    f = av_q2d(fps);
+    return f >= 29.5 && f <= 30.5;
+}
+
+/* Explicit DVD-standard check. DDR stays 720x576-backed; NTSC uses 480 lines. */
+static int player_accept_video_frame(Player *p, const AVFrame *frame,
+                                     const AVCodecContext *vdec)
+{
+    AVRational fps;
+    DvdVideoStd std = DVD_VIDEO_UNKNOWN;
+    int h;
+
+    if (!p || !frame) {
+        fprintf(stderr, "FAIL: missing video frame\n");
+        if (p)
+            player_abort(p);
+        return -1;
+    }
+    fps = detect_fps(p, vdec);
+    if (fps.num > 0 && fps.den > 0)
+        p->fps = fps;
+
+    if (frame->width == FB_W && frame->height == FB_H_PAL && fps_is_pal(p->fps))
+        std = DVD_VIDEO_PAL;
+    else if (frame->width == FB_W && frame->height == FB_H_NTSC &&
+             fps_is_ntsc(p->fps))
+        std = DVD_VIDEO_NTSC;
+
+    if (std == DVD_VIDEO_UNKNOWN) {
+        fprintf(stderr,
+                "FAIL: unsupported DVD video %dx%d @ %.3f fps "
+                "(supported: 720x576 @ 25 PAL, 720x480 @ 29.97 NTSC)\n",
+                frame->width, frame->height,
+                (p->fps.num > 0 && p->fps.den > 0) ? av_q2d(p->fps) : 0.0);
+        player_abort(p);
+        return -1;
+    }
+
+    h = (std == DVD_VIDEO_NTSC) ? FB_H_NTSC : FB_H_PAL;
+    if (p->dvd_std == DVD_VIDEO_UNKNOWN) {
+        p->dvd_std = std;
+        p->video_w = FB_W;
+        p->video_h = h;
+        fprintf(stderr, "DVD video standard: %s %dx%d @ %.3f fps\n",
+                dvd_std_name(std), FB_W, h,
+                (p->fps.num > 0 && p->fps.den > 0) ? av_q2d(p->fps) : 0.0);
+        dbg("DVD video: active %dx%d  DDR backing %dx%d stride %d  "
+            "T=%.3f ms  fps %d/%d\n",
+            FB_W, h, FB_W, FB_H, FB_STRIDE,
+            frame_duration_us(p) / 1000.0, p->fps.num, p->fps.den);
+    } else if (p->dvd_std != std || frame->width != p->video_w ||
+               frame->height != p->video_h) {
+        fprintf(stderr,
+                "FAIL: DVD video geometry changed to %dx%d "
+                "(was %s %dx%d)\n",
+                frame->width, frame->height,
+                dvd_std_name(p->dvd_std), p->video_w, p->video_h);
+        player_abort(p);
+        return -1;
+    }
+    return 0;
+}
+
 /* Permanent content-phase: presentation_vpts = raw_vpts - N*T. Raw PTS is
  * never modified. N=0 → identity. */
 static int64_t presentation_phase_us(const Player *p)
@@ -4501,33 +4631,155 @@ static int wait_valid_display_buf(Player *p, int *out, int64_t timeout_us)
     }
 }
 
+static int64_t ack_reissue_interval_us(const Player *p)
+{
+    int64_t T = diag_native_period_us(p);
+
+    if (T <= 0)
+        T = ACK_REISSUE_MAX_US;
+    if (T < ACK_REISSUE_MIN_US)
+        T = ACK_REISSUE_MIN_US;
+    if (T > ACK_REISSUE_MAX_US)
+        T = ACK_REISSUE_MAX_US;
+    return T;
+}
+
+static void ack_snapshot(Player *p, int want, uint64_t raw, int magic_ok,
+                         int valid_ok, int valid_buf, unsigned reissues,
+                         int64_t T_us)
+{
+    p->last_ack_want = want;
+    p->last_ack_raw = raw;
+    p->last_ack_magic_ok = magic_ok;
+    p->last_ack_valid_ok = valid_ok;
+    p->last_ack_valid_buf = valid_buf;
+    p->last_ack_reissues = reissues;
+    p->last_ack_T_us = T_us;
+}
+
+static void log_display_ack_state(const char *title, int want, int64_t waited_us,
+                                  uint64_t raw, int valid_ok, int valid_buf,
+                                  unsigned reissues, int64_t T_us)
+{
+    fprintf(stderr,
+            "%s:\n"
+            "  want=%c\n"
+            "  waited_us=%" PRId64 "\n"
+            "  last raw mailbox status=0x%016" PRIx64 "\n"
+            "  last valid display_buf=%s\n"
+            "  request reissues=%u\n"
+            "  frame_T_us=%" PRId64 "\n",
+            title,
+            want ? 'B' : 'A',
+            waited_us,
+            raw,
+            valid_ok ? (valid_buf ? "B" : "A") : "(none)",
+            reissues,
+            T_us);
+}
+
+/*
+ * Buffer-ownership wait only. timeout_us is a warning threshold (200 ms),
+ * not a fatal abort. Reasserts the same mailbox request about once per
+ * native frame T. Hard abort at ACK_HARD_TIMEOUT_US.
+ */
 static int wait_display_buf(Player *p, int want, int64_t timeout_us,
                             int64_t *elapsed_us, int *instant)
 {
     int64_t t0 = av_gettime_relative();
+    int64_t last_reissue_us = t0;
+    int64_t native_T = diag_native_period_us(p);
+    int64_t reissue_us = ack_reissue_interval_us(p);
+    int64_t warn_us = timeout_us > 0 ? timeout_us : ACK_TIMEOUT_US;
     int first = 1;
+    int crossed_warn = 0;
+    unsigned reissues = 0;
+    int last_valid = 0;
+    int last_valid_ok = 0;
+    uint64_t last_raw = 0;
+    int last_magic_ok = 0;
 
     for (;;) {
-        int cur;
+        int cur = -1;
+        int64_t now = av_gettime_relative();
+        int64_t e = now - t0;
 
-        if (read_display_buf(p->fb, &cur) == 0 && cur == want) {
-            int64_t e = av_gettime_relative() - t0;
-            if (e < 0)
-                e = 0;
-            if (elapsed_us)
-                *elapsed_us = e;
-            if (instant)
-                *instant = first;
-            return 0;
+        if (e < 0)
+            e = 0;
+        last_raw = peek_mbox_status(p->fb);
+        last_magic_ok = ((uint32_t)(last_raw >> 32) == JOY_MAGIC);
+        if (read_display_buf(p->fb, &cur) == 0) {
+            last_valid = cur;
+            last_valid_ok = 1;
+            if (cur == want) {
+                if (elapsed_us)
+                    *elapsed_us = e;
+                if (instant)
+                    *instant = first;
+                p->ack_reissue_total += reissues;
+                if (reissues)
+                    p->ack_wait_reissued++;
+                if (native_T > 0) {
+                    if (e > native_T)
+                        p->ackw_gt1t++;
+                    if (e > 2 * native_T)
+                        p->ackw_gt2t++;
+                    if (e > 3 * native_T)
+                        p->ackw_gt3t++;
+                }
+                if (e >= ACK_TIMEOUT_US)
+                    p->ackw_gt200++;
+                if (e >= warn_us) {
+                    if (!crossed_warn)
+                        p->ack_late_n++;
+                    p->ack_recovered_late_n++;
+                    fprintf(stderr,
+                            "DISPLAY ACK recovered after %" PRId64
+                            "ms (%u reissues)\n",
+                            e / 1000, reissues);
+                }
+                ack_snapshot(p, want, last_raw, last_magic_ok,
+                             last_valid_ok, last_valid, reissues, native_T);
+                return 0;
+            }
         }
         first = 0;
         if (p->fail || g_interrupt)
             return -1;
-        if (av_gettime_relative() - t0 > timeout_us) {
+        if (!crossed_warn && e >= warn_us) {
+            crossed_warn = 1;
+            p->ack_late_n++;
+            ack_snapshot(p, want, last_raw, last_magic_ok,
+                         last_valid_ok, last_valid, reissues, native_T);
+            log_display_ack_state("DISPLAY ACK LATE", want, e, last_raw,
+                                  last_valid_ok, last_valid, reissues,
+                                  native_T);
+        }
+        if (e >= ACK_HARD_TIMEOUT_US) {
+            ack_snapshot(p, want, last_raw, last_magic_ok,
+                         last_valid_ok, last_valid, reissues, native_T);
             fprintf(stderr,
                     "FAIL: display_buf ack timeout (want %c)\n",
                     want ? 'B' : 'A');
+            log_display_ack_state("  hard timeout", want, e, last_raw,
+                                  last_valid_ok, last_valid, reissues,
+                                  native_T);
+            fprintf(stderr,
+                    "  magic=%s  mbox[0]=%" PRIu32 "\n",
+                    last_magic_ok ? "DVD1" : "invalid",
+                    (uint32_t)(p->fb->mbox[0] & 1u));
             return -1;
+        }
+        if (now - last_reissue_us >= reissue_us) {
+            /* Idempotent reassertion of the outstanding request. Not a flip. */
+            p->fb->mbox[0] = (uint32_t)want;
+            last_reissue_us = now;
+            reissues++;
+            dbg("ack reissue #%u want=%c waited=%.1fms raw=0x%016" PRIx64
+                " valid=%s magic=%s\n",
+                reissues, want ? 'B' : 'A', e / 1000.0, last_raw,
+                last_valid_ok ? (last_valid ? "B" : "A") : "(none)",
+                last_magic_ok ? "DVD1" : "invalid");
         }
         av_usleep(500);
     }
@@ -4658,12 +4910,8 @@ static int bench_convert_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
     int64_t now;
     int64_t cpu0, cpu1, c0, sws_wall, sws_cpu;
 
-    if (frame->width != FB_W || frame->height != FB_H) {
-        fprintf(stderr, "FAIL: %dx%d, expected %dx%d\n",
-                frame->width, frame->height, FB_W, FB_H);
-        player_abort(p);
+    if (player_accept_video_frame(p, frame, vdec) < 0)
         return -1;
-    }
 
     assign_video_pts(p, frame, vdec);
     {
@@ -4704,8 +4952,8 @@ static int bench_convert_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
             fps0.num, fps0.den,
             (fps0.num > 0 && fps0.den > 0) ? av_q2d(fps0) : 0.0,
             p->sws_cpu_ok ? "CLOCK_THREAD_CPUTIME_ID" : "unavailable");
-        *sws = sws_getContext(FB_W, FB_H, frame->format,
-                              FB_W, FB_H, AV_PIX_FMT_BGR0,
+        *sws = sws_getContext(FB_W, player_active_h(p), frame->format,
+                              FB_W, player_active_h(p), AV_PIX_FMT_BGR0,
                               SWS_FAST_BILINEAR, NULL, NULL, NULL);
         if (!*sws) {
             fprintf(stderr, "sws_getContext failed\n");
@@ -4719,7 +4967,7 @@ static int bench_convert_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
     cpu0 = p->sws_cpu_ok ? thread_cpu_us() : -1;
     c0 = av_gettime_relative();
     sws_scale(*sws, (const uint8_t * const *)frame->data, frame->linesize,
-              0, FB_H, dst_data, dst_linesize);
+              0, player_active_h(p), dst_data, dst_linesize);
     sws_wall = av_gettime_relative() - c0;
     cpu1 = (p->sws_cpu_ok && cpu0 >= 0) ? thread_cpu_us() : -1;
     __sync_synchronize();
@@ -4755,12 +5003,8 @@ static int present_video_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
     uint8_t *dst_data[4] = {0};
     int dst_linesize[4] = {0};
 
-    if (frame->width != FB_W || frame->height != FB_H) {
-        fprintf(stderr, "FAIL: %dx%d, expected %dx%d\n",
-                frame->width, frame->height, FB_W, FB_H);
-        player_abort(p);
+    if (player_accept_video_frame(p, frame, vdec) < 0)
         return -1;
-    }
 
     assign_video_pts(p, frame, vdec);
     int64_t vpts_us = (p->assigned_pts != AV_NOPTS_VALUE)
@@ -4814,8 +5058,8 @@ static int present_video_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
             p->initial_skip_req, p->initial_skip_req == 1 ? "" : "s",
             presentation_phase_us(p) / 1000.0,
             p->sws_cpu_ok ? "CLOCK_THREAD_CPUTIME_ID" : "unavailable");
-        *sws = sws_getContext(FB_W, FB_H, frame->format,
-                              FB_W, FB_H, AV_PIX_FMT_BGR0,
+        *sws = sws_getContext(FB_W, player_active_h(p), frame->format,
+                              FB_W, player_active_h(p), AV_PIX_FMT_BGR0,
                               SWS_FAST_BILINEAR, NULL, NULL, NULL);
         if (!*sws) {
             fprintf(stderr, "sws_getContext failed\n");
@@ -4865,7 +5109,7 @@ static int present_video_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
     int64_t cpu0 = p->sws_cpu_ok ? thread_cpu_us() : -1;
     int64_t c0 = av_gettime_relative();
     sws_scale(*sws, (const uint8_t * const *)frame->data, frame->linesize,
-              0, FB_H, dst_data, dst_linesize);
+              0, player_active_h(p), dst_data, dst_linesize);
     int64_t sws_wall = av_gettime_relative() - c0;
     int64_t cpu1 = (p->sws_cpu_ok && cpu0 >= 0) ? thread_cpu_us() : -1;
     p->convert_us += sws_wall;
@@ -5045,12 +5289,8 @@ static int producer_enqueue_frame(Player *p, AVFrame *frame, AVCodecContext *vde
     int idx;
     int64_t cpu0, cpu1, c0, sws_wall, sws_cpu;
 
-    if (frame->width != FB_W || frame->height != FB_H) {
-        fprintf(stderr, "FAIL: %dx%d, expected %dx%d\n",
-                frame->width, frame->height, FB_W, FB_H);
-        player_abort(p);
+    if (player_accept_video_frame(p, frame, vdec) < 0)
         return -1;
-    }
 
     assign_video_pts(p, frame, vdec);
     {
@@ -5087,8 +5327,8 @@ static int producer_enqueue_frame(Player *p, AVFrame *frame, AVCodecContext *vde
             (fps0.num > 0 && fps0.den > 0) ? av_q2d(fps0) : 0.0,
             VIDEO_BUFFER_FRAMES, VIDEO_PREFILL_FRAMES,
             p->sws_cpu_ok ? "CLOCK_THREAD_CPUTIME_ID" : "unavailable");
-        *sws = sws_getContext(FB_W, FB_H, frame->format,
-                              FB_W, FB_H, AV_PIX_FMT_BGR0,
+        *sws = sws_getContext(FB_W, player_active_h(p), frame->format,
+                              FB_W, player_active_h(p), AV_PIX_FMT_BGR0,
                               SWS_FAST_BILINEAR, NULL, NULL, NULL);
         if (!*sws) {
             fprintf(stderr, "sws_getContext failed\n");
@@ -5107,7 +5347,7 @@ static int producer_enqueue_frame(Player *p, AVFrame *frame, AVCodecContext *vde
     cpu0 = p->sws_cpu_ok ? thread_cpu_us() : -1;
     c0 = av_gettime_relative();
     sws_scale(*sws, (const uint8_t * const *)frame->data, frame->linesize,
-              0, FB_H, dst_data, dst_linesize);
+              0, player_active_h(p), dst_data, dst_linesize);
     sws_wall = av_gettime_relative() - c0;
     cpu1 = (p->sws_cpu_ok && cpu0 >= 0) ? thread_cpu_us() : -1;
 
@@ -5150,12 +5390,8 @@ static int producer_enqueue_yuv(Player *p, AVFrame *frame, AVCodecContext *vdec,
     int64_t now;
     unsigned epoch;
 
-    if (frame->width != FB_W || frame->height != FB_H) {
-        fprintf(stderr, "FAIL: %dx%d, expected %dx%d\n",
-                frame->width, frame->height, FB_W, FB_H);
-        player_abort(p);
+    if (player_accept_video_frame(p, frame, vdec) < 0)
         return -1;
-    }
 
     assign_video_pts(p, frame, vdec);
     {
@@ -5304,7 +5540,7 @@ static int present_cached_frame(Player *p, uint8_t *src, int64_t vpts_us)
     uint8_t *dst = next ? p->fb->fb_b : p->fb->fb_a;
     int64_t cpu0 = p->sws_cpu_ok ? thread_cpu_us() : -1;
     int64_t c0 = av_gettime_relative();
-    memcpy(dst, src, FB_SIZE);
+    memcpy(dst, src, player_active_fb_bytes(p));
     int64_t copy_wall = av_gettime_relative() - c0;
     int64_t cpu1 = (p->sws_cpu_ok && cpu0 >= 0) ? thread_cpu_us() : -1;
     p->convert_us += copy_wall;
@@ -5477,7 +5713,7 @@ static int present_cached_frame(Player *p, uint8_t *src, int64_t vpts_us)
 }
 
 static void draw_highlight_border(uint8_t *bgr0, int stride,
-                                  int sx, int sy, int ex, int ey)
+                                  int sx, int sy, int ex, int ey, int max_h)
 {
     int x, y, t;
     uint32_t pix = 0x00FFFF00u; /* BGR0 LE: B=0 G=255 R=255 */
@@ -5490,8 +5726,10 @@ static void draw_highlight_border(uint8_t *bgr0, int stride,
         sy = 0;
     if (ex >= FB_W)
         ex = FB_W - 1;
-    if (ey >= FB_H)
-        ey = FB_H - 1;
+    if (max_h < 1)
+        max_h = FB_H;
+    if (ey >= max_h)
+        ey = max_h - 1;
     if (ex <= sx || ey <= sy)
         return;
     for (t = 0; t < HL_BORDER_PX; t++) {
@@ -5528,7 +5766,7 @@ static void present_draw_highlight(Player *p, uint8_t *dst, int stride,
     ey = p->hl.ey;
     pthread_mutex_unlock(&p->hl.mu);
     if (vis && in_menu && frame_menu && gen == player_nav_gen(p))
-        draw_highlight_border(dst, stride, sx, sy, ex, ey);
+        draw_highlight_border(dst, stride, sx, sy, ex, ey, player_active_h(p));
 }
 
 static int present_menu_skip_clock(Player *p, int ui_redraw, int frame_menu)
@@ -5550,13 +5788,8 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
     int64_t stale_off = 0;
     int skip_clock = present_menu_skip_clock(p, ui_redraw, frame_menu);
 
-    if (!frame || frame->width != FB_W || frame->height != FB_H) {
-        fprintf(stderr, "FAIL: %dx%d, expected %dx%d\n",
-                frame ? frame->width : 0, frame ? frame->height : 0,
-                FB_W, FB_H);
-        player_abort(p);
+    if (player_accept_video_frame(p, frame, NULL) < 0)
         return -1;
-    }
 
     if (!skip_clock && frame_is_stale(p, pvpts_us, 1, &stale_off)) {
         record_stale_drop(p, stale_off);
@@ -5585,8 +5818,8 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
     }
 
     if (!*sws) {
-        *sws = sws_getContext(FB_W, FB_H, frame->format,
-                              FB_W, FB_H, AV_PIX_FMT_BGR0,
+        *sws = sws_getContext(FB_W, player_active_h(p), frame->format,
+                              FB_W, player_active_h(p), AV_PIX_FMT_BGR0,
                               SWS_FAST_BILINEAR, NULL, NULL, NULL);
         if (!*sws) {
             fprintf(stderr, "sws_getContext failed\n");
@@ -5634,7 +5867,7 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
     int64_t cpu0 = p->sws_cpu_ok ? thread_cpu_us() : -1;
     int64_t c0 = av_gettime_relative();
     sws_scale(*sws, (const uint8_t * const *)frame->data, frame->linesize,
-              0, FB_H, dst_data, dst_linesize);
+              0, player_active_h(p), dst_data, dst_linesize);
     int64_t sws_wall = av_gettime_relative() - c0;
     int64_t cpu1 = (p->sws_cpu_ok && cpu0 >= 0) ? thread_cpu_us() : -1;
     p->convert_us += sws_wall;
@@ -6904,21 +7137,30 @@ int main(int argc, char **argv)
     if (!p.uncapped_bench) {
         int buf_min = 0, buf_max = 0;
         double buf_avg = 0.0;
-        if (p.buffered_yuv && p.yuvring.depth_n) {
+        int buf_valid = 0;
+        if (p.rendered > 0 && p.buffered_yuv && p.yuvring.depth_n) {
             buf_min = p.yuvring.depth_min;
             buf_max = p.yuvring.depth_max;
             buf_avg = (double)p.yuvring.depth_sum / p.yuvring.depth_n;
-        } else if (p.buffered_video && p.vring.depth_n) {
+            buf_valid = 1;
+        } else if (p.rendered > 0 && p.buffered_video && p.vring.depth_n) {
             buf_min = p.vring.depth_min;
             buf_max = p.vring.depth_max;
             buf_avg = (double)p.vring.depth_sum / p.vring.depth_n;
-        } else if (p.vq.depth_n) {
-            buf_min = p.vq.depth_min;
-            buf_max = p.vq.depth_max;
-            buf_avg = vq_avg;
+            buf_valid = 1;
         }
         fprintf(stderr,
                 "\n=== DVD PLAYBACK SUMMARY ===\n"
+                "DVD video standard:         %s",
+                p.dvd_std != DVD_VIDEO_UNKNOWN
+                    ? dvd_std_name(p.dvd_std) : "n/a");
+        if (p.dvd_std != DVD_VIDEO_UNKNOWN)
+            fprintf(stderr, " %dx%d @ %.3f fps\n",
+                    p.video_w, p.video_h,
+                    (p.fps.num > 0 && p.fps.den > 0) ? av_q2d(p.fps) : 0.0);
+        else
+            fprintf(stderr, "\n");
+        fprintf(stderr,
                 "Duration:                   %.3f s\n"
                 "Audio consumed:             %.3f s\n"
                 "Video decoded:              %d\n"
@@ -6928,17 +7170,23 @@ int main(int argc, char **argv)
                 "A/V offset average:         %+.2f ms\n"
                 "A/V offset start/end:       %+.1f / %+.1f ms\n"
                 "Audio underruns:            %d\n"
-                "PTS breaks:                 %d / %d\n"
-                "Video buffer min/avg/max:   %d / %.1f / %d\n"
-                "Missed native boundaries:   %u\n"
-                "Stop reason:                %s\n",
+                "PTS breaks:                 %d / %d\n",
                 wall, hw_dur, p.video_decoded, p.rendered,
                 (hw_dur > 0.0) ? p.rendered / hw_dur : 0.0,
                 p.stale_dropped, off_avg / 1000.0,
                 (p.first_off_n ? p.first_offsets[0] : 0) / 1000.0,
                 p.last_offset / 1000.0,
-                mr->underruns, p.audio_disc, p.video_disc,
-                buf_min, buf_avg, buf_max,
+                mr->underruns, p.audio_disc, p.video_disc);
+        if (buf_valid)
+            fprintf(stderr,
+                    "Video buffer min/avg/max:   %d / %.1f / %d\n",
+                    buf_min, buf_avg, buf_max);
+        else
+            fprintf(stderr,
+                    "Video buffer min/avg/max:   n/a (playback did not start)\n");
+        fprintf(stderr,
+                "Missed native boundaries:   %u\n"
+                "Stop reason:                %s\n",
                 p.miss_total, stop_reason);
 
     if (g_debug_stats) {
@@ -6986,7 +7234,7 @@ int main(int argc, char **argv)
                 ? "BUFFERED YUV queue / direct-DDR sws consumer"
                 : p.buffered_video
                     ? "BUFFERED CACHED-RAM producer/consumer"
-                    : "direct-DDR decode+sws (known-good PAL path)",
+                    : "direct-DDR decode+sws",
             stop_reason,
             wall, hw_dur, p.out_samples,
             (double)p.out_samples / (double)OUT_RATE,
@@ -6999,7 +7247,7 @@ int main(int argc, char **argv)
             total_presentation_phase_us(&p) / 1000.0,
             p.stale_dropped,
             (hw_dur > 0.0) ? p.rendered / hw_dur : 0.0,
-            (p.fps.num > 0 && p.fps.den > 0) ? av_q2d(p.fps) : 25.0,
+            (p.fps.num > 0 && p.fps.den > 0) ? av_q2d(p.fps) : 0.0,
             (hw_dur > 0.0) ? accounted / hw_dur : 0.0,
             p.audio_packets, p.audio_frames,
             p.vq.pushed,
@@ -7122,6 +7370,14 @@ int main(int argc, char **argv)
                 "Inferred lost video time:   %.1f ms\n"
                 "Mailbox->ack min/avg/max:   %.2f / %.2f / %.2f ms\n"
                 "Mailbox->ack 0-1T / 1-2T / 2-3T / >3T: %lu / %lu / %lu / %lu\n"
+                "ACK wait >1T/>2T/>3T/>200ms: %lu / %lu / %lu / %lu\n"
+                "ACK wait max:               %.2f ms\n"
+                "Request reissues:           %lu total in %lu waits\n"
+                "ACK late warnings (>200ms): %lu\n"
+                "ACK recovered after >200ms: %lu\n"
+                "Last ACK wait:              want=%c  prev_display_buf=%s  "
+                "reissues=%u  magic=%s\n"
+                "Last ACK raw 0x30400008:    0x%016" PRIx64 "\n"
                 "Final presentation v-a:     %+.2f ms\n"
                 "Presentation v-a start->end:%+.1f -> %+.1f ms  (delta %+.1f ms)\n"
                 "Presentation mean start/end:%+.1f / %+.1f ms  (delta %+.1f ms)\n"
@@ -7144,6 +7400,17 @@ int main(int argc, char **argv)
                 p.mbox_to_ack_max / 1000.0,
                 p.mbox_to_ack_0_1t, p.mbox_to_ack_1_2t,
                 p.mbox_to_ack_2_3t, p.mbox_to_ack_gt3t,
+                p.ackw_gt1t, p.ackw_gt2t, p.ackw_gt3t, p.ackw_gt200,
+                p.ackw_max / 1000.0,
+                p.ack_reissue_total, p.ack_wait_reissued,
+                p.ack_late_n,
+                p.ack_recovered_late_n,
+                p.last_ack_want ? 'B' : 'A',
+                p.last_ack_valid_ok
+                    ? (p.last_ack_valid_buf ? "B" : "A") : "(none)",
+                p.last_ack_reissues,
+                p.last_ack_magic_ok ? "DVD1" : "invalid",
+                p.last_ack_raw,
                 end_off / 1000.0,
                 start_off / 1000.0, end_off / 1000.0, off_delta / 1000.0,
                 start_mean / 1000.0, end_mean / 1000.0,
@@ -7503,7 +7770,7 @@ int main(int argc, char **argv)
                 "Present cycle min/avg/max:  %.2f / %.2f / %.2f ms\n"
                 "Present cycle >30/>35/>40/>50/>80 ms: %lu / %lu / %lu / %lu / %lu\n"
                 "Mailbox cycle min/avg/max:  %.2f / %.2f / %.2f ms  n=%lu\n"
-                "%s:           %.2f ms  (PAL budget 40.000 ms)\n"
+                "%s:           %.2f ms  (%s budget %.3f ms)\n"
                 "Inferred missed native boundaries: %u\n",
                 p.a2m_min / 1000.0, a2m_avg / 1000.0, p.a2m_max / 1000.0,
                 p.a2m_gt20, p.a2m_gt30, p.a2m_gt35, p.a2m_gt40, p.a2m_gt50,
@@ -7516,6 +7783,8 @@ int main(int argc, char **argv)
                                : "Decode+cycle avg",
                 p.buffered_yuv ? cyc_avg / 1000.0
                                : (dec_avg + cyc_avg) / 1000.0,
+                dvd_std_name(p.dvd_std),
+                Tfr / 1000.0,
                 p.miss_total);
         if (p.miss_log_n) {
             unsigned i, n = p.miss_log_n;
