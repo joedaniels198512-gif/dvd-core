@@ -140,6 +140,8 @@ enum {
 #define JOY_BIT_MENU        7
 #define JOY_BIT_PREV        8
 #define JOY_BIT_NEXT        9
+/* Bits 0-9 are all assigned. No spare ARM-visible single button exists;
+ * AUDIO NEXT is PREV+NEXT chord until a later FPGA mapping. */
 #define CTRL_POLL_US        8000
 #define CTRL_REPEAT_DELAY_US  400000
 #define CTRL_REPEAT_RATE_US   120000
@@ -299,7 +301,8 @@ typedef enum {
     NAVCMD_ACTIVATE,
     NAVCMD_PREVIOUS_CHAPTER,
     NAVCMD_NEXT_CHAPTER,
-    NAVCMD_PLAY_PAUSE
+    NAVCMD_PLAY_PAUSE,
+    NAVCMD_AUDIO_NEXT
 } NavCmd;
 
 /* ------------------------------------------------------------------ */
@@ -326,6 +329,7 @@ typedef struct {
     int32_t title, part;
     int32_t last_title, last_part;
     int cellN, pgN, pgcn, pgn;
+    int vtsN;
     int activate_trace;
     DVDDomain_t act_domain;
     int32_t act_title;
@@ -1074,11 +1078,21 @@ static void controller_poll(ControllerPad *pad, uint32_t bits, int64_t now_us,
         controller_emit("MENU", &pad->events, p, NAVCMD_MENU);
     if (now.play_pause && !prev.play_pause)
         controller_emit("PLAY_PAUSE", &pad->events, p, NAVCMD_PLAY_PAUSE);
-    if (now.next && !prev.next)
-        controller_emit("NEXT", &pad->events, p, NAVCMD_NEXT_CHAPTER);
-    if (now.previous && !prev.previous)
-        controller_emit("PREVIOUS", &pad->events, p,
-                        NAVCMD_PREVIOUS_CHAPTER);
+    /*
+     * AUDIO NEXT chord before individual PREV/NEXT: one rising
+     * PREV+NEXT = one cycle. Holding both does not repeat. While the
+     * chord is held, chapter PREV/NEXT are suppressed.
+     */
+    if (now.previous && now.next) {
+        if (!(prev.previous && prev.next))
+            controller_emit("AUDIO NEXT", &pad->events, p, NAVCMD_AUDIO_NEXT);
+    } else {
+        if (now.next && !prev.next)
+            controller_emit("NEXT", &pad->events, p, NAVCMD_NEXT_CHAPTER);
+        if (now.previous && !prev.previous)
+            controller_emit("PREVIOUS", &pad->events, p,
+                            NAVCMD_PREVIOUS_CHAPTER);
+    }
 
     dirs[0] = now.up;
     dirs[1] = now.down;
@@ -2368,6 +2382,13 @@ struct Player {
     int menu_still_drop;
     int video_reset_req;
     int audio_reset_req;
+    int audio_switch_req;
+    int current_audio_logical;
+    int audio_pending_logical;
+    int audio_follow_logical;
+    int audio_follow_physical;
+    int audio_follow_fmt;
+    AVFormatContext *avf;
     int demux_reopen_req;
     int soft_nav_log;
     unsigned soft_nav_gen;
@@ -4374,6 +4395,295 @@ static void dvdio_chapter_step(DVDIO *d, int dir)
     d->pci_valid = 0;
 }
 
+static const char *dvd_audio_fmt_name(uint16_t fmt)
+{
+    switch (fmt) {
+    case DVD_AUDIO_FORMAT_AC3:
+        return "AC3";
+    case DVD_AUDIO_FORMAT_MPEG:
+        return "MPEG";
+    case DVD_AUDIO_FORMAT_MPEG2_EXT:
+        return "MPEG";
+    case DVD_AUDIO_FORMAT_LPCM:
+        return "LPCM";
+    case DVD_AUDIO_FORMAT_DTS:
+        return "DTS";
+    case DVD_AUDIO_FORMAT_SDDS:
+        return "SDDS";
+    default:
+        return "unk";
+    }
+}
+
+/* Formats enabled in the SS1 FFmpeg DVD prefix (ac3/eac3/mp1/mp2/mp3/dca/pcm_dvd). */
+static int dvd_audio_fmt_supported(uint16_t fmt)
+{
+    switch (fmt) {
+    case DVD_AUDIO_FORMAT_AC3:
+    case DVD_AUDIO_FORMAT_MPEG:
+    case DVD_AUDIO_FORMAT_MPEG2_EXT:
+    case DVD_AUDIO_FORMAT_LPCM:
+    case DVD_AUDIO_FORMAT_DTS:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static void dvd_audio_lang_code(dvdnav_t *nav, int logical, char *out, size_t n)
+{
+    uint16_t lang;
+
+    if (!out || n < 4)
+        return;
+    memcpy(out, "und", 4);
+    if (!nav || logical < 0 || logical > 7)
+        return;
+    lang = dvdnav_audio_stream_to_lang(nav, (uint8_t)logical);
+    if (lang == 0xffff)
+        return;
+    out[0] = (char)((lang >> 8) & 0xff);
+    out[1] = (char)(lang & 0xff);
+    out[2] = 0;
+    if (out[0] < 32 || out[0] > 126)
+        out[0] = '?';
+    if (out[1] < 32 || out[1] > 126)
+        out[1] = '?';
+}
+
+static int dvd_audio_pes_id(uint16_t fmt, int nav_phys)
+{
+    if (nav_phys < 0)
+        return -1;
+    if (nav_phys >= 0x80)
+        return nav_phys & 0xff;
+    if (nav_phys > 7)
+        return nav_phys;
+    switch (fmt) {
+    case DVD_AUDIO_FORMAT_AC3:
+        return 0x80 + nav_phys;
+    case DVD_AUDIO_FORMAT_DTS:
+        return 0x88 + nav_phys;
+    case DVD_AUDIO_FORMAT_LPCM:
+        return 0xa0 + nav_phys;
+    case DVD_AUDIO_FORMAT_MPEG:
+    case DVD_AUDIO_FORMAT_MPEG2_EXT:
+        return 0xc0 + nav_phys;
+    default:
+        return nav_phys;
+    }
+}
+
+static int dvd_audio_enum_valid(dvdnav_t *nav, int *out, int cap)
+{
+    int i, n = 0;
+
+    if (!nav || !out || cap < 1)
+        return 0;
+    for (i = 0; i < 8 && n < cap; i++) {
+        int8_t phys;
+        uint16_t fmt;
+
+        /* Header says physical→logical; 6.1.0 impl is logical→physical. */
+        phys = dvdnav_get_audio_logical_stream(nav, (uint8_t)i);
+        if (phys < 0)
+            continue;
+        fmt = dvdnav_audio_stream_format(nav, (uint8_t)i);
+        if (fmt == 0xffff || !dvd_audio_fmt_supported(fmt))
+            continue;
+        out[n++] = i;
+    }
+    return n;
+}
+
+static int dvd_audio_logical_from_physical(dvdnav_t *nav, int physical)
+{
+    int i;
+
+    if (!nav || physical < 0)
+        return -1;
+    for (i = 0; i < 8; i++) {
+        int8_t phys = dvdnav_get_audio_logical_stream(nav, (uint8_t)i);
+
+        if (phys >= 0 && (int)phys == physical)
+            return i;
+    }
+    return -1;
+}
+
+static int dvdio_audio_in_list(const int *valid, int n, int logical)
+{
+    int i;
+
+    if (logical < 0)
+        return 0;
+    for (i = 0; i < n; i++) {
+        if (valid[i] == logical)
+            return 1;
+    }
+    return 0;
+}
+
+static int dvdio_audio_resolve_logical(DVDIO *d, const int *valid, int n)
+{
+    Player *p;
+    int phys, mapped;
+
+    p = d->player;
+    if (p && dvdio_audio_in_list(valid, n, p->current_audio_logical))
+        return p->current_audio_logical;
+    if (p && dvdio_audio_in_list(valid, n, p->audio_pending_logical))
+        return p->audio_pending_logical;
+    /* 6.1.0: dvdnav_get_active_audio_stream() is PHYSICAL, not ASTN. */
+    phys = dvdnav_get_active_audio_stream(d->nav);
+    mapped = dvd_audio_logical_from_physical(d->nav, phys);
+    if (dvdio_audio_in_list(valid, n, mapped))
+        return mapped;
+    return -1;
+}
+
+static void dvdio_audio_log_context(const DVDIO *d)
+{
+    fprintf(stderr, "  domain=%s title=%d part=%d pgcn=%d pgn=%d vts=%d\n",
+            dvd_domain_name(d->domain),
+            (int)d->title, (int)d->part, d->pgcn, d->pgn, d->vtsN);
+}
+
+static void dvdio_audio_log_map(DVDIO *d)
+{
+    int i;
+    int8_t active_phys;
+
+    dvdio_refresh_program(d);
+    fprintf(stderr, "AUDIO MAP:\n");
+    dvdio_audio_log_context(d);
+    active_phys = dvdnav_get_active_audio_stream(d->nav);
+    for (i = 0; i < 8; i++) {
+        int8_t phys;
+        uint16_t fmt, ch;
+        char langc[4];
+        int pes;
+        const char *skip = "";
+
+        phys = dvdnav_get_audio_logical_stream(d->nav, (uint8_t)i);
+        if (phys < 0)
+            continue;
+        fmt = dvdnav_audio_stream_format(d->nav, (uint8_t)i);
+        ch = dvdnav_audio_stream_channels(d->nav, (uint8_t)i);
+        dvd_audio_lang_code(d->nav, i, langc, sizeof(langc));
+        pes = dvd_audio_pes_id(fmt, phys);
+        if (fmt == 0xffff || !dvd_audio_fmt_supported(fmt))
+            skip = " [skipped]";
+        fprintf(stderr,
+                "  logical %d -> physical 0x%02x (nav=%d) lang=%s %s %uch%s\n",
+                i, pes < 0 ? 0 : pes, (int)phys, langc,
+                dvd_audio_fmt_name(fmt),
+                (ch == 0xffff) ? 0 : (unsigned)ch, skip);
+    }
+    fprintf(stderr,
+            "  current_logical=%d pending_logical=%d active_physical=%d\n",
+            d->player ? d->player->current_audio_logical : -1,
+            d->player ? d->player->audio_pending_logical : -1,
+            (int)active_phys);
+}
+
+static void dvdio_audio_reset_logical(DVDIO *d, const char *why)
+{
+    Player *p = d->player;
+
+    if (!p)
+        return;
+    if (p->current_audio_logical < 0 && p->audio_pending_logical < 0)
+        return;
+    fprintf(stderr, "AUDIO MAP RESET: %s\n", why ? why : "nav change");
+    dvdio_audio_log_context(d);
+    p->current_audio_logical = -1;
+    p->audio_pending_logical = -1;
+}
+
+/*
+ * libdvdnav 6.1.0 has no dvdnav_audio_change(). Authored menus change
+ * ASTN via SetSTN; execute the same VM command without a Link so there
+ * is no hop. Encoding: system-set immediate subtype 1, audio specified.
+ */
+static void dvd_vm_setstn_audio(vm_cmd_t *cmd, int logical)
+{
+    memset(cmd, 0, sizeof(*cmd));
+    cmd->bytes[0] = 0x51;
+    cmd->bytes[3] = (uint8_t)(0x80 | (logical & 0x07));
+}
+
+static void dvdio_audio_next(DVDIO *d)
+{
+    int cur, next, i, n, idx, valid[8];
+    char lang_from[4], lang_to[4];
+    vm_cmd_t cmd;
+    user_ops_t uops;
+
+    if (!d || !d->nav) {
+        fprintf(stderr, "AUDIO NEXT: ignored (no navigation)\n");
+        return;
+    }
+    if (dvdio_detect_menu(d) || (d->player && d->player->in_menu)) {
+        fprintf(stderr, "AUDIO NEXT: ignored (menu domain)\n");
+        return;
+    }
+    if (!dvdnav_is_domain_vts(d->nav)) {
+        fprintf(stderr, "AUDIO NEXT: ignored (not in title domain)\n");
+        return;
+    }
+    uops = dvdnav_get_restrictions(d->nav);
+    if (uops.audio_stream_change) {
+        fprintf(stderr, "AUDIO NEXT: prohibited by disc\n");
+        return;
+    }
+
+    n = dvd_audio_enum_valid(d->nav, valid, 8);
+    dvdio_audio_log_map(d);
+    if (n <= 0) {
+        fprintf(stderr, "AUDIO NEXT: no valid audio streams\n");
+        return;
+    }
+    if (n == 1) {
+        fprintf(stderr, "AUDIO NEXT: only one audio stream\n");
+        return;
+    }
+
+    cur = dvdio_audio_resolve_logical(d, valid, n);
+    idx = -1;
+    if (cur >= 0) {
+        for (i = 0; i < n; i++) {
+            if (valid[i] == cur) {
+                idx = i;
+                break;
+            }
+        }
+    }
+    next = (idx < 0) ? valid[0] : valid[(idx + 1) % n];
+    if (next == cur) {
+        fprintf(stderr, "AUDIO NEXT: only one audio stream\n");
+        return;
+    }
+
+    dvd_audio_lang_code(d->nav, cur, lang_from, sizeof(lang_from));
+    dvd_audio_lang_code(d->nav, next, lang_to, sizeof(lang_to));
+    if (cur < 0)
+        fprintf(stderr, "AUDIO NEXT REQUEST: logical ? unknown -> logical %d %s\n",
+                next, lang_to);
+    else
+        fprintf(stderr, "AUDIO NEXT REQUEST: logical %d %s -> logical %d %s\n",
+                cur, lang_from, next, lang_to);
+
+    dvd_vm_setstn_audio(&cmd, next);
+    if (dvdnav_button_activate_cmd(d->nav, 1, &cmd) != DVDNAV_STATUS_OK) {
+        fprintf(stderr, "AUDIO NEXT: VM SetSTN failed (%s)\n",
+                dvdnav_err_to_string(d->nav));
+        return;
+    }
+    if (d->player)
+        d->player->audio_pending_logical = next;
+}
+
 static void dvdio_exec_nav_cmd(DVDIO *d, NavCmd cmd)
 {
     int in_menu;
@@ -4473,6 +4783,9 @@ static void dvdio_exec_nav_cmd(DVDIO *d, NavCmd cmd)
         break;
     case NAVCMD_NEXT_CHAPTER:
         dvdio_chapter_step(d, 1);
+        break;
+    case NAVCMD_AUDIO_NEXT:
+        dvdio_audio_next(d);
         break;
     default:
         break;
@@ -4783,6 +5096,10 @@ static int dvdio_pump(DVDIO *d, int32_t event, int32_t len)
                 ev ? ev->new_vtsN : -1,
                 (int)d->title, (int)d->part, in_menu);
         }
+        if (ev)
+            d->vtsN = ev->new_vtsN;
+        dvdio_refresh_program(d);
+        dvdio_audio_reset_logical(d, "VTS_CHANGE");
         if (d->player && !d->hop_pending)
             player_nav_discontinuity(d->player, "VTS_CHANGE (stream/VTS)");
         d->hop_pending = 1;
@@ -4871,8 +5188,10 @@ static int dvdio_pump(DVDIO *d, int32_t event, int32_t len)
         dvdnav_cell_change_event_t *ev = (dvdnav_cell_change_event_t *)d->sector;
         int32_t prev_title = d->title;
         int32_t prev_part = d->part;
+        int old_pgcn = d->pgcn;
         int now = dvdio_detect_menu(d);
 
+        dvdio_refresh_program(d);
         if (d->player && d->player->in_menu && !now)
             dvdio_menu_to_title(d, "DVDNAV_CELL_CHANGE", 1);
         if (d->player)
@@ -4887,6 +5206,8 @@ static int dvdio_pump(DVDIO *d, int32_t event, int32_t len)
         }
         d->last_title = d->title;
         d->last_part = d->part;
+        if (old_pgcn != d->pgcn)
+            dvdio_audio_reset_logical(d, "PGC_CHANGE");
         dbg("DVD MENU: CELL_CHANGE  cell=%d pg=%d  title=%d part=%d  "
             "domain=%s  in_menu=%d  still=%d\n",
             ev ? ev->cellN : -1, ev ? ev->pgN : -1,
@@ -4930,8 +5251,32 @@ static int dvdio_pump(DVDIO *d, int32_t event, int32_t len)
     case DVDNAV_AUDIO_STREAM_CHANGE: {
         dvdnav_audio_stream_change_event_t *ev =
             (dvdnav_audio_stream_change_event_t *)d->sector;
+        uint16_t fmt = 0xffff;
+        int pes = -1;
+        int logical = ev ? ev->logical : -1;
+        int physical = ev ? ev->physical : -1;
+
         dbg("DVD MENU: AUDIO_STREAM_CHANGE  physical=%d logical=%d\n",
-            ev ? ev->physical : -1, ev ? ev->logical : -1);
+            physical, logical);
+        dvdio_refresh_program(d);
+        if (logical >= 0 && logical <= 7)
+            fmt = dvdnav_audio_stream_format(d->nav, (uint8_t)logical);
+        pes = dvd_audio_pes_id(fmt, physical);
+        fprintf(stderr,
+                "AUDIO CHANGE EVENT: logical=%d physical=%d (PES 0x%02x)\n",
+                logical, physical, pes < 0 ? 0 : pes);
+        dvdio_audio_log_context(d);
+        if (d->player && ev) {
+            if (logical >= 0 && logical <= 7)
+                d->player->current_audio_logical = logical;
+            else
+                d->player->current_audio_logical = -1;
+            d->player->audio_pending_logical = -1;
+            d->player->audio_follow_logical = logical;
+            d->player->audio_follow_physical = physical;
+            d->player->audio_follow_fmt =
+                (fmt == 0xffff) ? -1 : (int)fmt;
+        }
         return 0;
     }
     case DVDNAV_STOP:
@@ -5096,6 +5441,102 @@ static int copy_codecpar(AVCodecParameters **dst, const AVCodecParameters *src)
         return -1;
     }
     return 0;
+}
+
+static int replace_codecpar(AVCodecParameters **dst, const AVCodecParameters *src)
+{
+    avcodec_parameters_free(dst);
+    return copy_codecpar(dst, src);
+}
+
+static int dvd_audio_ffmpeg_matches(const AVStream *st, int physical, int dvd_fmt)
+{
+    int sid, base = -1;
+
+    if (!st || !st->codecpar ||
+        st->codecpar->codec_type != AVMEDIA_TYPE_AUDIO)
+        return 0;
+    if (physical < 0)
+        return 0;
+    sid = st->id & 0xff;
+    if (sid == physical || (st->id & 0xffff) == physical)
+        return 1;
+    if (physical > 7)
+        return 0;
+    switch (dvd_fmt) {
+    case DVD_AUDIO_FORMAT_AC3:
+        base = 0x80;
+        break;
+    case DVD_AUDIO_FORMAT_DTS:
+        base = 0x88;
+        break;
+    case DVD_AUDIO_FORMAT_LPCM:
+        base = 0xa0;
+        break;
+    case DVD_AUDIO_FORMAT_MPEG:
+    case DVD_AUDIO_FORMAT_MPEG2_EXT:
+        base = 0xc0;
+        break;
+    default:
+        break;
+    }
+    if (base >= 0 && sid == base + physical)
+        return 1;
+    if (dvd_fmt == DVD_AUDIO_FORMAT_AC3 && sid == 0xc0 + physical)
+        return 1;
+    if (dvd_fmt == DVD_AUDIO_FORMAT_DTS && sid == 0x98 + physical)
+        return 1;
+    if (dvd_fmt < 0 && sid >= 0x80 && sid <= 0xcf && (sid & 7) == physical)
+        return 1;
+    return 0;
+}
+
+/*
+ * After DVDNAV_AUDIO_STREAM_CHANGE, bind FFmpeg to the VM's physical
+ * stream. Flush audio packets only; do not touch video, nav_gen, or the
+ * MrAudio clock origin.
+ */
+static void player_apply_audio_follow(Player *p)
+{
+    AVFormatContext *fmt;
+    int i, found = -1, physical, dvd_fmt, flushed, logical;
+
+    if (!p || p->audio_follow_physical < 0 || !p->avf)
+        return;
+    fmt = p->avf;
+    physical = p->audio_follow_physical;
+    dvd_fmt = p->audio_follow_fmt;
+    logical = p->audio_follow_logical;
+    for (i = 0; i < (int)fmt->nb_streams; i++) {
+        if (dvd_audio_ffmpeg_matches(fmt->streams[i], physical, dvd_fmt)) {
+            found = i;
+            break;
+        }
+    }
+    if (found < 0)
+        return;
+    fprintf(stderr, "AUDIO FOLLOW: logical=%d physical=%d ffmpeg_stream=#%d "
+            "id=0x%x%s\n",
+            logical, physical, found,
+            fmt->streams[found]->id & 0xffff,
+            found == p->ai ? " (already bound)" : "");
+    p->audio_follow_physical = -1;
+    p->audio_follow_logical = -1;
+    p->audio_follow_fmt = -1;
+    if (found == p->ai)
+        return;
+    if (replace_codecpar(&p->acp, fmt->streams[found]->codecpar) < 0) {
+        fprintf(stderr, "AUDIO: follow failed (codecpar)\n");
+        return;
+    }
+    p->ai = found;
+    p->atb = fmt->streams[found]->time_base;
+    flushed = pktq_flush(&p->aq);
+    if (p->audio_started)
+        p->audio_switch_req = 1;
+    dbg("AUDIO: follow FFmpeg #%d id=0x%x %s  flushed=%d\n",
+        found, fmt->streams[found]->id & 0xffff,
+        avcodec_get_name(p->acp->codec_id), flushed);
 }
 
 static AVCodecContext *open_decoder(const AVCodecParameters *cp, AVRational tb,
@@ -5334,6 +5775,10 @@ static int pktq_pop_or_prefill_gate(PktQ *q, AVPacket *dst, Player *p)
             pthread_mutex_unlock(&q->mu);
             return 3;
         }
+        if (p->audio_switch_req) {
+            pthread_mutex_unlock(&q->mu);
+            return 5;
+        }
         pthread_mutex_unlock(&q->mu);
         if (player_buffered(p) && !p->buf_mraudio_started &&
             prefill_is_released(p) && !p->in_menu)
@@ -5345,6 +5790,10 @@ static int pktq_pop_or_prefill_gate(PktQ *q, AVPacket *dst, Player *p)
         if (p->audio_reset_req) {
             pthread_mutex_unlock(&q->mu);
             return 3;
+        }
+        if (p->audio_switch_req) {
+            pthread_mutex_unlock(&q->mu);
+            return 5;
         }
     }
     if (g_interrupt)
@@ -5474,6 +5923,26 @@ static void *audio_thread(void *opaque)
                 player_nav_gen(p), mr.bytes_origin);
         }
 
+        if (p->audio_switch_req) {
+            AVCodecContext *nctx;
+
+            p->audio_switch_req = 0;
+            p->pcm_hold_len = 0;
+            if (adec)
+                avcodec_free_context(&adec);
+            if (swr)
+                swr_free(&swr);
+            nctx = p->acp ? open_decoder(p->acp, p->atb, AVMEDIA_TYPE_AUDIO)
+                          : NULL;
+            if (!nctx) {
+                fprintf(stderr, "AUDIO: decoder reopen failed\n");
+                player_abort(p);
+                goto done;
+            }
+            adec = nctx;
+            dbg("AUDIO: decoder reopened for stream change (clock kept)\n");
+        }
+
         if (pause_should_hold_audio(p)) {
             pause_service_audio(p, &mr, first_pts_us, clock_epoch);
             if (p->fail || g_interrupt)
@@ -5502,7 +5971,7 @@ static void *audio_thread(void *opaque)
                 continue;
             }
             got_pkt = pktq_pop_or_prefill_gate(&p->aq, pkt, p);
-            if (got_pkt == 2 || got_pkt == 3)
+            if (got_pkt == 2 || got_pkt == 3 || got_pkt == 5)
                 continue;
             if (got_pkt == 4) {
                 pause_service_audio(p, &mr, first_pts_us, clock_epoch);
@@ -5514,7 +5983,7 @@ static void *audio_thread(void *opaque)
                 break;
         } else {
             got_pkt = pktq_pop_or_prefill_gate(&p->aq, pkt, p);
-            if (got_pkt == 2 || got_pkt == 3)
+            if (got_pkt == 2 || got_pkt == 3 || got_pkt == 5)
                 continue;
             if (got_pkt == 4) {
                 pause_service_audio(p, &mr, first_pts_us, clock_epoch);
@@ -8145,6 +8614,7 @@ int main(int argc, char **argv)
     memset(&d, 0, sizeof(d));
     d.last_title = -1;
     d.last_part = -1;
+    d.vtsN = -1;
     if (posix_memalign((void **)&d.sector, DVD_SECTOR, DVD_SECTOR) != 0)
         return 1;
 
@@ -8155,6 +8625,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "dvdnav_open failed\n");
         return 1;
     }
+    fprintf(stderr, "libdvdnav %s\n", dvdnav_version());
     dvdnav_set_readahead_flag(d.nav, 1);
     dvdnav_menu_language_select(d.nav, "en");
     dvdnav_audio_language_select(d.nav, "en");
@@ -8204,6 +8675,12 @@ int main(int argc, char **argv)
     memset(&p, 0, sizeof(p));
     p.fb = &fb;
     p.ai = p.vi = -1;
+    p.current_audio_logical = -1;
+    p.audio_pending_logical = -1;
+    p.audio_follow_logical = -1;
+    p.audio_follow_physical = -1;
+    p.audio_follow_fmt = -1;
+    p.avf = fmt;
     p.last_audio_pts_us = AV_NOPTS_VALUE;
     p.uncapped_bench = cli.uncapped_video_benchmark;
     p.buffered_video = cli.buffered_video;
@@ -8364,6 +8841,7 @@ int main(int argc, char **argv)
                 }
             }
         }
+        player_apply_audio_follow(&p);
 
         if (p.in_menu)
             menu_spu_log_streams(&p, fmt);

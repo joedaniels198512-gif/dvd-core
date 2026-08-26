@@ -248,7 +248,7 @@ claim_singleton
 trap on_exit EXIT
 trap on_signal TERM INT
 
-log "daemon started"
+log "daemon started (MiSTer DVD Player 0.1.0-private-beta)"
 
 while true; do
     now=$(date +%s 2>/dev/null || echo 0)

@@ -262,7 +262,7 @@ static void dvdread_quiet(void *p, dvd_logger_level_t level, const char *fmt,
     (void)ap;
 }
 
-static int probe_dvd_video(const char *path, char *name, size_t name_cap)
+int dvd_library_validate_iso(const char *path, char *name, size_t name_cap)
 {
     static const dvd_logger_cb quiet = { .pf_log = dvdread_quiet };
     dvd_reader_t *dvd;
@@ -494,7 +494,7 @@ int dvd_library_refresh(DvdLibItem *out, int cap, DvdLibStats *stats)
             st.cache_hits++;
         } else {
             st.probes++;
-            valid = probe_dvd_video(cand[i].path, display, sizeof(display));
+            valid = dvd_library_validate_iso(cand[i].path, display, sizeof(display));
             if (!valid) {
                 display[0] = 0;
                 if (g_debug)
@@ -551,6 +551,11 @@ int dvd_library_refresh(DvdLibItem *out, int cap, DvdLibStats *stats)
     if (stats)
         *stats = st;
     return n_out;
+}
+
+void dvd_library_invalidate_cache(void)
+{
+    unlink(cache_path());
 }
 
 #ifdef DVD_LIBRARY_STANDALONE
