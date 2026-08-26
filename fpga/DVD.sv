@@ -172,10 +172,14 @@ pll pll
 // 0x30400008       = FPGA→ARM {JOY_MAGIC, display_buf, joystick_0[30:0]}.
 // 0x30400010       = FPGA→ARM settings/capability (DVD2). Never written by ARM.
 // 0x30400018       = ARM→FPGA source-standard control (DVD3). FPGA reads only.
-// One mailbox-read opportunity is latched every poll tick (poll_due) and
-// always taken from idle before any controller write.
-// Video line-fill has priority on DDRAM; mailbox runs when the reader is idle.
-// Extra settings/control beats return to idle between ops so video can preempt.
+// One mailbox-read opportunity is latched every poll tick (poll_due).
+// Video has exclusive use of DDRAM only while a burst is in flight
+// (vid_active). fill_need must not starve mailbox/status: otherwise
+// back-to-back line fills (or a stuck ST_WAIT) freeze DVD2 set_seq and
+// never resample ARM's A/B request. Follow-up ctl/set/joy beats also
+// block new video starts so a poll can finish publishing DVD1/DVD2.
+// Extra settings/control beats return to idle between ops so video can
+// preempt after the poll completes.
 localparam [28:0] MB_ADDR    = 29'h0608_0000; // 0x30400000
 localparam [28:0] JOY_ADDR   = 29'h0608_0001; // 0x30400008
 localparam [28:0] SET_ADDR   = 29'h0608_0002; // 0x30400010
@@ -220,6 +224,11 @@ wire  [7:0] vid_burstcnt;
 wire  [7:0] pix_r, pix_g, pix_b;
 wire        display_buf;
 
+// New video bursts wait while mailbox is busy or a poll/follow-up is due.
+// In-flight video (vid_active) still owns DDRAM until the burst completes.
+wire        mb_allow_vid = (mb_st == ST_IDLE) && !poll_due && !ctl_due &&
+                           !set_due && !joy_pending;
+
 // OSD TV Mode status[2:1]: 0 Auto, 1 NTSC, 2 PAL.
 // CRT: CONF_STR On,Off so status[9]==0 is On; invert for existing dup_even.
 // Auto + UNKNOWN/NTSC → NTSC (launcher-safe). Auto + PAL → PAL.
@@ -256,8 +265,8 @@ always @(posedge clk_sys) begin
 		poll_due <= 1'b1;
 
 	case (mb_st)
-		ST_IDLE: if (vid_req) begin
-				// Video owns or wants DDRAM; wait.
+		ST_IDLE: if (vid_active) begin
+				// In-flight video burst owns DDRAM until it completes.
 			end else if (poll_due) begin
 				poll_due <= 1'b0;
 				joy_hb <= joy_hb + 1'd1;
@@ -377,7 +386,7 @@ fb_line_reader fb_line_reader
 	.pal(pal_eff),
 	.dup_even(crt_on),
 
-	.mb_idle(mb_st == ST_IDLE),
+	.mb_idle(mb_allow_vid),
 	.vid_req(vid_req),
 	.vid_active(vid_active),
 	.ddr_rd(vid_rd),

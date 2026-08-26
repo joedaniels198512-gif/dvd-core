@@ -22,7 +22,7 @@ module fb_line_reader
 	input         pal,
 	input         dup_even,
 
-	input         mb_idle,
+	input         mb_idle,      // mailbox allows a new video burst to start
 	output        vid_req,
 	output        vid_active,
 	output        ddr_rd,
@@ -141,6 +141,7 @@ always @(posedge clk) begin
 	end else begin
 		case (st)
 			ST_IDLE: if (fill_need && mb_idle) begin
+					// mb_idle is mb_allow_vid: mailbox idle and no poll/follow-up due.
 					fill_sel_r     <= fill_sel;
 					y_fill_r       <= y_cand;
 					line_base      <= cand_base;
