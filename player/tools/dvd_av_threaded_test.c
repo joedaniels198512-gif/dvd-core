@@ -115,7 +115,15 @@ enum {
 #define FB_B_PHYS       0x30200000UL
 #define MB_PHYS         0x30400000UL
 #define JOY_OFF         8
+#define SET_OFF         16           /* FPGA→ARM DVD-v1 settings (DVD2) */
+#define CTL_OFF         24           /* ARM→FPGA source-standard (DVD3) */
 #define JOY_MAGIC       0x44564431u  /* "DVD1" at 0x3040000C */
+#define SET_MAGIC       0x44564432u  /* "DVD2" at 0x30400014 */
+#define CTL_MAGIC       0x44564433u  /* "DVD3" at 0x3040001C */
+#define SET_VER         1
+#define FPGA_SRC_UNKNOWN 0
+#define FPGA_SRC_NTSC    1
+#define FPGA_SRC_PAL     2
 #define DISP_BUF_BIT    31           /* display_buf in joystick word */
 /* joystick_0[30:0] published at 0x30400008; bit 31 is display_buf, not a button.
  * CONF_STR J1 in fpga/DVD.sv: D-pad implicit 0-3, named buttons 4-9.
@@ -876,6 +884,70 @@ static uint64_t peek_mbox_status(const FBPair *fb)
     volatile uint64_t *st =
         (volatile uint64_t *)((uint8_t *)fb->mbox + JOY_OFF);
     return *st;
+}
+
+static uint64_t peek_dvd_settings(const FBPair *fb)
+{
+    volatile uint64_t *st =
+        (volatile uint64_t *)((uint8_t *)fb->mbox + SET_OFF);
+    return *st;
+}
+
+static void poke_dvd_control(const FBPair *fb, uint64_t word)
+{
+    volatile uint64_t *st =
+        (volatile uint64_t *)((uint8_t *)fb->mbox + CTL_OFF);
+    *st = word;
+    __sync_synchronize();
+}
+
+/* Circular OSD encoding: raw 0=0ms, 1..10=+10..+100, 11..20=-100..-10. */
+static int av_sync_raw_to_ms(unsigned raw)
+{
+    raw &= 31u;
+    if (raw > 20)
+        return 0;
+    if (raw <= 10)
+        return (int)raw * 10;
+    return ((int)raw - 21) * 10;
+}
+
+static int dvd_fpga_probe_v1(const FBPair *fb)
+{
+    uint64_t a, b;
+    unsigned seq_a, seq_b;
+    int i;
+
+    if (!fb || !fb->mbox)
+        return 0;
+    a = peek_dvd_settings(fb);
+    if ((uint32_t)(a >> 32) != SET_MAGIC)
+        return 0;
+    if (((a >> 24) & 0xffu) != SET_VER)
+        return 0;
+    seq_a = (unsigned)((a >> 16) & 0xffu);
+    for (i = 0; i < 8; i++) {
+        av_usleep(2000);
+        b = peek_dvd_settings(fb);
+        if ((uint32_t)(b >> 32) != SET_MAGIC)
+            return 0;
+        seq_b = (unsigned)((b >> 16) & 0xffu);
+        if (seq_b != seq_a)
+            return 1;
+    }
+    return 0;
+}
+
+static void dvd_fpga_write_source(const FBPair *fb, unsigned src)
+{
+    uint64_t w;
+
+    if (!fb || !fb->mbox)
+        return;
+    if (src > FPGA_SRC_PAL)
+        src = FPGA_SRC_UNKNOWN;
+    w = ((uint64_t)CTL_MAGIC << 32) | (src & 3u);
+    poke_dvd_control(fb, w);
 }
 
 static int read_display_buf(const FBPair *fb, int *out)
@@ -2070,6 +2142,11 @@ struct Player {
     int video_decoded, stale_dropped;
     int initial_skip_req, initial_skip_left, initial_video_skipped;
     int video_advance_ms;
+    /* OSD A/V Sync trim (ms). +N = video later vs audio; -N = video earlier.
+     * 0 ms == existing --video-advance-ms baseline. MrAudio is not touched. */
+    volatile int osd_av_trim_ms;
+    int fpga_v1_caps;
+    int fpga_src_std;
     int stale_run, stale_run_max;
     unsigned long stale_n;
     int64_t stale_off_sum, stale_off_min, stale_off_max;
@@ -4908,6 +4985,50 @@ static void note_unpinned_cpu(const char *name, int *got_cpu)
     dbg("sched: %s unpinned (sched_getcpu=%d)\n", name, *got_cpu);
 }
 
+static unsigned dvd_std_to_fpga_src(DvdVideoStd std)
+{
+    if (std == DVD_VIDEO_PAL)
+        return FPGA_SRC_PAL;
+    if (std == DVD_VIDEO_NTSC)
+        return FPGA_SRC_NTSC;
+    return FPGA_SRC_UNKNOWN;
+}
+
+static void dvd_fpga_poll_settings(Player *p)
+{
+    uint64_t w;
+    unsigned raw;
+    int trim;
+
+    if (!p || !p->fpga_v1_caps || !p->fb)
+        return;
+    w = peek_dvd_settings(p->fb);
+    if ((uint32_t)(w >> 32) != SET_MAGIC)
+        return;
+    raw = (unsigned)((w >> 8) & 0x1fu);
+    trim = av_sync_raw_to_ms(raw);
+    if (trim != p->osd_av_trim_ms) {
+        p->osd_av_trim_ms = trim;
+        fprintf(stderr, "A/V SYNC: trim %+d ms\n", trim);
+    }
+}
+
+static void dvd_fpga_report_source(Player *p, DvdVideoStd std)
+{
+    unsigned src;
+
+    if (!p || !p->fpga_v1_caps || !p->fb)
+        return;
+    src = dvd_std_to_fpga_src(std);
+    if ((int)src == p->fpga_src_std)
+        return;
+    dvd_fpga_write_source(p->fb, src);
+    p->fpga_src_std = (int)src;
+    fprintf(stderr, "TV AUTO: source %s\n",
+            src == FPGA_SRC_PAL ? "PAL" :
+            src == FPGA_SRC_NTSC ? "NTSC" : "UNKNOWN");
+}
+
 static void *input_thread(void *opaque)
 {
     Player *p = opaque;
@@ -4941,6 +5062,7 @@ static void *input_thread(void *opaque)
             pad.magic_logged = 1;
             dbg("Controller: waiting for DVD1 magic at 0x30400008\n");
         }
+        dvd_fpga_poll_settings(p);
         av_usleep(CTRL_POLL_US);
     }
 
@@ -5715,15 +5837,19 @@ static int player_accept_video_frame(Player *p, const AVFrame *frame,
             "T=%.3f ms  fps %d/%d\n",
             FB_W, h, FB_W, FB_H, FB_STRIDE,
             frame_duration_us(p) / 1000.0, p->fps.num, p->fps.den);
+        dvd_fpga_report_source(p, std);
     } else if (p->dvd_std != std || frame->width != p->video_w ||
                frame->height != p->video_h) {
         fprintf(stderr,
-                "FAIL: DVD video geometry changed to %dx%d "
-                "(was %s %dx%d)\n",
-                frame->width, frame->height,
+                "DVD video standard changed to %s %dx%d @ %.3f fps "
+                "(was %s %dx%d) — keeping navigation\n",
+                dvd_std_name(std), frame->width, frame->height,
+                (p->fps.num > 0 && p->fps.den > 0) ? av_q2d(p->fps) : 0.0,
                 dvd_std_name(p->dvd_std), p->video_w, p->video_h);
-        player_abort(p);
-        return -1;
+        p->dvd_std = std;
+        p->video_w = FB_W;
+        p->video_h = h;
+        dvd_fpga_report_source(p, std);
     }
     return 0;
 }
@@ -5741,12 +5867,19 @@ static int64_t presentation_phase_us(const Player *p)
     return (int64_t)p->initial_skip_req * T;
 }
 
-/* Temporary --video-advance-ms: buffered-YUV only. Default path is 0. */
+/* Temporary --video-advance-ms: buffered-YUV only. Default path is 0.
+ * OSD A/V Sync trim is subtracted so:
+ *   +OSD ms = present VIDEO later relative to audio
+ *   -OSD ms = present VIDEO earlier relative to audio
+ * OSD 0 ms is identical to the --video-advance-ms baseline (launcher: 20).
+ * MrAudio consumed bytes remain the sole media clock. */
 static int64_t video_advance_applied_us(const Player *p)
 {
-    if (!p->buffered_yuv || p->video_advance_ms <= 0)
-        return 0;
-    return (int64_t)p->video_advance_ms * 1000;
+    int64_t base = 0;
+
+    if (p->buffered_yuv && p->video_advance_ms > 0)
+        base = (int64_t)p->video_advance_ms * 1000;
+    return base - (int64_t)p->osd_av_trim_ms * 1000;
 }
 
 static int64_t total_presentation_phase_us(const Player *p)
@@ -8095,6 +8228,21 @@ int main(int argc, char **argv)
         fprintf(stderr, "Video advance: %d ms\n", p.video_advance_ms);
     else if (cli.buffered_yuv)
         fprintf(stderr, "Video advance: 0 ms\n");
+    p.fpga_src_std = -1;
+    p.osd_av_trim_ms = 0;
+    p.fpga_v1_caps = dvd_fpga_probe_v1(&fb);
+    if (p.fpga_v1_caps) {
+        fprintf(stderr,
+                "FPGA DVD-v1 settings live at 0x30400010 "
+                "(A/V Sync + TV Auto). OSD 0 ms == this video-advance baseline.\n");
+        dvd_fpga_write_source(&fb, FPGA_SRC_UNKNOWN);
+        p.fpga_src_std = FPGA_SRC_UNKNOWN;
+        dvd_fpga_poll_settings(&p);
+    } else {
+        fprintf(stderr,
+                "FPGA DVD-v1 settings unavailable; A/V trim=0 ms, "
+                "Auto source switching off.\n");
+    }
     clock_init(&p.clock);
     navq_init(&p);
     d.player = &p;
@@ -9324,6 +9472,8 @@ int main(int argc, char **argv)
     avio_context_free(&avio);
     dvdnav_close(d.nav);
     free(d.sector);
+    if (p.fpga_v1_caps)
+        dvd_fpga_write_source(&fb, FPGA_SRC_UNKNOWN);
     unmap_double_fb(&fb);
 
     if (g_interrupt) {

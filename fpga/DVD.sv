@@ -59,6 +59,11 @@ assign BUTTONS = 0;
 // (never written to 0x30400000): {JOY_MAGIC, display_buf, joystick_0[30:0]}.
 // joystick bits 0-9 are unchanged. Bit 31 is display_buf (A=0, B=1).
 //
+// Additional v1 registers (do not alias the mailbox/joystick words):
+//   0x30400010 FPGA→ARM settings  {DVD2, ver, seq, tv_osd, crt, av, src}
+//   0x30400018 ARM→FPGA control   {DVD3, source_std}
+// Old player ignores these addresses. New player probes DVD2 liveness.
+//
 //////////////////////////////////////////////////////////////////
 
 wire [1:0] ar = status[122:121];
@@ -66,14 +71,30 @@ wire [1:0] ar = status[122:121];
 assign VIDEO_ARX = (!ar) ? 12'd4 : (ar - 1'd1);
 assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
 
-`include "build_id.v" 
+`include "build_id.v"
+// Status Bit Map:
+//             Upper                             Lower
+// 0         1         2         3          4         5         6
+// 01234567890123456789012345678901 23456789012345678901234567890123
+// 0123456789ABCDEFGHIJKLMNOPQRSTUV 0123456789ABCDEFGHIJKLMNOPQRSTUV
+// X XX XX XXX X     XXXXX                                  XX
+// 0=reset  [2:1]=TV Mode  [4:3]=Noise  5/6-7/10=template
+// 8=Buffer  9=CRT Stabilizer  [16:12]=A/V Sync  [122:121]=AR
+//
+// TV Mode: 0=Auto 1=NTSC 2=PAL. Fresh default Auto (O, first item).
+// CRT Stabilizer: listed On,Off so status[9]=0 is On (MiSTer default-0).
+//   dup_even = ~status[9]. Duplicate Even RTL is unchanged.
+// A/V Sync 5-bit circular (Main_MiSTer LEFT/RIGHT wrap, mask=31):
+//   raw 0 = 0 ms, 1..10 = +10..+100, 11..20 = -100..-10
+//   RIGHT from 0 → 1 (+10). LEFT from 0 → 20 (-10).
 localparam CONF_STR = {
 	"DVD;;",
 	"-;",
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[8],Buffer,A,B;",
-	"O[2],TV Mode,NTSC,PAL;",
-	"O[9],CRT Field Test,Normal,Duplicate Even;",
+	"O[2:1],TV Mode,Auto,NTSC,PAL;",
+	"O[9],CRT Stabilizer,On,Off;",
+	"O[16:12],A/V Sync,0 ms,+10 ms,+20 ms,+30 ms,+40 ms,+50 ms,+60 ms,+70 ms,+80 ms,+90 ms,+100 ms,-100 ms,-90 ms,-80 ms,-70 ms,-60 ms,-50 ms,-40 ms,-30 ms,-20 ms,-10 ms;",
 	"O[4:3],Noise,White,Red,Green,Blue;",
 	"-;",
 	"P1,Test Page 1;",
@@ -99,9 +120,7 @@ localparam CONF_STR = {
 	"J1,Select,Back,Play/Pause,DVD Menu,Previous Chapter,Next Chapter;",
 	"jn,A,B,Start,X,L,R;",
 	"jp,A,B,Start,X,L,R;",
-	"v,0;", // [optional] config version 0-99.
-	        // If CONF_STR options are changed in incompatible way, then change version number too,
-			  // so all options will get default values on first start.
+	"v,1;", // bumped: TV Mode is 2-bit Auto/NTSC/PAL, CRT/A/V Sync layout changed
 	"V,v",`BUILD_DATE 
 };
 
@@ -142,25 +161,47 @@ pll pll
 // Poll 16384 cycles of 27 MHz (~0.61 ms).
 // 0x30400000 bit0 = ARM→FPGA FB A/B request (never RMW / never FPGA-write).
 // 0x30400008       = FPGA→ARM {JOY_MAGIC, display_buf, joystick_0[30:0]}.
+// 0x30400010       = FPGA→ARM settings/capability (DVD2). Never written by ARM.
+// 0x30400018       = ARM→FPGA source-standard control (DVD3). FPGA reads only.
 // One mailbox-read opportunity is latched every poll tick (poll_due) and
 // always taken from idle before any controller write.
 // Video line-fill has priority on DDRAM; mailbox runs when the reader is idle.
+// Extra settings/control beats return to idle between ops so video can preempt.
 localparam [28:0] MB_ADDR    = 29'h0608_0000; // 0x30400000
 localparam [28:0] JOY_ADDR   = 29'h0608_0001; // 0x30400008
+localparam [28:0] SET_ADDR   = 29'h0608_0002; // 0x30400010
+localparam [28:0] CTL_ADDR   = 29'h0608_0003; // 0x30400018
 localparam [13:0] POLL_MAX   = 14'd16383;
 localparam [31:0] JOY_MAGIC  = 32'h44564431;  // "DVD1"
+localparam [31:0] SET_MAGIC  = 32'h44564432;  // "DVD2"
+localparam [31:0] CTL_MAGIC  = 32'h44564433;  // "DVD3"
+localparam [7:0]  SET_VER    = 8'd1;
 localparam [9:0]  JOY_HB_MAX = 10'd1023;      // heartbeat ~0.62 s at 27 MHz
+
+localparam ST_IDLE     = 4'd0;
+localparam ST_RD_MB    = 4'd1;
+localparam ST_RD_MB_W  = 4'd2;
+localparam ST_WR_JOY   = 4'd3;
+localparam ST_WR_JOY_H = 4'd4;
+localparam ST_WR_SET   = 4'd5;
+localparam ST_WR_SET_H = 4'd6;
+localparam ST_RD_CTL   = 4'd7;
+localparam ST_RD_CTL_W = 4'd8;
 
 reg        mb_rd  = 0;
 reg        mb_we  = 0;
 reg        mb_bit = 0;
-reg  [2:0] mb_st  = 0; // 0 idle, 1 issue rd, 2 wait rd, 3 issue wr, 4 wr hold
+reg  [3:0] mb_st  = 0;
 reg [13:0] poll_cnt = 0;
 reg        poll_due = 0;
+reg        ctl_due  = 0;
+reg        set_due  = 0;
 reg        joy_pending = 1'b1;
 reg [31:0] joy_sent = 32'hffff_ffff;
 reg        disp_sent = 1'b0;
 reg  [9:0] joy_hb = 0;
+reg  [7:0] set_seq = 0;
+reg  [1:0] src_std = 2'd0;
 
 wire        vid_req;
 wire        vid_active;
@@ -170,11 +211,29 @@ wire  [7:0] vid_burstcnt;
 wire  [7:0] pix_r, pix_g, pix_b;
 wire        display_buf;
 
+// OSD TV Mode status[2:1]: 0 Auto, 1 NTSC, 2 PAL.
+// CRT: CONF_STR On,Off so status[9]==0 is On; invert for existing dup_even.
+// Auto + UNKNOWN/NTSC → NTSC (launcher-safe). Auto + PAL → PAL.
+wire [1:0] tv_osd = status[2:1];
+wire       crt_on = ~status[9];
+wire [4:0] av_raw = status[16:12];
+wire       pal_eff = (tv_osd == 2'd2) ? 1'b1 :
+                     (tv_osd == 2'd1) ? 1'b0 :
+                     (src_std == 2'd2);
+
+wire [63:0] joy_word = {JOY_MAGIC, display_buf, joystick_0[30:0]};
+wire [63:0] set_word = {SET_MAGIC, SET_VER, set_seq, tv_osd, crt_on, av_raw, 6'd0, src_std};
+
+wire [28:0] mb_addr =
+	(mb_st == ST_WR_JOY || mb_st == ST_WR_JOY_H) ? JOY_ADDR :
+	(mb_st == ST_WR_SET || mb_st == ST_WR_SET_H) ? SET_ADDR :
+	(mb_st == ST_RD_CTL || mb_st == ST_RD_CTL_W) ? CTL_ADDR :
+	MB_ADDR;
+
 assign DDRAM_CLK      = clk_sys;
 assign DDRAM_BURSTCNT = vid_active ? vid_burstcnt : 8'd1;
-assign DDRAM_ADDR     = vid_active ? vid_addr :
-                        ((mb_st == 3'd3 || mb_st == 3'd4) ? JOY_ADDR : MB_ADDR);
-assign DDRAM_DIN      = {JOY_MAGIC, display_buf, joystick_0[30:0]};
+assign DDRAM_ADDR     = vid_active ? vid_addr : mb_addr;
+assign DDRAM_DIN      = (mb_st == ST_WR_SET || mb_st == ST_WR_SET_H) ? set_word : joy_word;
 assign DDRAM_BE       = 8'hFF;
 assign DDRAM_WE       = vid_active ? 1'b0 : mb_we;
 assign DDRAM_RD       = vid_active ? vid_rd : mb_rd;
@@ -188,7 +247,7 @@ always @(posedge clk_sys) begin
 		poll_due <= 1'b1;
 
 	case (mb_st)
-		0: if (vid_req) begin
+		ST_IDLE: if (vid_req) begin
 				// Video owns or wants DDRAM; wait.
 			end else if (poll_due) begin
 				poll_due <= 1'b0;
@@ -197,29 +256,54 @@ always @(posedge clk_sys) begin
 					joy_hb <= 10'd0;
 					joy_pending <= 1'b1;
 				end
-				mb_st <= 3'd1;
+				mb_st <= ST_RD_MB;
+			end else if (ctl_due) begin
+				mb_st <= ST_RD_CTL;
+			end else if (set_due) begin
+				mb_st <= ST_WR_SET;
 			end else if (joy_pending) begin
-				mb_st <= 3'd3;
+				mb_st <= ST_WR_JOY;
 			end
-		1: if (!DDRAM_BUSY) begin
+		ST_RD_MB: if (!DDRAM_BUSY) begin
 				mb_rd <= 1;
-				mb_st <= 3'd2;
+				mb_st <= ST_RD_MB_W;
 			end
-		2: if (DDRAM_DOUT_READY) begin
+		ST_RD_MB_W: if (DDRAM_DOUT_READY) begin
 				mb_bit <= DDRAM_DOUT[0];
-				mb_st  <= 3'd0;
+				ctl_due <= 1'b1;
+				set_due <= 1'b1;
+				mb_st  <= ST_IDLE;
 			end
-		3: if (!DDRAM_BUSY) begin
+		ST_WR_JOY: if (!DDRAM_BUSY) begin
 				mb_we <= 1;
-				mb_st <= 3'd4;
+				mb_st <= ST_WR_JOY_H;
 			end
-		4: begin
+		ST_WR_JOY_H: begin
 				joy_sent  <= joystick_0;
 				disp_sent <= display_buf;
 				joy_pending <= 1'b0;
-				mb_st <= 3'd0;
+				mb_st <= ST_IDLE;
 			end
-		default: mb_st <= 3'd0;
+		ST_WR_SET: if (!DDRAM_BUSY) begin
+				mb_we <= 1;
+				mb_st <= ST_WR_SET_H;
+			end
+		ST_WR_SET_H: begin
+				set_seq <= set_seq + 8'd1;
+				set_due <= 1'b0;
+				mb_st <= ST_IDLE;
+			end
+		ST_RD_CTL: if (!DDRAM_BUSY) begin
+				mb_rd <= 1;
+				mb_st <= ST_RD_CTL_W;
+			end
+		ST_RD_CTL_W: if (DDRAM_DOUT_READY) begin
+				if (DDRAM_DOUT[63:32] == CTL_MAGIC && DDRAM_DOUT[1:0] <= 2'd2)
+					src_std <= DDRAM_DOUT[1:0];
+				ctl_due <= 1'b0;
+				mb_st <= ST_IDLE;
+			end
+		default: mb_st <= ST_IDLE;
 	endcase
 
 	if (joystick_0 != joy_sent)
@@ -255,7 +339,7 @@ mycore mycore
 	.clk(clk_sys),
 	.reset(reset_core),
 
-	.pal(status[2]),
+	.pal(pal_eff),
 	.scandouble(forced_scandoubler),
 
 	.ce_pix(ce_pix),
@@ -281,10 +365,10 @@ fb_line_reader fb_line_reader
 	.ce_pix(ce_pix),
 	.req_buf(mb_bit | status[8]),
 	.display_buf(display_buf),
-	.pal(status[2]),
-	.dup_even(status[9]),
+	.pal(pal_eff),
+	.dup_even(crt_on),
 
-	.mb_idle(mb_st == 3'd0),
+	.mb_idle(mb_st == ST_IDLE),
 	.vid_req(vid_req),
 	.vid_active(vid_active),
 	.ddr_rd(vid_rd),
