@@ -4,7 +4,9 @@
 // PAL:  src_y = vc*2 + field for vc 0..287 → lines 0..575.
 // Raster counters are inputs; never stall them.
 // display_buf snapshots req_buf once per complete native frame (field 1 -> 0).
-// HDMI ASCAL captures the same VGA_* stream; it does not read these DDR buffers.
+// HDMI ASCAL captures the same VGA_* stream (bob-deint is HDMI-side only).
+// CRT Stabilizer (dup_even) is applied here, so it currently affects both
+// CRT and HDMI; the framework has no separate HDMI pixel port.
 
 module fb_line_reader
 (

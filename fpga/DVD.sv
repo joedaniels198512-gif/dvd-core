@@ -34,7 +34,11 @@ assign VGA_SCALER  = 0;
 assign VGA_DISABLE = 0;
 assign HDMI_FREEZE = 0;
 assign HDMI_BLACKOUT = 0;
-assign HDMI_BOB_DEINT = 0;
+// HDMI/ascal only. Analog VGA/CRT still uses the native 15 kHz interlaced
+// raster (VGA_HS/VS/DE + VGA_F1). ascal bob-deinterlaces captured fields
+// into a progressive feed for the HDMI scaler. Ignored when ascal has not
+// detected interlaced input (i_inter=0).
+assign HDMI_BOB_DEINT = 1;
 
 assign AUDIO_S = 0;
 assign AUDIO_L = 0;
@@ -46,6 +50,11 @@ assign LED_POWER = 0;
 assign BUTTONS = 0;
 
 /////////////////  Native scanout (one VGA_* stream for CRT and HDMI)  /////
+//
+// CRT:  native 480i/576i from mycore + fb_line_reader. Timing unchanged.
+// HDMI: same VGA_* capture into ascal, with HDMI_BOB_DEINT so the scaler
+//       presents bob-deinterlaced progressive frames (not ARM 720p/1080p).
+// VGA_F1 must remain the raster field so ascal detects interlaced input.
 //
 // Two native 720x576 BGR0/XRGB8888 buffers in reserved DDR:
 //   A = 0x30000000   B = 0x30200000
