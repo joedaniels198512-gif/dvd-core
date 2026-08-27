@@ -29,6 +29,14 @@ jobs:
         run: |
           docker run --rm -v "$GITHUB_WORKSPACE/fpga:/build" -w /build \
             raetro/quartus:17.0 quartus_sh --flow compile DVD.qpf
+          cp -f fpga/output_files/DVD.rbf fpga/output_files/DVD_FPGA_YUV420_Test.rbf
+
+      - name: Upload DVD_FPGA_YUV420_Test.rbf
+        uses: actions/upload-artifact@v4
+        with:
+          name: DVD_FPGA_YUV420_Test.rbf
+          path: fpga/output_files/DVD_FPGA_YUV420_Test.rbf
+          if-no-files-found: error
 
       - name: Upload DVD.rbf
         uses: actions/upload-artifact@v4

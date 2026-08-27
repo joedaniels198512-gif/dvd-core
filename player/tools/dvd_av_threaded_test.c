@@ -125,6 +125,13 @@ enum {
 #define SET_MAGIC       0x44564432u  /* "DVD2" at 0x30400014 */
 #define CTL_MAGIC       0x44564433u  /* "DVD3" at 0x3040001C */
 #define SET_VER         1
+#define SET_YUV_CAP_BIT 2            /* DVD2 pad: FPGA YUV420 reader present */
+#define MB_YUV_BIT      1            /* mailbox 0x30400000: 1 = planar YUV420 */
+#define YUV_Y_OFF       0x000000u
+#define YUV_U_OFF       0x080000u
+#define YUV_V_OFF       0x0A0000u
+#define YUV_Y_STRIDE    720
+#define YUV_C_STRIDE    360
 #define FPGA_SRC_UNKNOWN 0
 #define FPGA_SRC_NTSC    1
 #define FPGA_SRC_PAL     2
@@ -559,6 +566,7 @@ typedef struct {
     int debug_subtitles;
     int debug_yellow_highlight;
     int authored_start;
+    int fpga_yuv420;
 } Cli;
 
 static void usage(void)
@@ -573,6 +581,7 @@ static void usage(void)
             "                              [--perf-present-no-convert]\n"
             "                              [--perf-sws-ddr]\n"
             "                              [--buffered-yuv-phase-decode]\n"
+            "                              [--fpga-yuv420]\n"
             "                              [--debug-stats]\n"
             "                              [--debug-spu]\n"
             "                              [--debug-subtitles]\n"
@@ -612,6 +621,12 @@ static void usage(void)
             "                        decode while consumer sws_scale is writing\n"
             "                        uncached DDR. Requires --buffered-yuv-video.\n"
             "                        Producer may refill during ACK/PTS waits.\n"
+            "--fpga-yuv420           experimental: copy planar YUV420P into the\n"
+            "                        inactive A/B slot and set mailbox bit1 so\n"
+            "                        FPGA converts BT.601. Skips sws_scale and\n"
+            "                        ARM subtitle/menu BGR overlays. Requires\n"
+            "                        DVD_FPGA_YUV420_Test.rbf. Default off =\n"
+            "                        legacy BGR0 unchanged.\n"
             "--debug-stats           verbose instrumentation (ACK, timings,\n"
             "                        queues, stale distributions, threads).\n"
             "                        Default off; normal output is compact.\n"
@@ -729,6 +744,10 @@ static int parse_cli(int argc, char **argv, Cli *cli)
             cli->phase_decode = 1;
             continue;
         }
+        if (!strcmp(argv[i], "--fpga-yuv420")) {
+            cli->fpga_yuv420 = 1;
+            continue;
+        }
         if (!strcmp(argv[i], "--debug-stats")) {
             cli->debug_stats = 1;
             continue;
@@ -817,6 +836,15 @@ static int parse_cli(int argc, char **argv, Cli *cli)
         fprintf(stderr,
                 "--buffered-yuv-phase-decode cannot be combined with "
                 "--perf-present-no-convert or --uncapped-video-benchmark\n");
+        return -1;
+    }
+    if (cli->fpga_yuv420 &&
+        (cli->perf_present_no_convert || cli->perf_sws_ddr ||
+         cli->buffered_video || cli->uncapped_video_benchmark ||
+         cli->phase_decode)) {
+        fprintf(stderr,
+                "--fpga-yuv420 cannot be combined with isolation, "
+                "buffered-video, uncapped, or phase-decode flags\n");
         return -1;
     }
     return 0;
@@ -1069,6 +1097,28 @@ static int dvd_fpga_probe_v1(const FBPair *fb)
             return 1;
     }
     return 0;
+}
+
+static int dvd_fpga_yuv_cap(const FBPair *fb)
+{
+    uint64_t w;
+
+    if (!fb || !fb->mbox)
+        return 0;
+    w = peek_dvd_settings(fb);
+    if ((uint32_t)(w >> 32) != SET_MAGIC)
+        return 0;
+    if (((w >> 24) & 0xffu) != SET_VER)
+        return 0;
+    return (int)((w >> SET_YUV_CAP_BIT) & 1u);
+}
+
+static uint32_t mailbox_ab_word(int yuv_mode, int ab)
+{
+    uint32_t w = (uint32_t)(ab & 1);
+    if (yuv_mode)
+        w |= (1u << MB_YUV_BIT);
+    return w;
 }
 
 static void dvd_fpga_write_source(const FBPair *fb, unsigned src)
@@ -2289,6 +2339,8 @@ struct Player {
      * 0 ms == existing --video-advance-ms baseline. MrAudio is not touched. */
     volatile int osd_av_trim_ms;
     int fpga_v1_caps;
+    int fpga_yuv420;
+    int yuv_meta_logged;
     int fpga_src_std;
     int stale_run, stale_run_max;
     unsigned long stale_n;
@@ -2686,6 +2738,10 @@ struct Player {
     int64_t *phase_cyc;
     int phase_sws_n, phase_ack_n, phase_cyc_n;
     int64_t phase_sws_sum, phase_ack_sum, phase_cyc_sum;
+    int64_t *yuv_copy;
+    int yuv_copy_n;
+    int64_t yuv_copy_sum;
+    int64_t yuv_copy_max;
     int present_started;
     int buf_playing;
     VidRing vring;
@@ -7253,6 +7309,87 @@ static int player_active_h(const Player *p)
     return FB_H;
 }
 
+static void log_yuv_frame_meta_once(Player *p, const AVFrame *frame)
+{
+    const char *cl = NULL, *cr = NULL, *cs = NULL, *fmt = NULL;
+
+    if (!p || !frame || p->yuv_meta_logged)
+        return;
+    p->yuv_meta_logged = 1;
+    fmt = av_get_pix_fmt_name(frame->format);
+    cl = av_chroma_location_name(frame->chroma_location);
+    cr = av_color_range_name(frame->color_range);
+    cs = av_color_space_name(frame->colorspace);
+    fprintf(stderr,
+            "FPGA YUV420 META: interlaced_frame=%d top_field_first=%d "
+            "chroma_location=%s (%d) color_range=%s colorspace=%s "
+            "format=%s %dx%d linesize=%d/%d/%d\n"
+            "FPGA YUV420 CHROMA: SIMPLE chroma_row=y>>1 "
+            "(approximate for interlaced MPEG-2 4:2:0; not final)\n",
+            frame->interlaced_frame, frame->top_field_first,
+            cl ? cl : "unspecified", (int)frame->chroma_location,
+            cr ? cr : "unspecified", cs ? cs : "unspecified",
+            fmt ? fmt : "?", frame->width, frame->height,
+            frame->linesize[0], frame->linesize[1], frame->linesize[2]);
+}
+
+static int copy_yuv420_to_slot(uint8_t *slot, const AVFrame *frame, int active_h)
+{
+    int y, h, ch, ycopy, ccopy;
+
+    if (!slot || !frame || !frame->data[0] || !frame->data[1] || !frame->data[2])
+        return -1;
+    if (frame->format != AV_PIX_FMT_YUV420P &&
+        frame->format != AV_PIX_FMT_YUVJ420P)
+        return -1;
+    h = active_h;
+    if (frame->height > 0 && frame->height < h)
+        h = frame->height;
+    if (h < 2)
+        return -1;
+    if (h > FB_H)
+        h = FB_H;
+    h &= ~1;
+    ch = h / 2;
+    ycopy = FB_W;
+    ccopy = YUV_C_STRIDE;
+    if (frame->width > 0 && frame->width < ycopy)
+        ycopy = frame->width;
+    if (ycopy > YUV_Y_STRIDE)
+        ycopy = YUV_Y_STRIDE;
+    ccopy = ycopy / 2;
+    if (frame->linesize[0] < ycopy || frame->linesize[1] < ccopy ||
+        frame->linesize[2] < ccopy)
+        return -1;
+    for (y = 0; y < h; y++)
+        memcpy(slot + YUV_Y_OFF + (size_t)y * YUV_Y_STRIDE,
+               frame->data[0] + (size_t)y * (size_t)frame->linesize[0],
+               (size_t)ycopy);
+    for (y = 0; y < ch; y++) {
+        memcpy(slot + YUV_U_OFF + (size_t)y * YUV_C_STRIDE,
+               frame->data[1] + (size_t)y * (size_t)frame->linesize[1],
+               (size_t)ccopy);
+        memcpy(slot + YUV_V_OFF + (size_t)y * YUV_C_STRIDE,
+               frame->data[2] + (size_t)y * (size_t)frame->linesize[2],
+               (size_t)ccopy);
+    }
+    return 0;
+}
+
+static void yuv_copy_note(Player *p, int64_t us)
+{
+    if (!p || !p->yuv_copy)
+        return;
+    if (us < 0)
+        us = 0;
+    if (p->yuv_copy_n < ISO_SAMPLE_CAP)
+        p->yuv_copy[p->yuv_copy_n] = us;
+    p->yuv_copy_sum += us;
+    p->yuv_copy_n++;
+    if (us > p->yuv_copy_max)
+        p->yuv_copy_max = us;
+}
+
 static size_t player_active_fb_bytes(const Player *p)
 {
     return (size_t)FB_STRIDE * (size_t)player_active_h(p);
@@ -7993,7 +8130,7 @@ static int wait_display_buf(Player *p, int want, int64_t timeout_us,
         }
         if (now - last_reissue_us >= reissue_us) {
             /* Idempotent reassertion of the outstanding request. Not a flip. */
-            p->fb->mbox[0] = (uint32_t)want;
+            p->fb->mbox[0] = mailbox_ab_word(p->fpga_yuv420, want);
             last_reissue_us = now;
             reissues++;
             if (reissues == 1 || crossed_warn)
@@ -8362,13 +8499,15 @@ static int present_video_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
             p->initial_skip_req, p->initial_skip_req == 1 ? "" : "s",
             presentation_phase_us(p) / 1000.0,
             p->sws_cpu_ok ? "CLOCK_THREAD_CPUTIME_ID" : "unavailable");
-        *sws = sws_getContext(FB_W, player_active_h(p), frame->format,
-                              FB_W, player_active_h(p), AV_PIX_FMT_BGR0,
-                              SWS_FAST_BILINEAR, NULL, NULL, NULL);
-        if (!*sws) {
-            fprintf(stderr, "sws_getContext failed\n");
-            player_abort(p);
-            return -1;
+        if (!p->fpga_yuv420) {
+            *sws = sws_getContext(FB_W, player_active_h(p), frame->format,
+                                  FB_W, player_active_h(p), AV_PIX_FMT_BGR0,
+                                  SWS_FAST_BILINEAR, NULL, NULL, NULL);
+            if (!*sws) {
+                fprintf(stderr, "sws_getContext failed\n");
+                player_abort(p);
+                return -1;
+            }
         }
     }
 
@@ -8412,15 +8551,30 @@ static int present_video_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
     dst_linesize[0] = FB_STRIDE;
     int64_t cpu0 = p->sws_cpu_ok ? thread_cpu_us() : -1;
     int64_t c0 = av_gettime_relative();
-    sws_scale(*sws, (const uint8_t * const *)frame->data, frame->linesize,
-              0, player_active_h(p), dst_data, dst_linesize);
-    int64_t sws_wall = av_gettime_relative() - c0;
-    int64_t cpu1 = (p->sws_cpu_ok && cpu0 >= 0) ? thread_cpu_us() : -1;
-    p->convert_us += sws_wall;
-    if (p->in_menu || g_debug_yellow_highlight)
-        present_draw_highlight(p, dst_data[0], dst_linesize[0], p->in_menu);
-    else
-        movie_sub_overlay(p, dst_data[0], dst_linesize[0], vpts_us, NULL);
+    int64_t sws_wall;
+    int64_t cpu1;
+    if (p->fpga_yuv420) {
+        log_yuv_frame_meta_once(p, frame);
+        if (copy_yuv420_to_slot(dst_data[0], frame, player_active_h(p)) < 0) {
+            fprintf(stderr, "FAIL: FPGA YUV420 plane copy\n");
+            player_abort(p);
+            return -1;
+        }
+        sws_wall = av_gettime_relative() - c0;
+        cpu1 = (p->sws_cpu_ok && cpu0 >= 0) ? thread_cpu_us() : -1;
+        p->convert_us += sws_wall;
+        yuv_copy_note(p, sws_wall);
+    } else {
+        sws_scale(*sws, (const uint8_t * const *)frame->data, frame->linesize,
+                  0, player_active_h(p), dst_data, dst_linesize);
+        sws_wall = av_gettime_relative() - c0;
+        cpu1 = (p->sws_cpu_ok && cpu0 >= 0) ? thread_cpu_us() : -1;
+        p->convert_us += sws_wall;
+        if (p->in_menu || g_debug_yellow_highlight)
+            present_draw_highlight(p, dst_data[0], dst_linesize[0], p->in_menu);
+        else
+            movie_sub_overlay(p, dst_data[0], dst_linesize[0], vpts_us, NULL);
+    }
     __sync_synchronize();
     int64_t conv_done = av_gettime_relative();
 
@@ -8435,7 +8589,7 @@ static int present_video_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
         record_offset_pair(p, raw_off, av_off);
     }
 
-    p->fb->mbox[0] = (uint32_t)next;
+    p->fb->mbox[0] = mailbox_ab_word(p->fpga_yuv420, next);
     p->last_mbox_wall_us = av_gettime_relative();
     if (next)
         p->frames_b++;
@@ -8860,7 +9014,7 @@ static int present_cached_frame(Player *p, uint8_t *src, int64_t vpts_us)
         record_offset_pair(p, raw_off, av_off);
     }
 
-    p->fb->mbox[0] = (uint32_t)next;
+    p->fb->mbox[0] = mailbox_ab_word(p->fpga_yuv420, next);
     p->last_mbox_wall_us = av_gettime_relative();
     if (next)
         p->frames_b++;
@@ -9084,13 +9238,14 @@ static void log_present_perf(Player *p, int64_t raw_vpts_us, int64_t pvpts_us,
     fprintf(stderr,
             "PRESENT PERF: raw_vpts=%" PRId64 " pvpts=%" PRId64 " aclk=%" PRId64
             " av_delta_us=%" PRId64 " ack_wait_us=%" PRId64 " ack_instant=%d"
-            " sws_wall_us=%" PRId64 " post_sws_wait_us=%" PRId64
+            " %s=%" PRId64 " post_sws_wait_us=%" PRId64
             " cycle_us=%" PRId64 " mbox_to_ack_us=%" PRId64
             " mbox_write_us=%" PRId64 " queue_depth=%d osd_trim_ms=%d"
             " video_advance_ms=%d initial_skip=%d display_before=%c dest=%c"
             " display_after=%c phase_us=%" PRId64 " status_word=0x%016" PRIx64
             "\n",
             raw_vpts_us, pvpts_us, aclk, av_delta_us, ack_wait_us, ack_instant,
+            p->fpga_yuv420 ? "yuv_copy_us" : "sws_wall_us",
             sws_wall_us, post_sws_wait_us, cycle_us, mbox_to_ack_us,
             mbox_write_us, q, p->osd_av_trim_ms, p->video_advance_ms,
             p->initial_skip_req,
@@ -9148,7 +9303,9 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
             "Additional video advance: %.3f ms\n"
             "Total presentation phase: %.3f ms  (hold and stale)\n"
             "sws CPU: %s\n",
-            p->perf_present_no_convert
+            p->fpga_yuv420
+                ? "copy YUV planes to DDR"
+                : p->perf_present_no_convert
                 ? "warmup sws then skip convert"
                 : "sws YUV DIRECT DDR",
             T0 / 1000.0,
@@ -9160,7 +9317,7 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
             p->sws_cpu_ok ? "CLOCK_THREAD_CPUTIME_ID" : "unavailable");
     }
 
-    if (!skip_sws && !*sws) {
+    if (!skip_sws && !p->fpga_yuv420 && !*sws) {
         *sws = sws_getContext(FB_W, player_active_h(p), frame->format,
                               FB_W, player_active_h(p), AV_PIX_FMT_BGR0,
                               SWS_FAST_BILINEAR, NULL, NULL, NULL);
@@ -9214,7 +9371,20 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
     int sub_active = 0;
     int64_t sub_blend_us = 0;
 
-    if (!skip_sws) {
+    if (p->fpga_yuv420) {
+        log_yuv_frame_meta_once(p, frame);
+        phase_sws_enter(p);
+        if (copy_yuv420_to_slot(dst_data[0], frame, player_active_h(p)) < 0) {
+            fprintf(stderr, "FAIL: FPGA YUV420 plane copy\n");
+            player_abort(p);
+            return -1;
+        }
+        sws_wall = av_gettime_relative() - c0;
+        cpu1 = (p->sws_cpu_ok && cpu0 >= 0) ? thread_cpu_us() : -1;
+        p->convert_us += sws_wall;
+        yuv_copy_note(p, sws_wall);
+        phase_sws_leave(p);
+    } else if (!skip_sws) {
         phase_sws_enter(p);
         sws_scale(*sws, (const uint8_t * const *)frame->data, frame->linesize,
                   0, player_active_h(p), dst_data, dst_linesize);
@@ -9266,7 +9436,7 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
     }
 
     int64_t mbox_t0 = av_gettime_relative();
-    p->fb->mbox[0] = (uint32_t)next;
+    p->fb->mbox[0] = mailbox_ab_word(p->fpga_yuv420, next);
     p->last_mbox_wall_us = av_gettime_relative();
     int64_t mbox_write_us = p->last_mbox_wall_us - mbox_t0;
     if (mbox_write_us < 0)
@@ -10362,8 +10532,12 @@ int main(int argc, char **argv)
             "(cached RAM producer/consumer, MrAudio still master)\n");
     if (cli.buffered_yuv)
         fprintf(stderr, "MODE: --buffered-yuv-video  "
-            "(decoded YUV queue, direct-DDR sws at present, "
-            "MrAudio still master)\n");
+            "(decoded YUV queue, %s at present, "
+            "MrAudio still master)\n",
+            cli.fpga_yuv420 ? "FPGA YUV420 plane copy" : "direct-DDR sws");
+    if (cli.fpga_yuv420 && !cli.buffered_yuv)
+        fprintf(stderr, "MODE: --fpga-yuv420  "
+            "(planar YUV copy, FPGA BT.601, overlays off)\n");
     if (cli.perf_present_no_convert) {
         fprintf(stderr,
                 "PERF isolation ACK: per-frame sws_scale bypassed after "
@@ -10481,6 +10655,7 @@ int main(int argc, char **argv)
     p.buffered_yuv = cli.buffered_yuv;
     p.perf_present_no_convert = cli.perf_present_no_convert;
     p.phase_decode = cli.phase_decode;
+    p.fpga_yuv420 = cli.fpga_yuv420;
     p.subperf.act_blend = calloc(ISO_SAMPLE_CAP, sizeof(int64_t));
     p.subperf.act_sws = calloc(ISO_SAMPLE_CAP, sizeof(int64_t));
     p.subperf.act_ack = calloc(ISO_SAMPLE_CAP, sizeof(int64_t));
@@ -10516,6 +10691,13 @@ int main(int argc, char **argv)
                 "PHASE DECODE: producer waits during consumer sws/DDR. "
                 "May refill during ACK/PTS. YUV low-water=%d  vq high-water=%d.\n",
                 PHASE_YUV_LOW_WATER, PHASE_VQ_HIGH_WATER);
+    }
+    if (cli.fpga_yuv420) {
+        p.yuv_copy = calloc(ISO_SAMPLE_CAP, sizeof(int64_t));
+        if (!p.yuv_copy) {
+            fprintf(stderr, "FAIL: yuv_copy sample buffer\n");
+            return 1;
+        }
     }
     p.first_audio_pts_us = AV_NOPTS_VALUE;
     p.initial_skip_req = cli.initial_video_skip;
@@ -10558,6 +10740,18 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "FPGA DVD-v1 settings unavailable; A/V trim=0 ms, "
                 "Auto source switching off.\n");
+    }
+    if (cli.fpga_yuv420) {
+        if (!p.fpga_v1_caps || !dvd_fpga_yuv_cap(&fb)) {
+            fprintf(stderr,
+                    "FAIL: --fpga-yuv420 needs DVD_FPGA_YUV420_Test.rbf "
+                    "(DVD2 YUV capability bit). Legacy BGR0 cores refused.\n");
+            return 1;
+        }
+        fprintf(stderr,
+                "FPGA YUV420 MODE: planar Y/U/V copy, mailbox bit1, "
+                "FPGA BT.601. sws_scale skipped.\n"
+                "FPGA YUV420 MODE: subtitles/menu overlays disabled for experiment\n");
     }
     clock_init(&p.clock);
     navq_init(&p);
@@ -11811,6 +12005,11 @@ int main(int argc, char **argv)
                 dvd_std_name(p.dvd_std),
                 Tfr / 1000.0,
                 p.miss_total);
+        if (p.fpga_yuv420) {
+            fprintf(stderr, "yuv_copy_us:\n");
+            subperf_print_dist("yuv_copy_us", p.yuv_copy, p.yuv_copy_n,
+                               p.yuv_copy_sum, p.yuv_copy_max);
+        }
         if (p.miss_log_n) {
             unsigned i, n = p.miss_log_n;
             unsigned start = (p.miss_total > MISS_LOG_CAP) ? p.miss_log_i : 0;
@@ -11862,6 +12061,7 @@ int main(int argc, char **argv)
         free(p.phase_ack);
         free(p.phase_cyc);
     }
+    free(p.yuv_copy);
     free(p.subperf.act_blend);
     free(p.subperf.act_sws);
     free(p.subperf.act_ack);

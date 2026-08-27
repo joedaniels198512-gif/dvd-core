@@ -1,4 +1,6 @@
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/mycore.v
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/yuv601_rgb.v
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/yuv_plane_addr.v
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/fb_line_reader.v
 set_global_assignment -name SDC_FILE DVD.sdc
 set_global_assignment -name SYSTEMVERILOG_FILE DVD.sv

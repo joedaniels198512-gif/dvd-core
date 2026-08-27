@@ -169,6 +169,7 @@ pll pll
 // Mailbox at physical 0x30400000. DDRAM_ADDR is byte_addr[31:3].
 // Poll 16384 cycles of 27 MHz (~0.61 ms).
 // 0x30400000 bit0 = ARM→FPGA FB A/B request (never RMW / never FPGA-write).
+// 0x30400000 bit1 = ARM→FPGA pixel format (0=legacy BGR0, 1=planar YUV420).
 // 0x30400008       = FPGA→ARM {JOY_MAGIC, display_buf, joystick_0[30:0]}.
 // 0x30400010       = FPGA→ARM settings/capability (DVD2). Never written by ARM.
 // 0x30400018       = ARM→FPGA source-standard control (DVD3). FPGA reads only.
@@ -204,6 +205,7 @@ localparam ST_RD_CTL_W = 4'd8;
 reg        mb_rd  = 0;
 reg        mb_we  = 0;
 reg        mb_bit = 0;
+reg        mb_yuv = 0;
 reg  [3:0] mb_st  = 0;
 reg [13:0] poll_cnt = 0;
 reg        poll_due = 0;
@@ -240,7 +242,9 @@ wire       pal_eff = (tv_osd == 2'd2) ? 1'b1 :
                      (src_std == 2'd2);
 
 wire [63:0] joy_word = {JOY_MAGIC, display_buf, joystick_0[30:0]};
-wire [63:0] set_word = {SET_MAGIC, SET_VER, set_seq, tv_osd, crt_on, av_raw, 6'd0, src_std};
+// DVD2 pad bit2 = YUV420 reader capability. SET_VER stays 1 so ARM v1 probe
+// still matches. Bits [7:3] remain 0 (no collision with src_std / av_raw).
+wire [63:0] set_word = {SET_MAGIC, SET_VER, set_seq, tv_osd, crt_on, av_raw, 5'd0, 1'b1, src_std};
 
 wire [28:0] mb_addr =
 	(mb_st == ST_WR_JOY || mb_st == ST_WR_JOY_H) ? JOY_ADDR :
@@ -288,6 +292,7 @@ always @(posedge clk_sys) begin
 			end
 		ST_RD_MB_W: if (DDRAM_DOUT_READY) begin
 				mb_bit <= DDRAM_DOUT[0];
+				mb_yuv <= DDRAM_DOUT[1];
 				ctl_due <= 1'b1;
 				set_due <= 1'b1;
 				mb_st  <= ST_IDLE;
@@ -382,7 +387,9 @@ fb_line_reader fb_line_reader
 	.field(field),
 	.ce_pix(ce_pix),
 	.req_buf(mb_bit | status[8]),
+	.req_yuv(mb_yuv),
 	.display_buf(display_buf),
+	.display_yuv(),
 	.pal(pal_eff),
 	.dup_even(crt_on),
 
