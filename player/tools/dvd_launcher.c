@@ -43,7 +43,7 @@
 #define JOY_OFF         8
 #define JOY_MAGIC       0x44564431u
 #define DISP_BUF_BIT    31
-#define JOY_BTN_MASK    0x3FFu
+#define JOY_BTN_MASK    0xFFFu
 #define JOY_BIT_RIGHT   0
 #define JOY_BIT_LEFT    1
 #define JOY_BIT_DOWN    2
@@ -54,6 +54,8 @@
 #define JOY_BIT_MENU    7  /* J1[3] DVD Menu */
 #define JOY_BIT_PREV    8  /* J1[4] L */
 #define JOY_BIT_NEXT    9  /* J1[5] R */
+#define JOY_BIT_SUBTITLE   10 /* J1[6] Y — player-only, launcher just logs */
+#define JOY_BIT_AUDIO_NEXT 11 /* J1[7] Select — player-only, launcher just logs */
 
 #define CHEAT_TIMEOUT_US     3000000
 #define KUN_PERIOD_US        62500   /* 16 fps */

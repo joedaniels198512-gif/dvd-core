@@ -266,18 +266,35 @@ the new frame on raster field 0 (even / top field). This build **does not**
 change that swap boundary. Bit 3 is reserved so a later BFF fix needs no
 protocol change.
 
-### Controller (CONF_STR `v,2`)
+### Controller (CONF_STR `v,3`)
 
 Bits 0–9 unchanged. J1[0] OSD name is **Confirm** (jn/jp `A`). Physical
 Select/Minus cannot bind to Confirm after the rename; it defaults to bit 11
-via jn/jp `Select`.
+via jn/jp `Select`. Main_MiSTer's jn/jp vocabulary (`joymapping.cpp`) offers
+only `L`/`LT` and `R`/`RT` as rear triggers and both are taken by
+Previous/Next Chapter, so no free rear trigger exists for Audio Next.
 
 | Bit | Logical | jn/jp default |
 |---|---|---|
 | 4 | Confirm | A (EAST) |
-| 10 | Subtitle | Y |
+| 10 | Subtitle | Y (WEST) |
 | 11 | Audio Next | Select / Minus |
 
 OSD `O[8],Buffer,A,B` is removed. `req_buf = mb_bit` (no `status[8]` OR).
-Explicit status indices `[2:1]`, `[4:3]`, `[9]`, `[16:12]`, `[122:121]` are
-unchanged. Expected ALM cost is a few LUTs plus two flops.
+
+### OSD options (CONF_STR `v,3`)
+
+- `O[9],CRT,Native,Stabilized` — `status[9]=0` **Native** (default,
+  authentic field weave), `1` **Stabilized** (existing Duplicate Even RTL,
+  unchanged implementation).
+- `O[17:12],A/V Sync` — 41-entry circular wheel in **5 ms** steps:
+  raw 0 = `0 ms`, 1..20 = `+5..+100`, 21..40 = `-100..-5`.
+  The trim is **added** to the launcher's `--video-advance-ms 20` baseline:
+  OSD `0 ms` = internal +20 ms exactly; `+5` = +25 (video earlier);
+  `-5` = +15 (video later). MrAudio clock/ACK scheduling untouched.
+- DVD2 settings word is **SET_VER 2**: same layout as v1 except
+  `av_raw[5]` occupies previously-zero pad bit 7 (`av_raw[4:0]` stays at
+  bits 12:8). Old v1-only players fail the DVD2 probe cleanly.
+- Used status bits: `0` (reset), `[2:1]` TV Mode, `[4:3]` Noise,
+  `5`/`[7:6]`/`10` template pages, `9` CRT, `[17:12]` A/V Sync,
+  `[122:121]` aspect. `8` and `11` are free.

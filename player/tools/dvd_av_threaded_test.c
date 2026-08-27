@@ -139,7 +139,7 @@ enum {
 #define JOY_MAGIC       0x44564431u  /* "DVD1" at 0x3040000C */
 #define SET_MAGIC       0x44564432u  /* "DVD2" at 0x30400014 */
 #define CTL_MAGIC       0x44564433u  /* "DVD3" at 0x3040001C */
-#define SET_VER         1
+#define SET_VER         2            /* v2: 6-bit A/V wheel, av_raw[5] at bit7 */
 #define SET_YUV_CAP_BIT 2            /* DVD2 pad: FPGA YUV420 reader present */
 #define MB_YUV_BIT      1            /* mailbox 0x30400000: 1 = planar YUV420 */
 #define MB_INTL_BIT     2            /* mailbox bit2: frame interlaced (not DVD2) */
@@ -1305,15 +1305,23 @@ static void poke_dvd_control(const FBPair *fb, uint64_t word)
     __sync_synchronize();
 }
 
-/* Circular OSD encoding: raw 0=0ms, 1..10=+10..+100, 11..20=-100..-10. */
+/* Circular OSD encoding, 6-bit / 5 ms steps (DVD2 v2):
+ * raw 0 = 0 ms, 1..20 = +5..+100 ms, 21..40 = -100..-5 ms.
+ * Unreachable raws (41..63) decode to 0 ms. */
 static int av_sync_raw_to_ms(unsigned raw)
 {
-    raw &= 31u;
-    if (raw > 20)
+    raw &= 63u;
+    if (raw > 40)
         return 0;
-    if (raw <= 10)
-        return (int)raw * 10;
-    return ((int)raw - 21) * 10;
+    if (raw <= 20)
+        return (int)raw * 5;
+    return ((int)raw - 41) * 5;
+}
+
+/* DVD2 v2: av_raw[4:0] at bits 12:8, av_raw[5] at bit 7. */
+static unsigned av_sync_raw_from_setword(uint64_t w)
+{
+    return (unsigned)((w >> 8) & 0x1fu) | (unsigned)(((w >> 7) & 1u) << 5);
 }
 
 static int dvd_fpga_probe_v1(const FBPair *fb)
@@ -2596,8 +2604,9 @@ struct Player {
     int video_decoded, stale_dropped;
     int initial_skip_req, initial_skip_left, initial_video_skipped;
     int video_advance_ms;
-    /* OSD A/V Sync trim (ms). +N = video later vs audio; -N = video earlier.
-     * 0 ms == existing --video-advance-ms baseline. MrAudio is not touched. */
+    /* OSD A/V Sync trim (ms), added to the --video-advance-ms baseline:
+     * +N = video N ms earlier vs audio; -N = video N ms later.
+     * 0 ms == the baseline exactly. MrAudio is not touched. */
     volatile int osd_av_trim_ms;
     int fpga_v1_caps;
     int fpga_yuv420;
@@ -8632,11 +8641,12 @@ static void dvd_fpga_poll_settings(Player *p)
     w = peek_dvd_settings(p->fb);
     if ((uint32_t)(w >> 32) != SET_MAGIC)
         return;
-    raw = (unsigned)((w >> 8) & 0x1fu);
+    raw = av_sync_raw_from_setword(w);
     trim = av_sync_raw_to_ms(raw);
     if (trim != p->osd_av_trim_ms) {
         p->osd_av_trim_ms = trim;
-        fprintf(stderr, "A/V SYNC: trim %+d ms\n", trim);
+        fprintf(stderr, "A/V SYNC: %+d ms (internal advance %+d ms)\n",
+                trim, p->video_advance_ms + trim);
     }
 }
 
@@ -9749,11 +9759,12 @@ static int64_t presentation_phase_us(const Player *p)
     return (int64_t)p->initial_skip_req * T;
 }
 
-/* Temporary --video-advance-ms: buffered-YUV only. Default path is 0.
- * OSD A/V Sync trim is subtracted so:
- *   +OSD ms = present VIDEO later relative to audio
- *   -OSD ms = present VIDEO earlier relative to audio
- * OSD 0 ms is identical to the --video-advance-ms baseline (launcher: 20).
+/* --video-advance-ms: buffered-YUV only. Default path is 0.
+ * OSD A/V Sync trim is ADDED to the baseline:
+ *   effective_internal_advance_ms = video_advance_ms + osd_trim_ms
+ *   OSD  0 ms -> internal +20 ms (launcher baseline, hardware-approved)
+ *   OSD +5 ms -> internal +25 ms (video presented 5 ms EARLIER vs audio)
+ *   OSD -5 ms -> internal +15 ms (video presented 5 ms LATER vs audio)
  * MrAudio consumed bytes remain the sole media clock. */
 static int64_t video_advance_applied_us(const Player *p)
 {
@@ -9761,7 +9772,7 @@ static int64_t video_advance_applied_us(const Player *p)
 
     if (p->buffered_yuv && p->video_advance_ms > 0)
         base = (int64_t)p->video_advance_ms * 1000;
-    return base - (int64_t)p->osd_av_trim_ms * 1000;
+    return base + (int64_t)p->osd_av_trim_ms * 1000;
 }
 
 static int64_t total_presentation_phase_us(const Player *p)

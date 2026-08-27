@@ -91,24 +91,30 @@ assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
 // 0         1         2         3          4         5         6
 // 01234567890123456789012345678901 23456789012345678901234567890123
 // 0123456789ABCDEFGHIJKLMNOPQRSTUV 0123456789ABCDEFGHIJKLMNOPQRSTUV
-// X XX XX XXX      XXXXX                                  XX
+// X XX XX XXXXXXXXX                                        XX
 // 0=reset  [2:1]=TV Mode  [4:3]=Noise  5/6-7/10=template
-// 9=CRT Stabilizer  [16:12]=A/V Sync  [122:121]=AR
+// 9=CRT  [17:12]=A/V Sync  [122:121]=AR
 // status[8] is unused (legacy OSD Buffer A/B override removed).
+// status[11] is unused.
 //
 // TV Mode: 0=Auto 1=NTSC 2=PAL. Fresh default Auto (O, first item).
-// CRT Stabilizer: listed On,Off so status[9]=0 is On (MiSTer default-0).
-//   dup_even = ~status[9]. Duplicate Even RTL is unchanged.
-// A/V Sync 5-bit circular (Main_MiSTer LEFT/RIGHT wrap, mask=31):
-//   raw 0 = 0 ms, 1..10 = +10..+100, 11..20 = -100..-10
-//   RIGHT from 0 → 1 (+10). LEFT from 0 → 20 (-10).
+// CRT: listed Native,Stabilized so status[9]=0 is Native (MiSTer default-0).
+//   Native      = authentic interlaced field weave (dup_even off).
+//   Stabilized  = existing Duplicate Even anti-twitter RTL (dup_even on).
+//   Implementations are unchanged; only naming/default moved.
+// A/V Sync 6-bit circular wheel, 5 ms steps (LEFT/RIGHT wrap over the
+// 41 listed entries, exactly like the proven 21-entry 10 ms wheel):
+//   raw 0 = 0 ms, 1..20 = +5..+100, 21..40 = -100..-5
+//   RIGHT from 0 → 1 (+5). LEFT from 0 → 40 (-5).
+//   OSD 0 ms keeps the hardware-approved baseline (--video-advance-ms 20).
+//   +N presents video N ms earlier vs audio; -N presents it later.
 localparam CONF_STR = {
 	"DVD;;",
 	"-;",
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[2:1],TV Mode,Auto,NTSC,PAL;",
-	"O[9],CRT Stabilizer,On,Off;",
-	"O[16:12],A/V Sync,0 ms,+10 ms,+20 ms,+30 ms,+40 ms,+50 ms,+60 ms,+70 ms,+80 ms,+90 ms,+100 ms,-100 ms,-90 ms,-80 ms,-70 ms,-60 ms,-50 ms,-40 ms,-30 ms,-20 ms,-10 ms;",
+	"O[9],CRT,Native,Stabilized;",
+	"O[17:12],A/V Sync,0 ms,+5 ms,+10 ms,+15 ms,+20 ms,+25 ms,+30 ms,+35 ms,+40 ms,+45 ms,+50 ms,+55 ms,+60 ms,+65 ms,+70 ms,+75 ms,+80 ms,+85 ms,+90 ms,+95 ms,+100 ms,-100 ms,-95 ms,-90 ms,-85 ms,-80 ms,-75 ms,-70 ms,-65 ms,-60 ms,-55 ms,-50 ms,-45 ms,-40 ms,-35 ms,-30 ms,-25 ms,-20 ms,-15 ms,-10 ms,-5 ms;",
 	"O[4:3],Noise,White,Red,Green,Blue;",
 	"-;",
 	"P1,Test Page 1;",
@@ -134,9 +140,12 @@ localparam CONF_STR = {
 	// J1[0] is Confirm (jn/jp A). It is NOT named Select, so SYS_BTN_SELECT
 	// (Minus) cannot bind here. Audio Next's jn/jp default is Select.
 	"J1,Confirm,Back,Play/Pause,DVD Menu,Previous Chapter,Next Chapter,Subtitle,Audio Next;",
+	// Main_MiSTer jn/jp vocabulary (joymapping.cpp) has only L/LT and R/RT
+	// as rear triggers, both taken by Previous/Next Chapter, so Audio Next
+	// falls back to Select. No L2/R2 token exists in the framework.
 	"jn,A,B,Start,X,L,R,Y,Select;",
 	"jp,A,B,Start,X,L,R,Y,Select;",
-	"v,2;", // bumped: drop OSD Buffer, Confirm rename, Subtitle/Audio Next
+	"v,3;", // bumped: CRT Native/Stabilized naming + 5 ms A/V Sync wheel
 	"V,v",`BUILD_DATE 
 };
 
@@ -198,7 +207,7 @@ localparam [13:0] POLL_MAX   = 14'd16383;
 localparam [31:0] JOY_MAGIC  = 32'h44564431;  // "DVD1"
 localparam [31:0] SET_MAGIC  = 32'h44564432;  // "DVD2"
 localparam [31:0] CTL_MAGIC  = 32'h44564433;  // "DVD3"
-localparam [7:0]  SET_VER    = 8'd1;
+localparam [7:0]  SET_VER    = 8'd2; // v2: 6-bit A/V wheel (bit7 = av_raw[5])
 localparam [9:0]  JOY_HB_MAX = 10'd1023;      // heartbeat ~0.62 s at 27 MHz
 
 localparam ST_IDLE     = 4'd0;
@@ -243,20 +252,25 @@ wire        mb_allow_vid = (mb_st == ST_IDLE) && !poll_due && !ctl_due &&
                            !set_due && !joy_pending;
 
 // OSD TV Mode status[2:1]: 0 Auto, 1 NTSC, 2 PAL.
-// CRT: CONF_STR On,Off so status[9]==0 is On; invert for existing dup_even.
+// CRT: CONF_STR Native,Stabilized so status[9]==0 is Native (dup_even off)
+// and status[9]==1 is Stabilized (existing Duplicate Even RTL, unchanged).
 // Auto + UNKNOWN/NTSC → NTSC (launcher-safe). Auto + PAL → PAL.
-wire [1:0] tv_osd = status[2:1];
-wire       crt_on = ~status[9];
-wire [4:0] av_raw = status[16:12];
+wire [1:0] tv_osd   = status[2:1];
+wire       crt_stab = status[9];
+wire [5:0] av_raw   = status[17:12];
 wire       pal_eff = (tv_osd == 2'd2) ? 1'b1 :
                      (tv_osd == 2'd1) ? 1'b0 :
                      (src_std == 2'd2);
 
 wire [63:0] joy_word = {JOY_MAGIC, display_buf, joystick_0[30:0]};
-// DVD2 pad bit2 = YUV420 reader capability (this SET word, not the mailbox).
-// Mailbox 0x30400000 bit2 is frame interlaced_frame — different address.
-// SET_VER stays 1 so ARM v1 probe still matches. Bits [7:3] remain 0.
-wire [63:0] set_word = {SET_MAGIC, SET_VER, set_seq, tv_osd, crt_on, av_raw, 5'd0, 1'b1, src_std};
+// DVD2 v2 layout (SET_VER=2). Field positions match v1 except av_raw grew
+// from 5 to 6 bits: the extra MSB av_raw[5] sits in previously-zero pad
+// bit7. Bit2 = YUV420 reader capability (this SET word, not the mailbox;
+// mailbox 0x30400000 bit2 is frame interlaced_frame — different address).
+//   [63:32] SET_MAGIC   [31:24] SET_VER=2   [23:16] set_seq
+//   [15:14] tv_osd      [13] crt_stab       [12:8] av_raw[4:0]
+//   [7] av_raw[5]       [6:3] 0             [2] yuv_cap=1   [1:0] src_std
+wire [63:0] set_word = {SET_MAGIC, SET_VER, set_seq, tv_osd, crt_stab, av_raw[4:0], av_raw[5], 4'd0, 1'b1, src_std};
 
 wire [28:0] mb_addr =
 	(mb_st == ST_WR_JOY || mb_st == ST_WR_JOY_H) ? JOY_ADDR :
@@ -409,7 +423,7 @@ fb_line_reader fb_line_reader
 	.display_intl(),
 	.display_tff(),
 	.pal(pal_eff),
-	.dup_even(crt_on),
+	.dup_even(crt_stab),
 
 	.mb_idle(mb_allow_vid),
 	.vid_req(vid_req),

@@ -29,17 +29,19 @@ jobs:
         run: |
           docker run --rm -v "$GITHUB_WORKSPACE/fpga:/build" -w /build \
             raetro/quartus:17.0 \
-            sh -c 'quartus_sh --flow compile DVD.qpf && cp -f output_files/DVD.rbf output_files/DVD_FPGA_YUV420_Test.rbf'
-          # output_files/ is root-owned by the container. Copy the test RBF
-          # into the runner-owned workspace so artifact upload cannot fail
-          # with "Permission denied" on a second write into that directory.
-          cp -f fpga/output_files/DVD.rbf "$GITHUB_WORKSPACE/DVD_FPGA_YUV420_Test.rbf"
+            sh -c 'quartus_sh --flow compile DVD.qpf'
+          # output_files/ is root-owned by the container. Copy the candidate
+          # RBF into the runner-owned workspace so artifact upload cannot
+          # fail with "Permission denied" writing into that directory.
+          # RC1 candidate name: never reuse DVD_FPGA_YUV420_Test.rbf here so
+          # the known-good public RBF cannot be overwritten by CI artifacts.
+          cp -f fpga/output_files/DVD.rbf "$GITHUB_WORKSPACE/DVD_FPGA_YUV420_Production_RC1.rbf"
 
-      - name: Upload DVD_FPGA_YUV420_Test.rbf
+      - name: Upload DVD_FPGA_YUV420_Production_RC1.rbf
         uses: actions/upload-artifact@v4
         with:
-          name: DVD_FPGA_YUV420_Test.rbf
-          path: DVD_FPGA_YUV420_Test.rbf
+          name: DVD_FPGA_YUV420_Production_RC1.rbf
+          path: DVD_FPGA_YUV420_Production_RC1.rbf
           if-no-files-found: error
 
       - name: Upload DVD.rbf

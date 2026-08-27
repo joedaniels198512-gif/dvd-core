@@ -43,6 +43,14 @@ run_tb() {
   fi
 }
 
+if python3 "$HERE/check_static.py"; then
+  echo "PASS check_static"
+  PASS=$((PASS+1))
+else
+  echo "FAIL check_static"
+  FAIL=$((FAIL+1))
+fi
+
 run_tb yuv601_tb "$HERE/yuv601_tb.v" "$RTL/yuv601_rgb.v"
 run_tb yuv_chroma_row_tb "$HERE/yuv_chroma_row_tb.v" "$RTL/yuv_chroma_row.v"
 run_tb yuv_plane_addr_tb "$HERE/yuv_plane_addr_tb.v" \
