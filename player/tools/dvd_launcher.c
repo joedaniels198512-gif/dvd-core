@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -88,6 +89,17 @@ enum {
 #define LIB_VIS         7
 #define LAUNCHER_PID_FILE "/tmp/dvd_launcher.pid"
 
+enum {
+    MODE_LAUNCHER_ACTIVE = 0,
+    MODE_PLAYER_ACTIVE
+};
+
+static volatile sig_atomic_t g_stop = 0;
+static pid_t g_child = 0;
+static int g_launcher_mode = MODE_LAUNCHER_ACTIVE;
+static int g_pid_fd = -1;
+static uint32_t g_last_input_bits = 0xffffffffu;
+
 #define COL_BG          0x00000000u
 #define COL_TEXT        0x00E0E0E0u
 #define COL_DIM         0x00909090u
@@ -122,9 +134,6 @@ typedef struct {
     int64_t dir_held_us[2];
     int64_t dir_last_us[2];
 } Pad;
-
-static volatile sig_atomic_t g_stop = 0;
-static pid_t g_child = 0;
 
 typedef struct {
     int enabled;
@@ -295,18 +304,131 @@ static void on_signal(int sig)
         kill(g_child, SIGTERM);
 }
 
-static void write_launcher_pid(void)
-{
-    FILE *f = fopen(LAUNCHER_PID_FILE, "w");
+static int read_buttons(const FBPair *fb, uint32_t *out);
 
-    if (!f)
+static const char *launcher_mode_name(int mode)
+{
+    return mode == MODE_PLAYER_ACTIVE ? "PLAYER_ACTIVE" : "LAUNCHER_ACTIVE";
+}
+
+static void set_launcher_mode(int mode, const char *why)
+{
+    g_launcher_mode = mode;
+    fprintf(stderr, "launcher_mode=%s%s%s\n",
+            launcher_mode_name(mode),
+            (why && why[0]) ? " why=" : "",
+            (why && why[0]) ? why : "");
+}
+
+static void log_launcher_input(uint32_t bits)
+{
+    if (bits == g_last_input_bits)
         return;
-    fprintf(f, "%ld\n", (long)getpid());
-    fclose(f);
+    g_last_input_bits = bits;
+    fprintf(stderr, "LAUNCHER INPUT raw=0x%03x launcher_mode=%s\n",
+            bits & JOY_BTN_MASK, launcher_mode_name(g_launcher_mode));
+}
+
+static void log_launcher_action(const char *action)
+{
+    fprintf(stderr, "LAUNCHER ACTION %s launcher_mode=%s\n",
+            action ? action : "?", launcher_mode_name(g_launcher_mode));
+}
+
+static int wait_controller_neutral(const FBPair *fb)
+{
+    uint32_t bits = 0;
+    int64_t t0 = now_us();
+
+    while (!g_stop) {
+        bits = 0;
+        if (read_buttons(fb, &bits) != 0 || bits == 0)
+            break;
+        if (now_us() - t0 > 5000000)
+            break;
+        usleep(CTRL_POLL_US);
+    }
+    fprintf(stderr, "controller neutral raw=0x%03x\n", bits & JOY_BTN_MASK);
+    return 0;
+}
+
+static int cmdline_is_player(pid_t pid)
+{
+    char path[64];
+    char buf[256];
+    int fd, n;
+
+    if (pid <= 0)
+        return 0;
+    snprintf(path, sizeof(path), "/proc/%ld/cmdline", (long)pid);
+    fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return 0;
+    n = (int)read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return 0;
+    buf[n] = 0;
+    return strstr(buf, "dvd_av_threaded_test") != NULL;
+}
+
+static int player_process_running(void)
+{
+    DIR *d;
+    struct dirent *e;
+    int found = 0;
+
+    d = opendir("/proc");
+    if (!d)
+        return 0;
+    while ((e = readdir(d)) != NULL) {
+        pid_t pid;
+        char *end = NULL;
+
+        if (e->d_name[0] < '1' || e->d_name[0] > '9')
+            continue;
+        pid = (pid_t)strtol(e->d_name, &end, 10);
+        if (!end || *end || pid <= 0 || pid == getpid())
+            continue;
+        if (cmdline_is_player(pid)) {
+            found = 1;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+static int claim_launcher_singleton(void)
+{
+    char buf[32];
+    int n;
+
+    g_pid_fd = open(LAUNCHER_PID_FILE, O_RDWR | O_CREAT, 0644);
+    if (g_pid_fd < 0) {
+        fprintf(stderr, "LAUNCHER: pid file open failed: %s\n", strerror(errno));
+        return -1;
+    }
+    if (flock(g_pid_fd, LOCK_EX | LOCK_NB) < 0) {
+        fprintf(stderr, "LAUNCHER: another instance is running — exit\n");
+        close(g_pid_fd);
+        g_pid_fd = -1;
+        return -1;
+    }
+    (void)ftruncate(g_pid_fd, 0);
+    n = snprintf(buf, sizeof(buf), "%ld\n", (long)getpid());
+    if (n > 0)
+        (void)write(g_pid_fd, buf, (size_t)n);
+    return 0;
 }
 
 static void clear_launcher_pid(void)
 {
+    if (g_pid_fd >= 0) {
+        flock(g_pid_fd, LOCK_UN);
+        close(g_pid_fd);
+        g_pid_fd = -1;
+    }
     unlink(LAUNCHER_PID_FILE);
 }
 
@@ -1576,20 +1698,31 @@ static int disc_present(void)
     return 1;
 }
 
-static int run_player(const char *player, const char *source)
+static int run_player(FBPair *fb, Pad *pad, const char *player, const char *source)
 {
     pid_t pid;
     int status = 0;
+    uint32_t bits = 0;
 
     fprintf(stderr, "LAUNCHER: starting %s\n", source);
+    fprintf(stderr,
+            "LAUNCHER ARGV dvd_av_threaded_test %s "
+            "--buffered-yuv-video --fpga-yuv420 --fpga-yuv420-subtitles "
+            "--initial-video-skip 1 --video-advance-ms 20 --authored-start\n",
+            source);
+    fprintf(stderr, "PLAYER START\n");
+    set_launcher_mode(MODE_PLAYER_ACTIVE, "start player");
     pid = fork();
     if (pid < 0) {
         fprintf(stderr, "LAUNCHER: fork failed: %s\n", strerror(errno));
+        set_launcher_mode(MODE_LAUNCHER_ACTIVE, "fork failed");
         return -1;
     }
     if (pid == 0) {
         execl(player, "dvd_av_threaded_test", source,
               "--buffered-yuv-video",
+              "--fpga-yuv420",
+              "--fpga-yuv420-subtitles",
               "--initial-video-skip", "1",
               "--video-advance-ms", "20",
               "--authored-start",
@@ -1598,13 +1731,42 @@ static int run_player(const char *player, const char *source)
         _exit(127);
     }
     g_child = pid;
-    while (waitpid(pid, &status, 0) < 0) {
-        if (errno != EINTR) {
+    /*
+     * Do not run launcher UI/actions while the child plays. Both processes
+     * read FPGA joystick at 0x30400008 independently; launcher must not
+     * write mailbox A/B or treat Confirm as a launcher selection.
+     */
+    for (;;) {
+        pid_t w = waitpid(pid, &status, WNOHANG);
+
+        if (w == pid)
+            break;
+        if (w < 0) {
+            if (errno == EINTR)
+                continue;
             g_child = 0;
+            fprintf(stderr, "PLAYER EXIT\n");
+            wait_controller_neutral(fb);
+            if (pad)
+                pad->primed = 0;
+            set_launcher_mode(MODE_LAUNCHER_ACTIVE, "waitpid error");
             return -1;
         }
+        bits = 0;
+        if (read_buttons(fb, &bits) == 0)
+            log_launcher_input(bits);
+        usleep(CTRL_POLL_US);
+        if (g_stop)
+            break;
     }
     g_child = 0;
+    fprintf(stderr, "PLAYER EXIT\n");
+    wait_controller_neutral(fb);
+    if (pad)
+        pad->primed = 0;
+    set_launcher_mode(MODE_LAUNCHER_ACTIVE, "player exited");
+    if (g_stop)
+        return -1;
     if (WIFEXITED(status)) {
         fprintf(stderr, "LAUNCHER: player exited (%d)\n", WEXITSTATUS(status));
         return WEXITSTATUS(status);
@@ -1653,17 +1815,44 @@ int main(int argc, char **argv)
         rip_helper[0] = 0;
     if (map_fb(&fb) < 0)
         return 1;
-    write_launcher_pid();
+    if (claim_launcher_singleton() < 0)
+        return 1;
     kun_init();
 
     fprintf(stderr, "MiSTer DVD Player %s\n", DVD_PLAYER_VERSION);
+    set_launcher_mode(MODE_LAUNCHER_ACTIVE, "startup");
 
     while (!g_stop) {
         uint32_t bits = 0;
         int act = ACT_NONE;
         int64_t t = now_us();
 
-        if (dirty) {
+        /*
+         * A player started outside this process (SSH hardware test) still
+         * shares FPGA joystick + mailbox. Become inert until it exits.
+         */
+        if (g_launcher_mode == MODE_LAUNCHER_ACTIVE && g_child == 0 &&
+            player_process_running()) {
+            fprintf(stderr, "PLAYER START\n");
+            set_launcher_mode(MODE_PLAYER_ACTIVE, "detected player process");
+        }
+        if (g_launcher_mode == MODE_PLAYER_ACTIVE && g_child == 0) {
+            bits = 0;
+            if (read_buttons(&fb, &bits) == 0)
+                log_launcher_input(bits);
+            if (!player_process_running()) {
+                fprintf(stderr, "PLAYER EXIT\n");
+                wait_controller_neutral(&fb);
+                pad.primed = 0;
+                set_launcher_mode(MODE_LAUNCHER_ACTIVE, "foreign player exited");
+                dirty = 1;
+            } else {
+                usleep(CTRL_POLL_US);
+                continue;
+            }
+        }
+
+        if (dirty && g_launcher_mode == MODE_LAUNCHER_ACTIVE) {
             if (screen == SCR_MAIN) {
                 present_main_full(&fb, main_sel);
                 if (g_kun.enabled)
@@ -1691,14 +1880,23 @@ int main(int argc, char **argv)
         }
 
         if (read_buttons(&fb, &bits) == 0) {
-            if (screen == SCR_MAIN && cheat_poll(&pad, bits, t))
-                dirty = 1;
-            if (screen != SCR_MAIN)
-                cheat_reset();
-            act = pad_poll(&pad, bits, t);
+            log_launcher_input(bits);
+            if (g_launcher_mode == MODE_LAUNCHER_ACTIVE) {
+                if (screen == SCR_MAIN && cheat_poll(&pad, bits, t))
+                    dirty = 1;
+                if (screen != SCR_MAIN)
+                    cheat_reset();
+                act = pad_poll(&pad, bits, t);
+                if (act != ACT_NONE)
+                    log_launcher_action(act == ACT_UP ? "UP" :
+                                        act == ACT_DOWN ? "DOWN" :
+                                        act == ACT_CONFIRM ? "CONFIRM" :
+                                        act == ACT_CANCEL ? "CANCEL" : "?");
+            }
         }
 
-        if (screen == SCR_MAIN && g_kun.enabled) {
+        if (screen == SCR_MAIN && g_kun.enabled &&
+            g_launcher_mode == MODE_LAUNCHER_ACTIVE) {
             if (!g_kun.last_us)
                 g_kun.last_us = t;
             if (t - g_kun.last_us >= KUN_PERIOD_US) {
@@ -1735,7 +1933,7 @@ int main(int argc, char **argv)
             }
         }
 
-        if (screen == SCR_MAIN) {
+        if (g_launcher_mode == MODE_LAUNCHER_ACTIVE && screen == SCR_MAIN) {
             if (act == ACT_UP && main_sel > 0) {
                 main_sel--;
                 dirty = 1;
@@ -1746,6 +1944,7 @@ int main(int argc, char **argv)
                 if (main_sel == 0) {
                     int rc;
                     fprintf(stderr, "LAUNCHER: Play Physical DVD\n");
+                    log_launcher_action("CONFIRM Play Physical DVD");
                     if (!disc_present()) {
                         err_title = "Unable to read DVD";
                         err_msg = "No disc in drive";
@@ -1754,7 +1953,7 @@ int main(int argc, char **argv)
                         pad.primed = 0;
                         dirty = 1;
                     } else {
-                        rc = run_player(player, SR0_PATH);
+                        rc = run_player(&fb, &pad, player, SR0_PATH);
                         pad.primed = 0;
                         if (g_stop)
                             break;
@@ -1828,7 +2027,8 @@ int main(int argc, char **argv)
                 } else {
                     fprintf(stderr, "LAUNCHER: DVD Library play %s\n",
                             library[lib_sel].path);
-                    rc = run_player(player, library[lib_sel].path);
+                    log_launcher_action("CONFIRM DVD Library play");
+                    rc = run_player(&fb, &pad, player, library[lib_sel].path);
                     pad.primed = 0;
                     if (g_stop)
                         break;
