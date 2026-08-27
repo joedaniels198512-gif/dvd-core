@@ -268,6 +268,31 @@ check(re.search(r"mb_allow_vid\s*=", sv) is not None and
 check(re.search(r"assign HDMI_BOB_DEINT = 1;", sv) is not None,
       "HDMI Bob (HDMI_BOB_DEINT=1) present")
 
+# ------------------------------------------------- Quartus file coverage
+# Every module defined under rtl/ that is instantiated by DVD.sv or by
+# another rtl/ file must be listed in DVD.qip or files.qip, otherwise
+# quartus_map fails with "instantiates undefined entity".
+rtl_dir = os.path.join(HERE, "..", "rtl")
+qip = read(os.path.join(HERE, "..", "DVD.qip")) + \
+      read(os.path.join(HERE, "..", "files.qip"))
+# IP blocks ship their own .qip next to their sources (e.g. rtl/pll.qip);
+# treat files referenced there as covered too.
+for fn in os.listdir(rtl_dir):
+    if fn.endswith(".qip"):
+        qip += read(os.path.join(rtl_dir, fn))
+rtl_srcs = {}
+for fn in sorted(os.listdir(rtl_dir)):
+    if fn.endswith((".v", ".sv")):
+        rtl_srcs[fn] = read(os.path.join(rtl_dir, fn))
+all_src = sv + "".join(rtl_srcs.values())
+for fn, txt in rtl_srcs.items():
+    for mod in re.findall(r"^\s*module\s+(\w+)", txt, re.M):
+        if re.search(r"^\s*%s\s+\w+\s*$|^\s*%s\s+\w+\s*\(|\b%s\s+u_\w+" %
+                     (mod, mod, mod), all_src, re.M) or \
+           re.search(r"\b%s\b\s+\w+\s*\(" % mod, all_src.replace(txt, "")):
+            check(("rtl/" + fn) in qip or fn in qip,
+                  "rtl/%s (module %s) listed in a .qip" % (fn, mod))
+
 print()
 if fails:
     print("check_static FAIL (%d)" % len(fails))
