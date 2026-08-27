@@ -4,12 +4,13 @@
 #
 # Starts once at boot from /media/fat/linux/user-startup.sh.
 # Watches /tmp/CORENAME (MiSTer writes the FPGA CONF_STR name there).
-# When the DVD core is loaded, starts dvd_launcher.
+# When the DVD-Player core is loaded, starts dvd_launcher.
 # When any other core is loaded, SIGTERM dvd_launcher (which SIGTERMs the
 # player child if it is running).
 #
-# Internal FPGA name is "DVD" (CONF_STR "DVD;;"). Renaming the RBF to
-# MiSTer_DVD_Player.rbf does NOT change /tmp/CORENAME.
+# Internal FPGA name is "DVD-Player" (CONF_STR "DVD-Player;;"). Renaming the
+# RBF to MiSTer_DVD_Player.rbf does NOT change /tmp/CORENAME. Generic "DVD"
+# is a different core and is not matched.
 #
 # BusyBox-safe: no pgrep/pkill. PID files + kill -0 + /proc/PID/cmdline.
 #
@@ -88,14 +89,11 @@ clear_stale_pidfile() {
     rm -f "$_file"
 }
 
-name_is_dvd() {
+name_is_dvd_player() {
     _n=$(echo "$1" | tr 'A-Z' 'a-z')
     _n=${_n%.rbf}
     _n=${_n##*/}
-    case "$_n" in
-        dvd|dvd_*|mister_dvd_player*) return 0 ;;
-    esac
-    return 1
+    [ "$_n" = "dvd-player" ]
 }
 
 dvd_core_active() {
@@ -103,10 +101,10 @@ dvd_core_active() {
     _rbf=""
     [ -f /tmp/CORENAME ] && _core=$(trim /tmp/CORENAME)
     [ -f /tmp/RBFNAME ] && _rbf=$(trim /tmp/RBFNAME)
-    if name_is_dvd "$_core"; then
+    if name_is_dvd_player "$_core"; then
         return 0
     fi
-    if name_is_dvd "$_rbf"; then
+    if name_is_dvd_player "$_rbf"; then
         return 0
     fi
     return 1
@@ -255,7 +253,7 @@ while true; do
 
     if dvd_core_active; then
         if [ "$in_dvd" = "0" ]; then
-            log "core entered DVD"
+            log "core entered DVD-Player"
             in_dvd=1
             halt_respawn=0
             fail_count=0
@@ -289,7 +287,7 @@ while true; do
         fi
     else
         if [ "$in_dvd" = "1" ]; then
-            log "core left DVD"
+            log "core left DVD-Player"
             in_dvd=0
             halt_respawn=0
             fail_count=0

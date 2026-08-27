@@ -108,8 +108,11 @@ assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
 //   RIGHT from 0 → 1 (+5). LEFT from 0 → 40 (-5).
 //   OSD 0 ms keeps the hardware-approved baseline (--video-advance-ms 20).
 //   +N presents video N ms earlier vs audio; -N presents it later.
+// Canonical core identity. Field 0 becomes orig_name and default core_name
+// (/tmp/CORENAME, /tmp/RBFNAME, MiSTer.ini [DVD-Player], games/DVD-Player).
+// Must not be generic "DVD" — that name is already used by another core.
 localparam CONF_STR = {
-	"DVD;;",
+	"DVD-Player;;",
 	"-;",
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[2:1],TV Mode,Auto,NTSC,PAL;",

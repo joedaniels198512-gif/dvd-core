@@ -1,0 +1,4 @@
+0a8fb44ccec6d69c8b7f158abd5fe8065ab2bf4f
+minimig: resolve the CD32/CDTV/A500/A600/A1200 quick-start ROMs through HomeDir() (#1292)
+Kasper Olesen <kaspersolesen@gmail.com>
+2026-08-23T22:53:38+01:00

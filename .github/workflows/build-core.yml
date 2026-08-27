@@ -33,15 +33,16 @@ jobs:
           # output_files/ is root-owned by the container. Copy the candidate
           # RBF into the runner-owned workspace so artifact upload cannot
           # fail with "Permission denied" writing into that directory.
-          # RC1 candidate name: never reuse DVD_FPGA_YUV420_Test.rbf here so
-          # the known-good public RBF cannot be overwritten by CI artifacts.
-          cp -f fpga/output_files/DVD.rbf "$GITHUB_WORKSPACE/DVD_FPGA_YUV420_Production_RC1.rbf"
+          # Experimental custom-Main identity bitstream.
+          # Never reuse DVD_FPGA_YUV420_Test.rbf (known-good public) or
+          # DVD_FPGA_YUV420_Production_RC1.rbf (strong pre-Main candidate).
+          cp -f fpga/output_files/DVD.rbf "$GITHUB_WORKSPACE/DVD_FPGA_YUV420_DVDPlayer_Main.rbf"
 
-      - name: Upload DVD_FPGA_YUV420_Production_RC1.rbf
+      - name: Upload DVD_FPGA_YUV420_DVDPlayer_Main.rbf
         uses: actions/upload-artifact@v4
         with:
-          name: DVD_FPGA_YUV420_Production_RC1.rbf
-          path: DVD_FPGA_YUV420_Production_RC1.rbf
+          name: DVD_FPGA_YUV420_DVDPlayer_Main.rbf
+          path: DVD_FPGA_YUV420_DVDPlayer_Main.rbf
           if-no-files-found: error
 
       - name: Upload DVD.rbf

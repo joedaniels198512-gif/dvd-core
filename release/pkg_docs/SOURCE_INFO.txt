@@ -1,0 +1,68 @@
+MiSTer DVD Player 0.1.0-private-beta — SOURCE_INFO
+==================================================
+
+This ZIP redistributes third-party binaries. Corresponding source and
+licence texts are in SOURCES/ and LICENSES/.
+
+Our ARM/FPGA source remains in the project repository. A snapshot of the
+ARM files used to build the player, launcher, rip helper, autostart
+daemon source, and custom Main overlay is in:
+
+    SOURCES/mister-dvd-player-arm/
+
+No modifications were made to the upstream tarballs listed below.
+FFmpeg is built from stock 6.0.1 with the configure flags in
+player/build_mac.sh (also copied into the ARM snapshot).
+
+
+Component              Version        Licence        Origin
+------------------------------------------------------------------------------
+dvdbackup              0.4.2          GPL-3+         Debian armhf binary
+                                                     source: dvdbackup-0.4.2
+genisoimage (cdrkit)   1.1.11         GPL-2          Debian bullseye armhf
+                                                     source: cdrkit 1.1.11
+libdvdread             6.1.1 (so.8)   GPL-2+ /       VideoLAN / Debian
+                                       LGPL-2.1+
+libdvdnav              6.1.0 (so.4)   GPL-2+         VideoLAN / Debian
+libdvdcss              1.4.2 (so.2)   GPL-2          VideoLAN
+FFmpeg                 6.0.1          LGPL-2.1+      ffmpeg.org
+                                                     statically linked into
+                                                     dvd_av_threaded_test
+                                                     (--disable-everything,
+                                                     MPEG-PS / MPEG-2 / AC3
+                                                     etc.; no --enable-gpl)
+libmagic (file)        5.39           BSD-style      Debian bullseye armhf
+zlib                   1.2.11         zlib           Debian
+bzip2                  1.0.8          BSD-style      Debian
+
+Our tools (not upstream):
+    dvd_launcher, dvd_rip_iso, dvd_av_threaded_test, dvd_autostart_daemon.sh
+    MiSTer_DVD (Main_MiSTer overlay; dvd_main.cpp supervisor)
+    Built with arm-unknown-linux-gnueabihf-gcc, -mcpu=cortex-a9,
+    -mfpu=neon-vfpv3. See the ARM snapshot and build_*.sh scripts.
+
+Custom Main is a snapshot of MiSTer-devel/Main_MiSTer at
+    0a8fb44ccec6d69c8b7f158abd5fe8065ab2bf4f
+plus isolated DVD launcher supervision. It is installed as
+/media/fat/MiSTer_DVD and selected with [DVD-Player] main=MiSTer_DVD.
+Stock /media/fat/MiSTer is not replaced. The autostart daemon source is
+preserved but is not started by new installs.
+
+FPGA bitstream:
+    DVD_V1_OSD_Test.rbf renamed MiSTer_DVD_Player.rbf
+    SHA-256 55e6b114bc34fe1d314ad7ec94e1944627968d44c42e947d13caba23470576ae
+    Not rebuilt for this package. Source is in the project repository
+    (not required for the GPL components above).
+
+
+Exact download locations used when archives are present under SOURCES/:
+
+    https://ffmpeg.org/releases/ffmpeg-6.0.1.tar.xz
+    https://download.videolan.org/pub/videolan/libdvdread/6.1.1/libdvdread-6.1.1.tar.bz2
+    https://download.videolan.org/pub/videolan/libdvdnav/6.1.0/libdvdnav-6.1.0.tar.bz2
+    https://download.videolan.org/pub/libdvdcss/1.4.2/libdvdcss-1.4.2.tar.bz2
+    https://sourceforge.net/projects/dvdbackup/files/dvdbackup/dvdbackup-0.4.2/dvdbackup-0.4.2.tar.gz
+    http://deb.debian.org/debian/pool/main/c/cdrkit/cdrkit_1.1.11.orig.tar.gz
+    https://github.com/file/file/archive/refs/tags/FILE5_39.tar.gz
+    https://zlib.net/fossils/zlib-1.2.11.tar.gz
+    https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz

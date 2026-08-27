@@ -1,0 +1,69 @@
+MiSTer_DVD — first custom Main integration — hardware test checklist
+====================================================================
+
+Upstream Main_MiSTer commit:
+    0a8fb44ccec6d69c8b7f158abd5fe8065ab2bf4f
+
+Do not replace /media/fat/MiSTer. Install MiSTer_DVD beside it.
+Do not start a new package zip / tag / push for this checklist.
+Identity test requires an FPGA bitstream built after CONF_STR "DVD-Player;;"
+(Quartus not run as part of this naming change).
+
+
+INSTALL
+-------
+[ ] Copy MiSTer_DVD to /media/fat/MiSTer_DVD (installer or scp)
+[ ] Scripts -> Install MiSTer DVD Player
+[ ] Stock /media/fat/MiSTer is still present and is not identical to MiSTer_DVD
+[ ] MiSTer.ini contains marked [DVD-Player] main=MiSTer_DVD
+[ ] Unrelated MiSTer.ini sections are unchanged (including any third-party [DVD])
+[ ] Marked user-startup daemon block is gone (other user-startup lines remain)
+[ ] dvd_autostart_daemon is not running
+[ ] Daemon script still exists at /media/fat/DVD/bin/dvd_autostart_daemon.sh
+[ ] /media/fat/games/DVD-Player exists
+[ ] Re-running the installer does not duplicate the INI or startup blocks
+[ ] A hand-written [DVD-Player] main=OtherBinary is refused (do this on a spare INI copy)
+
+
+LAUNCH / SUPERVISION
+--------------------
+[ ] Selecting MiSTer DVD Player switches to MiSTer_DVD (log: restarting to .../MiSTer_DVD)
+[ ] /tmp/CORENAME is DVD-Player
+[ ] /tmp/RBFNAME is DVD-Player (not generic DVD)
+[ ] dvd_launcher starts once (ps / /tmp/dvd_launcher.pid contains a live PID)
+[ ] LD_LIBRARY_PATH includes /media/fat/DVD/lib (check /proc/<pid>/environ)
+[ ] launcher.log rotated to launcher.previous.log on a new DVD session
+[ ] Launcher UI appears (no second launcher)
+[ ] Playback still works (physical disc and/or ISO) — engine unchanged
+
+
+NO DUPLICATE / ORPHAN
+---------------------
+[ ] Kill -9 MiSTer_DVD while launcher is running (or simulate crash)
+[ ] Restart DVD-Player core: exactly one launcher; the orphan is adopted, not duplicated
+[ ] /tmp/dvd_launcher.pid matches the live launcher PID
+[ ] A stale pidfile with a dead PID does not block a new start
+
+
+LEAVE / RESTART / REBOOT
+------------------------
+[ ] Load menu or another core: launcher and player are gone before the new Main runs
+[ ] OSD reboot from DVD: launcher/player do not survive
+[ ] Cold reboot: launcher/player do not survive
+[ ] Returning to DVD starts a single launcher again
+[ ] launcher.log is rotated on that new session (previous session kept)
+
+
+RESPAWN POLICY
+--------------
+[ ] Kill dvd_launcher once while DVD is loaded: it restarts
+[ ] Crash-loop it 3+ times within 5 seconds: respawn halts (DVD_MAIN log)
+[ ] Leaving and re-entering DVD clears the halt and starts again
+
+
+NEGATIVE
+--------
+[ ] Menu core on stock Main does not start dvd_launcher
+[ ] Loading a third-party core whose CONF_STR is DVD does not start our launcher
+[ ] No VFPv4 / SIGILL on MiSTer_DVD
+[ ] FPGA core and ARM playback engine behaviour unchanged vs previous beta

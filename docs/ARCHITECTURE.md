@@ -30,6 +30,15 @@ measurement changes the plan.
   final binary and **refuses to deploy** if any `vfma/vfms/vfnma/vfnms`
   instruction is present.
 
+### Core identity
+
+Canonical CONF_STR name is **`DVD-Player`** (not generic `DVD`, which is
+already used by another MiSTer core). That field is `orig_name` and the
+default `core_name`, so `/tmp/CORENAME`, `/tmp/RBFNAME`, MiSTer.ini
+`[DVD-Player]`, and `HomeDir()` → `/media/fat/games/DVD-Player` all follow
+it. The RBF filename (`MiSTer_DVD_Player.rbf`) and custom Main binary
+(`MiSTer_DVD`) are separate labels.
+
 ---
 
 ## 2. What is already proven

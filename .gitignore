@@ -18,6 +18,11 @@
 *.swp
 *.swo
 
+# --- Custom Main: upstream snapshot + build output ---
+main-dvd/.src/
+main-dvd/bin/
+main-dvd/build.log
+
 # --- Player: build artifacts (regenerable via player/build_mac.sh) ---
 # The FFmpeg source tree + statically built VFPv3-safe libs live here.
 # They are large and reproducible, so they are not tracked.

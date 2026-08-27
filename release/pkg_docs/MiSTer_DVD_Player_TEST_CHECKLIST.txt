@@ -1,0 +1,133 @@
+MiSTer DVD Player — Private Beta Test Checklist
+Version 0.1.0-private-beta
+
+
+YOUR SETUP
+==========
+
+Hardware (SS1 / MiSTer type):     ________________________________
+Display:  HDMI / CRT / both:      ________________________________
+Optical drive / dock:             ________________________________
+DVD title:                        ________________________________
+PAL or NTSC (if known):           ________________________________
+Physical DVD or ISO:              ________________________________
+Single or dual layer (if known):  ________________________________
+
+
+INSTALL
+=======
+
+[ ] Installer succeeds
+[ ] /media/fat/MiSTer_DVD is present; stock /media/fat/MiSTer is unchanged
+[ ] MiSTer.ini has [DVD-Player] main=MiSTer_DVD (and no duplicate daemon block)
+[ ] /media/fat/games/DVD-Player exists
+[ ] MiSTer DVD Player appears on the front page
+[ ] Launcher starts automatically when the core is selected
+[ ] Leaving the DVD core / reboot stops launcher and player
+[ ] Re-entering DVD does not start a second launcher
+[ ] Branding shows: MiSTer DVD Player / by Mojojojo198512
+[ ] Footer shows: Beta 0.1.0
+[ ] Instruction shows: To exit DVD, hold BACK for 3 seconds
+
+
+PHYSICAL DVD
+============
+
+[ ] Disc starts
+[ ] Video
+[ ] Audio
+[ ] Pause / resume
+[ ] Chapters (Previous / Next)
+[ ] Hold BACK 3 seconds returns to launcher
+
+
+MENUS
+=====
+
+[ ] Main menu
+[ ] Animated menu
+[ ] Still menu
+[ ] Scene selection
+[ ] Menu highlights / icons
+[ ] Extras
+
+
+AUDIO
+=====
+
+[ ] Authored audio menu
+[ ] PREVIOUS + NEXT together = Audio Next
+[ ] Multiple tracks / commentary
+[ ] Audio remains in sync after a track change
+
+WEST / Y is NOT Audio Next in this beta.
+
+
+VIDEO / OSD
+===========
+
+[ ] TV Mode Auto
+[ ] TV Mode NTSC
+[ ] TV Mode PAL
+[ ] CRT Stabilizer Off
+[ ] CRT Stabilizer On
+[ ] HDMI
+[ ] CRT (if available)
+[ ] A/V Sync adjustment
+
+If lip-sync looks slightly early or late, try A/V Sync +20 ms first.
+
+
+ISO
+===
+
+[ ] SD ISO  (/media/fat/DVD/isos)
+[ ] USB ISO (/media/usb*/DVD or /Movies)
+[ ] ISO larger than 4 GB (exFAT USB)
+[ ] Authored menus from ISO
+
+
+RIPPING — EXPERIMENTAL
+======================
+
+[ ] Disc detected / title correct
+[ ] Disc size / USB free / required space shown
+[ ] Backup stage (decrypted tree)
+[ ] ISO build stage
+[ ] Completion (Rip complete)
+[ ] Resulting .iso appears in DVD Library
+[ ] Ripped ISO plays correctly
+[ ] No leftover .iso.part or .rip_tmp after success
+[ ] Cancel during rip cleans up
+[ ] FAT32 + large disc is rejected with a clear message
+
+
+KNOWN NOT TO TEST AS WORKING
+============================
+
+[ ] Movie subtitles (not implemented)
+[ ] Multi-angle (not implemented)
+[ ] MKV / H.264 / Xvid file playback (not in this beta)
+[ ] WEST / Y Audio Next (not in this beta)
+
+
+BUG REPORT
+==========
+
+If something fails:
+
+1. Stop after reproducing the issue once if possible.
+2. Scripts -> Export MiSTer DVD Player Logs
+3. Send:
+
+       exported log archive
+       DVD title
+       exact menu / action immediately before failure
+       CRT or HDMI
+       physical disc vs ISO
+       this checklist (what passed / failed)
+
+Notes
+-----
+
+

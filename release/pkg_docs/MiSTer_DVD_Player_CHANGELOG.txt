@@ -1,0 +1,48 @@
+MiSTer DVD Player 0.1.0 Private Beta
+====================================
+
+First private-beta package for invited hardware testers.
+
+
+Highlights
+----------
+
+- Physical DVD playback (SuperDock / compatible drive)
+- CSS-encrypted commercial DVDs
+- PAL and NTSC DVD playback
+- Authored DVD menus, still menus, highlights and icons
+- Chapters, Play/Pause, hold BACK 3 seconds to launcher
+- DVD-Video ISO playback
+- SD / USB DVD library, including ISOs larger than 4 GB
+- TV Mode Auto / NTSC / PAL
+- CRT Stabilizer On / Off
+- Runtime A/V Sync OSD adjustment
+- Authored audio-track cycling
+- Automatic ARM launcher when the DVD core opens (MiSTer_DVD Main
+  supervisor; [DVD-Player] main=MiSTer_DVD; stock Main is not replaced)
+- Front-page MiSTer DVD Player core
+- DVD -> ISO ripping to USB (experimental)
+- Launcher branding: MiSTer DVD Player / by Mojojojo198512
+
+
+Known issues
+------------
+
+- A/V Sync zero calibration is pending. Try +20 ms if sync looks off.
+  OSD steps are 10 ms; 5 ms is planned. Do not expect 0 ms to be the
+  calibrated baseline in this build.
+- Audio Next uses a temporary PREVIOUS + NEXT chord. WEST / Y is not
+  wired in this FPGA build.
+- Movie subtitles are not implemented (menu highlights/icons are).
+- Multi-angle is not implemented.
+- DVD ripping is newly experimental in this beta.
+- HDTV deinterlace / scaler quality is still under evaluation.
+- Neon Genesis Evangelion Communications-page navigation is not claimed
+  as generally fixed. Audio logical/physical mapping has been fixed.
+
+
+Legal
+-----
+
+Use only media you are authorised to access or copy.
+See LICENSES/ and SOURCES/ for redistributed components.
