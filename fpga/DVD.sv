@@ -56,17 +56,22 @@ assign BUTTONS = 0;
 //       presents bob-deinterlaced progressive frames (not ARM 720p/1080p).
 // VGA_F1 must remain the raster field so ascal detects interlaced input.
 //
-// Two native 720x576 BGR0/XRGB8888 buffers in reserved DDR:
+// Two native 720x576 BGR0/XRGB8888 or planar YUV420 buffers in reserved DDR:
 //   A = 0x30000000   B = 0x30200000
-// ARM requests a flip by writing bit 0 of the mailbox word at 0x30400000.
+// ARM requests a flip by writing the mailbox word at 0x30400000:
+//   bit0 = A/B request
+//   bit1 = pixel format (0=legacy BGR0, 1=planar YUV420)
+//   bit2 = frame interlaced_frame (chroma row map; latched with A/B)
+//   bit3 = top_field_first RESERVED (latched, unused for field order)
 // The core polls that 64-bit word every 16384 cycles of 27 MHz clk_sys
-// (~0.61 ms). mb_bit always holds the latest observed request.
-// display_buf latches mb_bit (OSD Buffer B still forces B) at the native
+// (~0.61 ms). mb_* always hold the latest observed request.
+// display_buf/yuv/intl/tff latch that word together at the native
 // complete-frame wrap, before field-0 line-0 prefetch. Both analogue
 // fields and ASCAL capture of VGA_* use that one buffer for the frame.
 // Logical controller state is published at 0x30400008
 // (never written to 0x30400000): {JOY_MAGIC, display_buf, joystick_0[30:0]}.
-// joystick bits 0-9 are unchanged. Bit 31 is display_buf (A=0, B=1).
+// joystick bits 0-9 are unchanged. Bits 10-11 are Subtitle / Audio Next.
+// Bit 31 is display_buf (A=0, B=1).
 //
 // Additional v1 registers (do not alias the mailbox/joystick words):
 //   0x30400010 FPGA→ARM settings  {DVD2, ver, seq, tv_osd, crt, av, src}
@@ -86,9 +91,10 @@ assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
 // 0         1         2         3          4         5         6
 // 01234567890123456789012345678901 23456789012345678901234567890123
 // 0123456789ABCDEFGHIJKLMNOPQRSTUV 0123456789ABCDEFGHIJKLMNOPQRSTUV
-// X XX XX XXX X     XXXXX                                  XX
+// X XX XX XXX      XXXXX                                  XX
 // 0=reset  [2:1]=TV Mode  [4:3]=Noise  5/6-7/10=template
-// 8=Buffer  9=CRT Stabilizer  [16:12]=A/V Sync  [122:121]=AR
+// 9=CRT Stabilizer  [16:12]=A/V Sync  [122:121]=AR
+// status[8] is unused (legacy OSD Buffer A/B override removed).
 //
 // TV Mode: 0=Auto 1=NTSC 2=PAL. Fresh default Auto (O, first item).
 // CRT Stabilizer: listed On,Off so status[9]=0 is On (MiSTer default-0).
@@ -100,7 +106,6 @@ localparam CONF_STR = {
 	"DVD;;",
 	"-;",
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
-	"O[8],Buffer,A,B;",
 	"O[2:1],TV Mode,Auto,NTSC,PAL;",
 	"O[9],CRT Stabilizer,On,Off;",
 	"O[16:12],A/V Sync,0 ms,+10 ms,+20 ms,+30 ms,+40 ms,+50 ms,+60 ms,+70 ms,+80 ms,+90 ms,+100 ms,-100 ms,-90 ms,-80 ms,-70 ms,-60 ms,-50 ms,-40 ms,-30 ms,-20 ms,-10 ms;",
@@ -125,11 +130,13 @@ localparam CONF_STR = {
 	"T[0],Reset;",
 	"R[0],Reset and close OSD;",
 	// D-pad is implicit: joystick_0[0]=Right [1]=Left [2]=Down [3]=Up.
-	// Named buttons occupy bits 4-9. Do not map OSD/Home (buttons[0]).
-	"J1,Select,Back,Play/Pause,DVD Menu,Previous Chapter,Next Chapter;",
-	"jn,A,B,Start,X,L,R;",
-	"jp,A,B,Start,X,L,R;",
-	"v,1;", // bumped: TV Mode is 2-bit Auto/NTSC/PAL, CRT/A/V Sync layout changed
+	// Named buttons occupy bits 4-11. Do not map OSD/Home (buttons[0]).
+	// J1[0] is Confirm (jn/jp A). It is NOT named Select, so SYS_BTN_SELECT
+	// (Minus) cannot bind here. Audio Next's jn/jp default is Select.
+	"J1,Confirm,Back,Play/Pause,DVD Menu,Previous Chapter,Next Chapter,Subtitle,Audio Next;",
+	"jn,A,B,Start,X,L,R,Y,Select;",
+	"jp,A,B,Start,X,L,R,Y,Select;",
+	"v,2;", // bumped: drop OSD Buffer, Confirm rename, Subtitle/Audio Next
 	"V,v",`BUILD_DATE 
 };
 
@@ -170,6 +177,8 @@ pll pll
 // Poll 16384 cycles of 27 MHz (~0.61 ms).
 // 0x30400000 bit0 = ARM→FPGA FB A/B request (never RMW / never FPGA-write).
 // 0x30400000 bit1 = ARM→FPGA pixel format (0=legacy BGR0, 1=planar YUV420).
+// 0x30400000 bit2 = ARM→FPGA frame interlaced_frame (latched with bit0).
+// 0x30400000 bit3 = ARM→FPGA top_field_first RESERVED (latched, unused).
 // 0x30400008       = FPGA→ARM {JOY_MAGIC, display_buf, joystick_0[30:0]}.
 // 0x30400010       = FPGA→ARM settings/capability (DVD2). Never written by ARM.
 // 0x30400018       = ARM→FPGA source-standard control (DVD3). FPGA reads only.
@@ -206,6 +215,8 @@ reg        mb_rd  = 0;
 reg        mb_we  = 0;
 reg        mb_bit = 0;
 reg        mb_yuv = 0;
+reg        mb_intl = 0;
+reg        mb_tff  = 0;
 reg  [3:0] mb_st  = 0;
 reg [13:0] poll_cnt = 0;
 reg        poll_due = 0;
@@ -242,8 +253,9 @@ wire       pal_eff = (tv_osd == 2'd2) ? 1'b1 :
                      (src_std == 2'd2);
 
 wire [63:0] joy_word = {JOY_MAGIC, display_buf, joystick_0[30:0]};
-// DVD2 pad bit2 = YUV420 reader capability. SET_VER stays 1 so ARM v1 probe
-// still matches. Bits [7:3] remain 0 (no collision with src_std / av_raw).
+// DVD2 pad bit2 = YUV420 reader capability (this SET word, not the mailbox).
+// Mailbox 0x30400000 bit2 is frame interlaced_frame — different address.
+// SET_VER stays 1 so ARM v1 probe still matches. Bits [7:3] remain 0.
 wire [63:0] set_word = {SET_MAGIC, SET_VER, set_seq, tv_osd, crt_on, av_raw, 5'd0, 1'b1, src_std};
 
 wire [28:0] mb_addr =
@@ -291,8 +303,10 @@ always @(posedge clk_sys) begin
 				mb_st <= ST_RD_MB_W;
 			end
 		ST_RD_MB_W: if (DDRAM_DOUT_READY) begin
-				mb_bit <= DDRAM_DOUT[0];
-				mb_yuv <= DDRAM_DOUT[1];
+				mb_bit  <= DDRAM_DOUT[0];
+				mb_yuv  <= DDRAM_DOUT[1];
+				mb_intl <= DDRAM_DOUT[2];
+				mb_tff  <= DDRAM_DOUT[3];
 				ctl_due <= 1'b1;
 				set_due <= 1'b1;
 				mb_st  <= ST_IDLE;
@@ -386,10 +400,14 @@ fb_line_reader fb_line_reader
 	.vc(vc),
 	.field(field),
 	.ce_pix(ce_pix),
-	.req_buf(mb_bit | status[8]),
+	.req_buf(mb_bit),
 	.req_yuv(mb_yuv),
+	.req_intl(mb_intl),
+	.req_tff(mb_tff),
 	.display_buf(display_buf),
 	.display_yuv(),
+	.display_intl(),
+	.display_tff(),
 	.pal(pal_eff),
 	.dup_even(crt_on),
 

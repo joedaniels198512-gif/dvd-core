@@ -1,13 +1,18 @@
 // Ping-pong line reader for native 480i / 576i CRT.
 //
 // Legacy mode (req_yuv=0, default): 720x576 BGR0, stride 2880.
-// Experimental mode (req_yuv=1): planar YUV420P in the same A/B slots,
+// YUV mode (req_yuv=1): planar YUV420P in the same A/B slots,
 // FPGA BT.601 limited-range convert. Raster inputs are never stalled.
 //
 // NTSC: src_y = vc*2 + field for vc 0..239 → lines 0..479.
 // PAL:  src_y = vc*2 + field for vc 0..287 → lines 0..575.
-// display_buf / display_yuv snapshot once per complete native frame
-// (field 1 → 0). HDMI ASCAL captures the same VGA_* stream.
+// display_buf / display_yuv / display_intl / display_tff snapshot together
+// once per complete native frame (field 1 → 0). HDMI ASCAL captures the
+// same VGA_* stream. yuv_plane_addr uses display_intl, never live req_intl.
+//
+// display_tff is latched for a future BFF temporal-order fix. This build
+// does not change the proven field-1 wrap / A-B swap boundary: genuine BFF
+// material is still shown top-field-first (temporally reversed).
 
 module fb_line_reader
 (
@@ -20,8 +25,12 @@ module fb_line_reader
 	input         ce_pix,
 	input         req_buf,
 	input         req_yuv,
+	input         req_intl,
+	input         req_tff,
 	output reg    display_buf,
 	output reg    display_yuv,
+	output reg    display_intl,
+	output reg    display_tff,
 	input         pal,
 	input         dup_even,
 
@@ -126,6 +135,7 @@ wire [28:0] v_addr_w;
 yuv_plane_addr u_yuv_addr
 (
 	.display_buf(display_buf),
+	.interlaced(display_intl),
 	.y(y_cand),
 	.y_addr(y_addr_w),
 	.u_addr(u_addr_w),
@@ -150,11 +160,15 @@ wire pal_chg = pal_d != pal;
 always @(posedge clk) begin
 	pal_d <= pal;
 	if (reset || pal_chg) begin
-		display_buf <= 1'b0;
-		display_yuv <= 1'b0;
+		display_buf  <= 1'b0;
+		display_yuv  <= 1'b0;
+		display_intl <= 1'b0;
+		display_tff  <= 1'b0;
 	end else if (ce_pix && field && (vc == (V_ACTIVE - 10'd2)) && (hc == H_LAST)) begin
-		display_buf <= req_buf;
-		display_yuv <= req_yuv;
+		display_buf  <= req_buf;
+		display_yuv  <= req_yuv;
+		display_intl <= req_intl;
+		display_tff  <= req_tff;
 	end
 end
 

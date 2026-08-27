@@ -225,3 +225,59 @@ from this baseline.
 
 libdvdnav and the custom AVIO callback run **only on the demux thread**.
 Decoder contexts are not shared across threads.
+
+---
+
+## 8. FPGA YUV420 scanout (pre-Quartus integration)
+
+ARM copies planar `AV_PIX_FMT_YUV420P` into the same 2 MiB A/B slots. The FPGA
+converts BT.601 limited-range to RGB. HDMI still uses `HDMI_BOB_DEINT` on the
+native interlaced raster. CRT Native is unchanged.
+
+### Mailbox `0x30400000` (one 32-bit ARM store)
+
+| Bit | Meaning |
+|---|---|
+| 0 | A/B buffer request |
+| 1 | 1 = planar YUV420, 0 = legacy BGR0 |
+| 2 | `interlaced_frame` for this presented frame |
+| 3 | `top_field_first` **reserved** (transmitted and latched, unused) |
+
+`display_buf`, `display_yuv`, `display_intl`, and `display_tff` latch that word
+together at the proven field-1 wrap (`vc == V_ACTIVE-2`, `hc == H_LAST`).
+`yuv_plane_addr` consumes **latched** `display_intl`, never live `mb_intl`.
+
+Per-frame `interlaced_frame` / `top_field_first` are snapshotted onto the
+decoded YUV ring slot at produce time and used at present/reissue. ACK
+reissues repeat the identical mailbox word.
+
+### Chroma row map (nearest neighbour, MPEG-2 LEFT `x>>1`)
+
+- Progressive: `cy = y >> 1`
+- Interlaced MPEG-2 4:2:0: `cy = {y[9:2], y[0]}` = `(y >> 2)*2 + (y & 1)`
+
+TFF/BFF does **not** change this spatial map.
+
+### Known limitation: BFF temporal order
+
+Genuine bottom-field-first material is temporally reversed on **all** current
+paths (BGR0, FPGA YUV, CRT Native, HDMI Bob). The display wrap always starts
+the new frame on raster field 0 (even / top field). This build **does not**
+change that swap boundary. Bit 3 is reserved so a later BFF fix needs no
+protocol change.
+
+### Controller (CONF_STR `v,2`)
+
+Bits 0–9 unchanged. J1[0] OSD name is **Confirm** (jn/jp `A`). Physical
+Select/Minus cannot bind to Confirm after the rename; it defaults to bit 11
+via jn/jp `Select`.
+
+| Bit | Logical | jn/jp default |
+|---|---|---|
+| 4 | Confirm | A (EAST) |
+| 10 | Subtitle | Y |
+| 11 | Audio Next | Select / Minus |
+
+OSD `O[8],Buffer,A,B` is removed. `req_buf = mb_bit` (no `status[8]` OR).
+Explicit status indices `[2:1]`, `[4:3]`, `[9]`, `[16:12]`, `[122:121]` are
+unchanged. Expected ALM cost is a few LUTs plus two flops.

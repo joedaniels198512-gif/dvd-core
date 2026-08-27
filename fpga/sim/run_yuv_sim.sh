@@ -15,6 +15,15 @@ else
   FAIL=$((FAIL+1))
 fi
 
+cc -O2 -Wall -Wextra -o "$HERE/yuv420_chroma_ref" "$HERE/yuv420_chroma_ref.c"
+if "$HERE/yuv420_chroma_ref"; then
+  echo "PASS C yuv420_chroma_ref"
+  PASS=$((PASS+1))
+else
+  echo "FAIL C yuv420_chroma_ref"
+  FAIL=$((FAIL+1))
+fi
+
 if ! command -v iverilog >/dev/null 2>&1; then
   echo "ERROR: iverilog is required for the FPGA YUV simulation."
   exit 1
@@ -35,9 +44,12 @@ run_tb() {
 }
 
 run_tb yuv601_tb "$HERE/yuv601_tb.v" "$RTL/yuv601_rgb.v"
-run_tb yuv_plane_addr_tb "$HERE/yuv_plane_addr_tb.v" "$RTL/yuv_plane_addr.v"
+run_tb yuv_chroma_row_tb "$HERE/yuv_chroma_row_tb.v" "$RTL/yuv_chroma_row.v"
+run_tb yuv_plane_addr_tb "$HERE/yuv_plane_addr_tb.v" \
+  "$RTL/yuv_chroma_row.v" "$RTL/yuv_plane_addr.v"
 run_tb fb_yuv_reader_tb "$HERE/fb_yuv_reader_tb.v" \
-  "$RTL/yuv601_rgb.v" "$RTL/yuv_plane_addr.v" "$RTL/fb_line_reader.v"
+  "$RTL/yuv601_rgb.v" "$RTL/yuv_chroma_row.v" "$RTL/yuv_plane_addr.v" \
+  "$RTL/fb_line_reader.v"
 
 echo "Simulation $PASS passed, $FAIL failed"
 if [ "$FAIL" -ne 0 ]; then
