@@ -163,13 +163,20 @@ enum {
 #define HL_MODE_SELECT      0
 #define HL_MODE_ACTION      1
 #define SPU_MAX_PKT         0x10000
-#define MSUB_EVT_MAX        32
+#define MSUB_EVT_MAX        48
 #define MSUB_CHG_MAX        8
 #define MSUB_BAND_MAX       16
 #define MSUB_PX_MAX         48
+#define MSUB_RUN_MAX        16384
+#define MSUB_DAREA_LOG      8
+#define MSUB_SPAN_MAX       (MSUB_PX_MAX + 1)
+#define MSUB_CH_ROW_SPANS   8
 #define MSUB_EVT_COLOR      1
 #define MSUB_EVT_CONTR      2
 #define MSUB_EVT_CHG        3
+#define MSUB_EVT_START      4
+#define MSUB_EVT_STOP       5
+#define MSUB_Q_CAP          8
 
 typedef struct {
     uint16_t start_col;
@@ -197,6 +204,17 @@ typedef struct {
     uint8_t color[4];
     uint8_t alpha[4];
 } MsubEvt;
+
+typedef struct {
+    uint16_t x0, x1; /* inclusive, overlay-relative (0 = left of msub.x) */
+    uint8_t code;
+    uint8_t pad;
+} MsubRun;
+
+typedef struct {
+    uint16_t run0;
+    uint16_t n;
+} MsubRow;
 #define NAV_WAIT_FIFO_US    400000
 #define STILL_DRAIN_WAIT_US 750000
 #define VQ_MARK_STILL_BOUNDARY ((void *)(uintptr_t)0x53544c42u) /* STLB */
@@ -209,6 +227,16 @@ typedef struct {
 #define ISO_WARM_PRESENTS        2
 #define SWS_DDR_ITERS            1000
 #define SWS_DDR_WARMUP           8
+#define UNBOUNDED_DEFAULT_FRAMES 500
+#define UNBOUNDED_WARMUP_FRAMES  8
+#define UNBOUNDED_FRAMES_MAX     20000
+
+enum {
+    UNBOUNDED_OFF = 0,
+    UNBOUNDED_DECODE = 1,
+    UNBOUNDED_YUV_DDR = 2,
+    UNBOUNDED_BGR_DDR = 3
+};
 #define FB_W            720
 #define FB_H_PAL        576
 #define FB_H_NTSC       480
@@ -217,6 +245,53 @@ typedef struct {
 #define FB_SIZE         ((size_t)FB_STRIDE * FB_H)
 #define SPU_IDX_MAX     (FB_W * FB_H)
 #define MB_MAP_SIZE     4096
+
+/* One decoded movie SPU. Demux enqueues; presentation promotes. */
+typedef struct {
+    int occupied;
+    unsigned id;
+    int valid;
+    int forced;
+    int pes_id;
+    int logical;
+    int chosen_physical;
+    int64_t packet_pts_us;
+    int64_t from_us;
+    int64_t until_us;
+    int64_t first_start_delay_us;
+    int64_t final_stop_delay_us;
+    int x, y, w, h;
+    int darea_x, darea_y, darea_w, darea_h;
+    int decoded_w, decoded_h;
+    int crop_x, crop_y, crop_w, crop_h;
+    int top_off, bot_off;
+    uint8_t color[4];
+    uint8_t alpha[4];
+    uint8_t *idx;
+    MsubRun *runs;
+    MsubRow rows[FB_H];
+    int run_n;
+    int vis_run_n;
+    int run_overflow;
+    int evt_n;
+    int chg_n;
+    MsubEvt evt[MSUB_EVT_MAX];
+    MsubChg chg[MSUB_CHG_MAX];
+    int saw_chg_colcon;
+    int first_alpha[4];
+    int first_contr_src; /* 0 = default zeros, 1 = timed SET_CONTR */
+    int first_contr_evt;
+    int64_t first_contr_time_us;
+    int code_n[4];
+    int total_px;
+    int vis_px;
+    int ever_px;
+    int init_x0, init_y0, init_x1, init_y1;
+    int ever_x0, ever_y0, ever_x1, ever_y1;
+    int last_sx, last_ex, last_sy, last_ey;
+    int code_ever[4];
+    int geom_valid;
+} MsubDecoded;
 
 #define STARTUP_DISPLAY_VBLS     2
 #define MAILBOX_POLL_MARGIN_US   2000
@@ -432,6 +507,8 @@ static void present_draw_highlight(Player *p, uint8_t *dst, int stride,
 static void movie_sub_reset(Player *p, const char *why);
 static int movie_sub_overlay(Player *p, uint8_t *dst, int stride,
                              int64_t pvpts_us, int64_t *blend_us_out);
+static int player_bench_done(const Player *p);
+static int copy_yuv420_to_slot(uint8_t *slot, const AVFrame *frame, int active_h);
 
 static int dvd_read_packet(void *opaque, uint8_t *buf, int buf_size)
 {
@@ -439,7 +516,7 @@ static int dvd_read_packet(void *opaque, uint8_t *buf, int buf_size)
     int out = 0;
 
     while (out < buf_size) {
-        if (d->stopped || g_interrupt) {
+        if (d->stopped || g_interrupt || player_bench_done(d->player)) {
             if (out > 0)
                 dvdio_note_mpeg_return(d, out);
             return out ? out : AVERROR_EOF;
@@ -452,7 +529,7 @@ static int dvd_read_packet(void *opaque, uint8_t *buf, int buf_size)
             return AVERROR_EOF;
         }
         dvdio_process_nav_cmds(d);
-        if (d->stopped || g_interrupt) {
+        if (d->stopped || g_interrupt || player_bench_done(d->player)) {
             if (out > 0)
                 dvdio_note_mpeg_return(d, out);
             return out ? out : AVERROR_EOF;
@@ -560,6 +637,10 @@ typedef struct {
     int buffered_yuv;
     int perf_present_no_convert;
     int perf_sws_ddr;
+    int perf_unbounded_decode;
+    int perf_unbounded_yuv_ddr;
+    int perf_unbounded_bgr_ddr;
+    int unbounded_frames;
     int phase_decode;
     int debug_stats;
     int debug_spu;
@@ -567,6 +648,9 @@ typedef struct {
     int debug_yellow_highlight;
     int authored_start;
     int fpga_yuv420;
+    int fpga_yuv420_subtitles;
+    int subtitles_on;
+    int subtitles_off;
 } Cli;
 
 static void usage(void)
@@ -580,8 +664,15 @@ static void usage(void)
             "                              [--buffered-yuv-video]\n"
             "                              [--perf-present-no-convert]\n"
             "                              [--perf-sws-ddr]\n"
+            "                              [--perf-unbounded-decode]\n"
+            "                              [--perf-unbounded-yuv-ddr]\n"
+            "                              [--perf-unbounded-bgr-ddr]\n"
+            "                              [--perf-unbounded-frames N]\n"
             "                              [--buffered-yuv-phase-decode]\n"
             "                              [--fpga-yuv420]\n"
+            "                              [--fpga-yuv420-subtitles]\n"
+            "                              [--subtitles-on]\n"
+            "                              [--subtitles-off]\n"
             "                              [--debug-stats]\n"
             "                              [--debug-spu]\n"
             "                              [--debug-subtitles]\n"
@@ -617,6 +708,15 @@ static void usage(void)
             "                        the inactive O_SYNC DDR buffer. Source\n"
             "                        is a synthetic cached PAL 720x576 frame.\n"
             "                        No DVD decode, mailbox, ACK, or playback.\n"
+            "--perf-unbounded-decode unpaced MPEG-2 decode only. No DDR write,\n"
+            "                        ACK, PTS, mailbox, or presentation pacing.\n"
+            "--perf-unbounded-yuv-ddr  unpaced decode + planar YUV420 copy into\n"
+            "                        inactive O_SYNC DDR + __sync_synchronize.\n"
+            "                        No ACK, PTS, mailbox, or pacing.\n"
+            "--perf-unbounded-bgr-ddr  unpaced decode + sws_scale into inactive\n"
+            "                        O_SYNC BGR0 DDR + __sync_synchronize.\n"
+            "                        No ACK, PTS, mailbox, or pacing.\n"
+            "--perf-unbounded-frames N  timed frames after warmup (default %d).\n"
             "--buffered-yuv-phase-decode  experimental: do not start MPEG-2\n"
             "                        decode while consumer sws_scale is writing\n"
             "                        uncached DDR. Requires --buffered-yuv-video.\n"
@@ -627,6 +727,12 @@ static void usage(void)
             "                        ARM subtitle/menu BGR overlays. Requires\n"
             "                        DVD_FPGA_YUV420_Test.rbf. Default off =\n"
             "                        legacy BGR0 unchanged.\n"
+            "--fpga-yuv420-subtitles experimental: compose movie subtitles in\n"
+            "                        cached YUV420 before the O_SYNC plane copy.\n"
+            "                        Requires --fpga-yuv420. No BGR0 blend.\n"
+            "--subtitles-on          start with movie subtitles enabled.\n"
+            "--subtitles-off         start with movie subtitles disabled\n"
+            "                        (default). Menu highlights are unchanged.\n"
             "--debug-stats           verbose instrumentation (ACK, timings,\n"
             "                        queues, stale distributions, threads).\n"
             "                        Default off; normal output is compact.\n"
@@ -634,7 +740,8 @@ static void usage(void)
             "--debug-subtitles       log movie subtitle stream/SPU/DCSQ events\n"
             "                        (no per-pixel spam).\n"
             "--debug-yellow-highlight  restore the old yellow button rectangle\n"
-            "                        instead of authored SPU/HLI overlay.\n");
+            "                        instead of authored SPU/HLI overlay.\n",
+            UNBOUNDED_DEFAULT_FRAMES);
 }
 
 static int parse_positive_int(const char *s, int *out)
@@ -677,6 +784,37 @@ static int parse_ms_int(const char *s, int *out)
         return -1;
     *out = (int)v;
     return 0;
+}
+
+static int parse_frames_int(const char *s, int *out)
+{
+    char *end = NULL;
+    long v;
+    if (!s || !*s)
+        return -1;
+    errno = 0;
+    v = strtol(s, &end, 10);
+    if (errno || !end || *end || v < 1 || v > UNBOUNDED_FRAMES_MAX)
+        return -1;
+    *out = (int)v;
+    return 0;
+}
+
+static int cli_unbounded_mode(const Cli *cli)
+{
+    if (cli->perf_unbounded_decode)
+        return UNBOUNDED_DECODE;
+    if (cli->perf_unbounded_yuv_ddr)
+        return UNBOUNDED_YUV_DDR;
+    if (cli->perf_unbounded_bgr_ddr)
+        return UNBOUNDED_BGR_DDR;
+    return UNBOUNDED_OFF;
+}
+
+static int cli_unbounded_count(const Cli *cli)
+{
+    return cli->perf_unbounded_decode + cli->perf_unbounded_yuv_ddr +
+           cli->perf_unbounded_bgr_ddr;
 }
 
 static int parse_cli(int argc, char **argv, Cli *cli)
@@ -740,12 +878,46 @@ static int parse_cli(int argc, char **argv, Cli *cli)
             cli->perf_sws_ddr = 1;
             continue;
         }
+        if (!strcmp(argv[i], "--perf-unbounded-decode")) {
+            cli->perf_unbounded_decode = 1;
+            continue;
+        }
+        if (!strcmp(argv[i], "--perf-unbounded-yuv-ddr")) {
+            cli->perf_unbounded_yuv_ddr = 1;
+            continue;
+        }
+        if (!strcmp(argv[i], "--perf-unbounded-bgr-ddr")) {
+            cli->perf_unbounded_bgr_ddr = 1;
+            continue;
+        }
+        if (!strcmp(argv[i], "--perf-unbounded-frames")) {
+            if (i + 1 >= argc ||
+                parse_frames_int(argv[++i], &cli->unbounded_frames)) {
+                fprintf(stderr,
+                        "--perf-unbounded-frames requires an integer N in 1..%d\n",
+                        UNBOUNDED_FRAMES_MAX);
+                return -1;
+            }
+            continue;
+        }
         if (!strcmp(argv[i], "--buffered-yuv-phase-decode")) {
             cli->phase_decode = 1;
             continue;
         }
         if (!strcmp(argv[i], "--fpga-yuv420")) {
             cli->fpga_yuv420 = 1;
+            continue;
+        }
+        if (!strcmp(argv[i], "--fpga-yuv420-subtitles")) {
+            cli->fpga_yuv420_subtitles = 1;
+            continue;
+        }
+        if (!strcmp(argv[i], "--subtitles-on")) {
+            cli->subtitles_on = 1;
+            continue;
+        }
+        if (!strcmp(argv[i], "--subtitles-off")) {
+            cli->subtitles_off = 1;
             continue;
         }
         if (!strcmp(argv[i], "--debug-stats")) {
@@ -820,7 +992,7 @@ static int parse_cli(int argc, char **argv, Cli *cli)
     if (cli->perf_sws_ddr &&
         (cli->buffered_yuv || cli->buffered_video ||
          cli->uncapped_video_benchmark || cli->perf_present_no_convert ||
-         cli->phase_decode)) {
+         cli->phase_decode || cli_unbounded_count(cli))) {
         fprintf(stderr,
                 "--perf-sws-ddr cannot be combined with playback or "
                 "ACK-isolation flags\n");
@@ -832,21 +1004,52 @@ static int parse_cli(int argc, char **argv, Cli *cli)
         return -1;
     }
     if (cli->phase_decode &&
-        (cli->perf_present_no_convert || cli->uncapped_video_benchmark)) {
+        (cli->perf_present_no_convert || cli->uncapped_video_benchmark ||
+         cli_unbounded_count(cli))) {
         fprintf(stderr,
                 "--buffered-yuv-phase-decode cannot be combined with "
-                "--perf-present-no-convert or --uncapped-video-benchmark\n");
+                "--perf-present-no-convert, --uncapped-video-benchmark, or "
+                "unbounded perf flags\n");
         return -1;
     }
     if (cli->fpga_yuv420 &&
         (cli->perf_present_no_convert || cli->perf_sws_ddr ||
          cli->buffered_video || cli->uncapped_video_benchmark ||
-         cli->phase_decode)) {
+         cli->phase_decode || cli_unbounded_count(cli))) {
         fprintf(stderr,
                 "--fpga-yuv420 cannot be combined with isolation, "
-                "buffered-video, uncapped, or phase-decode flags\n");
+                "buffered-video, uncapped, unbounded, or phase-decode flags\n");
         return -1;
     }
+    if (cli->fpga_yuv420_subtitles && !cli->fpga_yuv420) {
+        fprintf(stderr, "--fpga-yuv420-subtitles requires --fpga-yuv420\n");
+        return -1;
+    }
+    if (cli->subtitles_on && cli->subtitles_off) {
+        fprintf(stderr, "--subtitles-on cannot be combined with --subtitles-off\n");
+        return -1;
+    }
+    if (cli_unbounded_count(cli) > 1) {
+        fprintf(stderr,
+                "use only one of --perf-unbounded-decode, "
+                "--perf-unbounded-yuv-ddr, --perf-unbounded-bgr-ddr\n");
+        return -1;
+    }
+    if (cli_unbounded_count(cli) &&
+        (cli->buffered_video || cli->buffered_yuv ||
+         cli->uncapped_video_benchmark || cli->perf_present_no_convert)) {
+        fprintf(stderr,
+                "unbounded perf flags cannot be combined with playback or "
+                "--uncapped-video-benchmark\n");
+        return -1;
+    }
+    if (cli->unbounded_frames && !cli_unbounded_count(cli)) {
+        fprintf(stderr,
+                "--perf-unbounded-frames requires an unbounded perf flag\n");
+        return -1;
+    }
+    if (cli_unbounded_count(cli) && !cli->unbounded_frames)
+        cli->unbounded_frames = UNBOUNDED_DEFAULT_FRAMES;
     return 0;
 }
 
@@ -2340,6 +2543,10 @@ struct Player {
     volatile int osd_av_trim_ms;
     int fpga_v1_caps;
     int fpga_yuv420;
+    int fpga_yuv420_subtitles;
+    int subtitle_enabled;
+    AVFrame *yuv_sub_scratch;
+    int yuv_sub_algo_logged;
     int yuv_meta_logged;
     int fpga_src_std;
     int stale_run, stale_run_max;
@@ -2552,6 +2759,9 @@ struct Player {
         int64_t from_us;
         int64_t until_us;
         int x, y, w, h;
+        int darea_x, darea_y, darea_w, darea_h;
+        int decoded_w, decoded_h;
+        int crop_x, crop_y, crop_w, crop_h;
         int top_off, bot_off;
         uint8_t color[4];
         uint8_t alpha[4];
@@ -2567,6 +2777,11 @@ struct Player {
         int chosen_physical;
         unsigned spu_seq;
         unsigned last_spu_id;
+        int cur;       /* index into plane[], -1 if none presented */
+        int last_slot; /* last enqueued slot, -1 none */
+        MsubDecoded plane[MSUB_Q_CAP];
+        unsigned long q_drop;
+        int64_t max_ahead_us;
         int saw_chg_colcon;
         int evt_n;
         int chg_n;
@@ -2582,11 +2797,34 @@ struct Player {
         unsigned long malformed_chg_colcon;
         uint64_t bbox_w_sum, bbox_h_sum;
         unsigned bbox_n, bbox_w_max, bbox_h_max;
+        MsubRun *runs;
+        MsubRow rows[FB_H];
+        int run_n;
+        int run_overflow;
+        int vis_run_n;
+        int darea_log_n;
+        int code_n[4];
+        int first_alpha[4];
+        int total_px;
+        int vis_px;
+        int init_x0, init_y0, init_x1, init_y1;
+        int ever_x0, ever_y0, ever_x1, ever_y1;
+        int last_sx, last_ex, last_sy, last_ey;
+        int code_ever[4];
+        int ever_px;
+        int geom_valid;
+        int log_state_valid;
+        int log_vis;
+        int log_chg_i;
+        uint8_t log_color[4];
+        uint8_t log_alpha[4];
     } msub;
     struct {
         int last_active;
         int inited;
         int64_t *act_blend;
+        int64_t *act_scratch;
+        int64_t *act_compose;
         int64_t *act_sws;
         int64_t *act_ack;
         int64_t *act_cyc;
@@ -2594,9 +2832,12 @@ struct Player {
         int64_t *inact_sws;
         int64_t *inact_ack;
         int64_t *inact_cyc;
-        int act_blend_n, act_sws_n, act_ack_n, act_cyc_n, act_combo_n;
+        int act_blend_n, act_scratch_n, act_compose_n;
+        int act_sws_n, act_ack_n, act_cyc_n, act_combo_n;
         int inact_sws_n, inact_ack_n, inact_cyc_n;
         int64_t act_blend_sum, act_blend_max;
+        int64_t act_scratch_sum, act_scratch_max;
+        int64_t act_compose_sum, act_compose_max;
         int64_t act_sws_sum, act_ack_sum, act_cyc_sum, act_combo_sum;
         int64_t inact_sws_sum, inact_ack_sum, inact_cyc_sum;
         unsigned long act_stale, inact_stale;
@@ -2704,6 +2945,13 @@ struct Player {
     int64_t bench_sws_cpu_sum, bench_sws_cpu_min, bench_sws_cpu_max;
     unsigned long bench_combo_n;
     int64_t bench_combo_sum, bench_combo_min, bench_combo_max;
+    int unbounded_mode;
+    int unbounded_frames;
+    int unbounded_warmup_left;
+    int bench_timed;
+    int bench_complete;
+    unsigned long bench_barrier_n;
+    int64_t bench_barrier_sum, bench_barrier_min, bench_barrier_max;
 
     /* --buffered-video / --buffered-yuv-video. Default playback never
      * reads these. */
@@ -2792,6 +3040,11 @@ static int buffered_queue_count(Player *p)
     return vidring_count(&p->vring);
 }
 
+static int player_bench_done(const Player *p)
+{
+    return p && p->bench_complete;
+}
+
 static void player_abort(Player *p)
 {
     p->fail = 1;
@@ -2824,6 +3077,14 @@ static void player_abort(Player *p)
         pthread_cond_broadcast(&p->phase_cv);
         pthread_mutex_unlock(&p->phase_mu);
     }
+}
+
+/* Stop an unbounded bench after N timed frames without marking fail. */
+static void player_bench_stop(Player *p)
+{
+    p->bench_complete = 1;
+    pktq_quit(&p->aq);
+    pktq_quit(&p->vq);
 }
 
 static unsigned player_nav_gen(const Player *p)
@@ -2878,6 +3139,9 @@ static void navq_init(Player *p)
     p->msub.from_us = AV_NOPTS_VALUE;
     p->msub.until_us = AV_NOPTS_VALUE;
     p->msub.acc_pts_us = AV_NOPTS_VALUE;
+    p->msub.cur = -1;
+    p->msub.last_slot = -1;
+    p->msub.max_ahead_us = 0;
     p->nav_gen = 1;
     p->codec_gen = 1;
     memset(&p->pause, 0, sizeof(p->pause));
@@ -2919,8 +3183,18 @@ static void navq_destroy(Player *p)
         pthread_mutex_destroy(&p->msub.mu);
         p->msub.inited = 0;
     }
-    free(p->msub.idx);
     p->msub.idx = NULL;
+    p->msub.runs = NULL;
+    {
+        int i;
+
+        for (i = 0; i < MSUB_Q_CAP; i++) {
+            free(p->msub.plane[i].idx);
+            p->msub.plane[i].idx = NULL;
+            free(p->msub.plane[i].runs);
+            p->msub.plane[i].runs = NULL;
+        }
+    }
     free(p->msub.acc);
     p->msub.acc = NULL;
     if (p->pause.inited) {
@@ -3691,6 +3965,12 @@ static int menu_spu_run_2bit(const uint8_t *buf, int size, int *bitpos,
     return (int)(v >> 2);
 }
 
+/*
+ * DVD SPU 2-bit RLE, matching FFmpeg libavcodec/dvdsubdec.c decode_rle:
+ *   field A (SET_DSPXA top)  -> rows 0,2,4,... via linesize = width*2
+ *   field B (SET_DSPXA bot)  -> rows 1,3,5,... starting at bitmap+width
+ * Packed idx[y * width + x] is then row-major interleaved.
+ */
 static int menu_spu_decode_rle(uint8_t *bitmap, int linesize, int w, int h,
                                const uint8_t *buf, int start, int buf_size)
 {
@@ -3722,6 +4002,61 @@ static int menu_spu_decode_rle(uint8_t *bitmap, int linesize, int w, int h,
             bitpos = (bitpos + 7) & ~7;
         }
     }
+    return 0;
+}
+
+static int movie_sub_rle_field_selftest(void)
+{
+    uint8_t bmp[64];
+    /* Width 4: one nibble-pair 0x1N encodes len=4, color=N&3.
+     * Field A = color 1 on even rows; field B = color 2 on odd rows. */
+    static const uint8_t even4[] = {0x11, 0x11};          /* h=4, 2 even rows */
+    static const uint8_t odd4[]  = {0x12, 0x12};
+    static const uint8_t even5[] = {0x11, 0x11, 0x11};    /* h=5, 3 even rows */
+    static const uint8_t odd5[]  = {0x12, 0x12};
+    uint8_t buf[8];
+    int w = 4, h, x, y, fail = 0;
+
+    h = 4;
+    memset(bmp, 0xff, sizeof(bmp));
+    memcpy(buf, even4, 2);
+    memcpy(buf + 2, odd4, 2);
+    if (menu_spu_decode_rle(bmp, w * 2, w, (h + 1) / 2, buf, 0, 4) < 0 ||
+        menu_spu_decode_rle(bmp + w, w * 2, w, h / 2, buf, 2, 4) < 0)
+        fail = 1;
+    for (y = 0; y < h && !fail; y++) {
+        int expect = (y & 1) ? 2 : 1;
+
+        for (x = 0; x < w; x++) {
+            if (bmp[y * w + x] != expect)
+                fail = 1;
+        }
+    }
+
+    h = 5;
+    memset(bmp, 0xff, sizeof(bmp));
+    memcpy(buf, even5, 3);
+    memcpy(buf + 3, odd5, 2);
+    if (menu_spu_decode_rle(bmp, w * 2, w, (h + 1) / 2, buf, 0, 5) < 0 ||
+        menu_spu_decode_rle(bmp + w, w * 2, w, h / 2, buf, 3, 5) < 0)
+        fail = 1;
+    for (y = 0; y < h && !fail; y++) {
+        int expect = (y & 1) ? 2 : 1;
+
+        for (x = 0; x < w; x++) {
+            if (bmp[y * w + x] != expect)
+                fail = 1;
+        }
+    }
+
+    if (fail) {
+        fprintf(stderr,
+                "FAIL: SPU RLE field test (FFmpeg even/odd interleave)\n");
+        return -1;
+    }
+    fprintf(stderr,
+            "SPU RLE FIELD TEST: PASS "
+            "(field A = rows 0,2,4,...; field B = rows 1,3,5,...)\n");
     return 0;
 }
 
@@ -4188,19 +4523,89 @@ static int64_t movie_sub_dcsq_delay_us(unsigned date)
 
 static int movie_sub_ensure_bufs(Player *p)
 {
+    int i;
+
     if (!p)
         return -1;
-    if (!p->msub.idx) {
-        p->msub.idx = malloc(SPU_IDX_MAX);
-        if (!p->msub.idx)
-            return -1;
-    }
     if (!p->msub.acc) {
         p->msub.acc = malloc(SPU_MAX_PKT);
         if (!p->msub.acc)
             return -1;
     }
+    for (i = 0; i < MSUB_Q_CAP; i++) {
+        if (!p->msub.plane[i].idx) {
+            p->msub.plane[i].idx = malloc(SPU_IDX_MAX);
+            if (!p->msub.plane[i].idx)
+                return -1;
+        }
+        if (!p->msub.plane[i].runs) {
+            p->msub.plane[i].runs = malloc((size_t)MSUB_RUN_MAX *
+                                           sizeof(MsubRun));
+            if (!p->msub.plane[i].runs)
+                return -1;
+        }
+    }
     return 0;
+}
+
+static void movie_sub_log_darea(Player *p, int sx, int ex, int sy, int ey,
+                                int top_off, int bot_off)
+{
+    int w = ex - sx + 1;
+    int h = ey - sy + 1;
+    int x_ok = (sx >= 0 && ex < FB_W && sx <= ex);
+    int pal_ok = (sy >= 0 && ey < FB_H_PAL && sy <= ey);
+    int ntsc_ok = (sy >= 0 && ey < FB_H_NTSC && sy <= ey);
+
+    if (!p || p->msub.darea_log_n >= MSUB_DAREA_LOG)
+        return;
+    p->msub.darea_log_n++;
+    fprintf(stderr,
+            "SPU DAREA:\n"
+            "  sx=%d\n"
+            "  ex=%d\n"
+            "  sy=%d\n"
+            "  ey=%d\n"
+            "  width=%d\n"
+            "  height=%d\n"
+            "  SET_DSPXA top=%d bottom=%d\n"
+            "  bounds x 0..%d: %s\n"
+            "  bounds y PAL 0..%d: %s\n"
+            "  bounds y NTSC 0..%d: %s\n",
+            sx, ex, sy, ey, w, h, top_off, bot_off,
+            FB_W - 1, x_ok ? "ok" : "OUT",
+            FB_H_PAL - 1, pal_ok ? "ok" : "OUT",
+            FB_H_NTSC - 1, ntsc_ok ? "ok" : "OUT");
+}
+
+static void movie_sub_build_runs(MsubDecoded *s, int w, int h);
+static void movie_sub_analyse_decoded(Player *p, MsubDecoded *s,
+                                      int sx, int ex, int sy, int ey);
+static void movie_sub_crop_ever_visible(MsubDecoded *s);
+static void movie_sub_count_vis_runs(MsubDecoded *s);
+
+/* Caller holds msub.mu. Drops queued and presented planes. */
+static void movie_sub_q_flush(Player *p)
+{
+    int i;
+
+    for (i = 0; i < MSUB_Q_CAP; i++)
+        p->msub.plane[i].occupied = 0;
+    p->msub.cur = -1;
+    p->msub.last_slot = -1;
+    p->msub.valid = 0;
+    p->msub.forced = 0;
+    p->msub.shown = 0;
+    p->msub.visible_now = 0;
+    p->msub.idx = NULL;
+    p->msub.runs = NULL;
+    p->msub.w = p->msub.h = 0;
+    p->msub.evt_n = 0;
+    p->msub.chg_n = 0;
+    p->msub.packet_pts_us = AV_NOPTS_VALUE;
+    p->msub.from_us = AV_NOPTS_VALUE;
+    p->msub.until_us = AV_NOPTS_VALUE;
+    p->msub.log_state_valid = 0;
 }
 
 static void movie_sub_reset(Player *p, const char *why)
@@ -4211,20 +4616,17 @@ static void movie_sub_reset(Player *p, const char *why)
     if (!p || !p->msub.inited)
         return;
     pthread_mutex_lock(&p->msub.mu);
-    was_valid = p->msub.valid || p->msub.visible_now;
-    p->msub.valid = 0;
-    p->msub.forced = 0;
-    p->msub.shown = 0;
-    p->msub.visible_now = 0;
-    p->msub.w = p->msub.h = 0;
+    was_valid = p->msub.valid || p->msub.visible_now || p->msub.cur >= 0;
+    movie_sub_q_flush(p);
+    p->msub.darea_w = p->msub.darea_h = 0;
+    p->msub.decoded_w = p->msub.decoded_h = 0;
+    p->msub.crop_w = p->msub.crop_h = 0;
     p->msub.acc_size = 0;
-    p->msub.packet_pts_us = AV_NOPTS_VALUE;
-    p->msub.from_us = AV_NOPTS_VALUE;
-    p->msub.until_us = AV_NOPTS_VALUE;
     p->msub.acc_pts_us = AV_NOPTS_VALUE;
-    p->msub.evt_n = 0;
-    p->msub.chg_n = 0;
     p->msub.saw_chg_colcon = 0;
+    p->msub.run_n = 0;
+    p->msub.vis_run_n = 0;
+    p->msub.run_overflow = 0;
     pthread_mutex_unlock(&p->msub.mu);
     if (was_valid)
         sub_dbg("SUBTITLE CLEAR\n");
@@ -4259,13 +4661,15 @@ static void movie_sub_set_stream(Player *p, int logical, int wide, int letterbox
         p->msub.pes_id = -1;
     if (old_pes != p->msub.pes_id) {
         pthread_mutex_lock(&p->msub.mu);
-        p->msub.valid = 0;
-        p->msub.visible_now = 0;
-        p->msub.shown = 0;
+        movie_sub_q_flush(p);
         p->msub.acc_size = 0;
         p->msub.acc_pts_us = AV_NOPTS_VALUE;
         pthread_mutex_unlock(&p->msub.mu);
     }
+    fprintf(stderr,
+            "SUBTITLE MAP logical=%d wide=%d letterbox=%d pan_scan=%d "
+            "chosen_physical=%d pes_id=%d\n",
+            logical, wide, letterbox, pan_scan, phys, p->msub.pes_id);
     sub_dbg("SUBTITLE STREAM CHANGE logical=%d wide=%d letterbox=%d "
             "pan_scan=%d active=%d chosen_physical=%d pes_id=%d\n",
             logical, wide, letterbox, pan_scan, active, phys, p->msub.pes_id);
@@ -4382,6 +4786,88 @@ static int movie_sub_push_evt(MsubEvt *evts, int *evt_n, int64_t time_us,
     else
         memset(evts[i].alpha, 0, 4);
     return 0;
+}
+
+static const char *movie_sub_evt_name(uint8_t kind)
+{
+    switch (kind) {
+    case MSUB_EVT_START:
+        return "START";
+    case MSUB_EVT_STOP:
+        return "STOP";
+    case MSUB_EVT_COLOR:
+        return "SET_COLOR";
+    case MSUB_EVT_CONTR:
+        return "SET_CONTR";
+    case MSUB_EVT_CHG:
+        return "CHG_COLCON";
+    default:
+        return "OTHER";
+    }
+}
+
+static void movie_sub_log_timeline(const MsubDecoded *s)
+{
+    int i;
+    int64_t pts = s->packet_pts_us;
+
+    fprintf(stderr,
+            "SPU TIMELINE id=%u pts=%" PRId64 " first_start=%" PRId64
+            " last_stop=%" PRId64 " evts=%d chg=%s forced=%d\n",
+            s->id, pts, s->from_us, s->until_us,
+            s->evt_n, s->saw_chg_colcon ? "yes" : "no",
+            s->forced);
+    for (i = 0; i < s->evt_n; i++) {
+        const MsubEvt *e = &s->evt[i];
+        int64_t rel = (pts != AV_NOPTS_VALUE && e->time_us != AV_NOPTS_VALUE)
+                          ? e->time_us - pts
+                          : e->time_us;
+
+        fprintf(stderr, "  %+7.3f ms  %s", rel / 1000.0,
+                movie_sub_evt_name(e->kind));
+        if (e->kind == MSUB_EVT_COLOR)
+            fprintf(stderr, "  %u/%u/%u/%u",
+                    e->color[0], e->color[1], e->color[2], e->color[3]);
+        else if (e->kind == MSUB_EVT_CONTR)
+            fprintf(stderr, "  %u/%u/%u/%u",
+                    e->alpha[0], e->alpha[1], e->alpha[2], e->alpha[3]);
+        else if (e->kind == MSUB_EVT_CHG && e->chg_i < s->chg_n) {
+            const MsubChg *g = &s->chg[e->chg_i];
+            int b;
+
+            fprintf(stderr, "  bands=%d", g->n_bands);
+            for (b = 0; b < g->n_bands; b++)
+                fprintf(stderr, "  lines=%u..%u", g->bands[b].y0,
+                        g->bands[b].y1);
+        }
+        fputc('\n', stderr);
+    }
+}
+
+static void movie_sub_note_state(Player *p, int vis, const uint8_t color[4],
+                                 const uint8_t alpha[4], const MsubChg *chg,
+                                 int64_t now)
+{
+    int chg_i = chg ? (int)(chg - p->msub.chg) : -1;
+
+    if (p->msub.log_state_valid &&
+        vis == p->msub.log_vis &&
+        chg_i == p->msub.log_chg_i &&
+        memcmp(color, p->msub.log_color, 4) == 0 &&
+        memcmp(alpha, p->msub.log_alpha, 4) == 0)
+        return;
+    p->msub.log_state_valid = 1;
+    p->msub.log_vis = vis;
+    p->msub.log_chg_i = chg_i;
+    memcpy(p->msub.log_color, color, 4);
+    memcpy(p->msub.log_alpha, alpha, 4);
+    fprintf(stderr,
+            "SUBTITLE STATE vis=%d t=%" PRId64 " color=%u/%u/%u/%u "
+            "alpha=%u/%u/%u/%u chg=%s\n",
+            vis, now,
+            color[0], color[1], color[2], color[3],
+            alpha[0], alpha[1], alpha[2], alpha[3],
+            chg ? "yes" : "no");
 }
 
 /*
@@ -4501,6 +4987,271 @@ static int movie_sub_parse_chg(Player *p, const uint8_t *buf, int buf_size,
     return size;
 }
 
+static int movie_sub_q_depth(const Player *p)
+{
+    int i, n = 0;
+
+    for (i = 0; i < MSUB_Q_CAP; i++) {
+        if (p->msub.plane[i].occupied)
+            n++;
+    }
+    return n;
+}
+
+static int movie_sub_slot_free_index(Player *p)
+{
+    int i;
+
+    for (i = 0; i < MSUB_Q_CAP; i++) {
+        if (!p->msub.plane[i].occupied)
+            return i;
+    }
+    return -1;
+}
+
+static int movie_sub_slot_started(const MsubDecoded *s, int64_t now)
+{
+    if (!s || !s->occupied || !s->valid)
+        return 0;
+    if (now == AV_NOPTS_VALUE)
+        return 1;
+    if (s->from_us == AV_NOPTS_VALUE)
+        return 1;
+    return now >= s->from_us;
+}
+
+static int movie_sub_slot_expired(const MsubDecoded *s, int64_t now)
+{
+    if (!s || !s->occupied || !s->valid)
+        return 1;
+    if (now == AV_NOPTS_VALUE)
+        return 0;
+    if (s->until_us != AV_NOPTS_VALUE && now >= s->until_us)
+        return 1;
+    return 0;
+}
+
+static void movie_sub_slot_release(MsubDecoded *s)
+{
+    uint8_t *idx;
+    MsubRun *runs;
+
+    if (!s)
+        return;
+    idx = s->idx;
+    runs = s->runs;
+    memset(s, 0, sizeof(*s));
+    s->idx = idx;
+    s->runs = runs;
+    s->packet_pts_us = AV_NOPTS_VALUE;
+    s->from_us = AV_NOPTS_VALUE;
+    s->until_us = AV_NOPTS_VALUE;
+    s->first_contr_time_us = AV_NOPTS_VALUE;
+    s->first_contr_evt = -1;
+}
+
+static void movie_sub_snapshot_decoded(Player *p, const MsubDecoded *s)
+{
+    p->msub.last_spu_id = s->id;
+    p->msub.darea_x = s->darea_x;
+    p->msub.darea_y = s->darea_y;
+    p->msub.darea_w = s->darea_w;
+    p->msub.darea_h = s->darea_h;
+    p->msub.decoded_w = s->decoded_w;
+    p->msub.decoded_h = s->decoded_h;
+    p->msub.crop_x = s->crop_x;
+    p->msub.crop_y = s->crop_y;
+    p->msub.crop_w = s->crop_w;
+    p->msub.crop_h = s->crop_h;
+    memcpy(p->msub.first_alpha, s->first_alpha, sizeof(p->msub.first_alpha));
+    memcpy(p->msub.code_n, s->code_n, sizeof(p->msub.code_n));
+    memcpy(p->msub.code_ever, s->code_ever, sizeof(p->msub.code_ever));
+    p->msub.total_px = s->total_px;
+    p->msub.vis_px = s->vis_px;
+    p->msub.ever_px = s->ever_px;
+    p->msub.init_x0 = s->init_x0;
+    p->msub.init_y0 = s->init_y0;
+    p->msub.init_x1 = s->init_x1;
+    p->msub.init_y1 = s->init_y1;
+    p->msub.ever_x0 = s->ever_x0;
+    p->msub.ever_y0 = s->ever_y0;
+    p->msub.ever_x1 = s->ever_x1;
+    p->msub.ever_y1 = s->ever_y1;
+    p->msub.last_sx = s->last_sx;
+    p->msub.last_ex = s->last_ex;
+    p->msub.last_sy = s->last_sy;
+    p->msub.last_ey = s->last_ey;
+    p->msub.geom_valid = s->geom_valid;
+}
+
+/* Copy slot into the presented aliases. Overlay still reads p->msub.*. */
+static void movie_sub_present_from_slot(Player *p, int idx, int64_t now_us,
+                                        int64_t aclk)
+{
+    MsubDecoded *s = &p->msub.plane[idx];
+    unsigned old_id = 0;
+    int64_t delta_v, delta_a;
+
+    if (p->msub.cur >= 0 && p->msub.cur != idx) {
+        old_id = p->msub.plane[p->msub.cur].id;
+        movie_sub_slot_release(&p->msub.plane[p->msub.cur]);
+    }
+    p->msub.cur = idx;
+    p->msub.valid = 1;
+    p->msub.forced = s->forced;
+    p->msub.packet_pts_us = s->packet_pts_us;
+    p->msub.from_us = s->from_us;
+    p->msub.until_us = s->until_us;
+    p->msub.x = s->x;
+    p->msub.y = s->y;
+    p->msub.w = s->w;
+    p->msub.h = s->h;
+    p->msub.darea_x = s->darea_x;
+    p->msub.darea_y = s->darea_y;
+    p->msub.darea_w = s->darea_w;
+    p->msub.darea_h = s->darea_h;
+    p->msub.decoded_w = s->decoded_w;
+    p->msub.decoded_h = s->decoded_h;
+    p->msub.crop_x = s->crop_x;
+    p->msub.crop_y = s->crop_y;
+    p->msub.crop_w = s->crop_w;
+    p->msub.crop_h = s->crop_h;
+    p->msub.top_off = s->top_off;
+    p->msub.bot_off = s->bot_off;
+    memcpy(p->msub.color, s->color, 4);
+    memcpy(p->msub.alpha, s->alpha, 4);
+    p->msub.idx = s->idx;
+    p->msub.runs = s->runs;
+    memcpy(p->msub.rows, s->rows, sizeof(s->rows));
+    memcpy(p->msub.evt, s->evt, sizeof(s->evt));
+    memcpy(p->msub.chg, s->chg, sizeof(s->chg));
+    p->msub.evt_n = s->evt_n;
+    p->msub.chg_n = s->chg_n;
+    p->msub.saw_chg_colcon = s->saw_chg_colcon;
+    p->msub.run_n = s->run_n;
+    p->msub.vis_run_n = s->vis_run_n;
+    p->msub.run_overflow = s->run_overflow;
+    p->msub.last_spu_id = s->id;
+    p->msub.shown = 0;
+    p->msub.log_state_valid = 0;
+    delta_v = (now_us != AV_NOPTS_VALUE && s->from_us != AV_NOPTS_VALUE)
+                  ? now_us - s->from_us : 0;
+    delta_a = (aclk != AV_NOPTS_VALUE && s->from_us != AV_NOPTS_VALUE)
+                  ? aclk - s->from_us : 0;
+    fprintf(stderr,
+            "SPU PROMOTE old=%u new=%u aclk=%" PRId64 " new_start=%" PRId64
+            " vpts=%" PRId64 " lateness_vpts=%" PRId64 " lateness_aclk=%" PRId64
+            "\n",
+            old_id, s->id, aclk, s->from_us, now_us, delta_v, delta_a);
+}
+
+static void movie_sub_clear_current(Player *p, int64_t now_us, int64_t aclk)
+{
+    unsigned id = 0;
+    int64_t stop_pts = AV_NOPTS_VALUE;
+
+    if (p->msub.cur >= 0) {
+        id = p->msub.plane[p->msub.cur].id;
+        stop_pts = p->msub.plane[p->msub.cur].until_us;
+        movie_sub_slot_release(&p->msub.plane[p->msub.cur]);
+        fprintf(stderr,
+                "SPU EXPIRE id=%u aclk=%" PRId64 " vpts=%" PRId64
+                " stop_pts=%" PRId64 "\n",
+                id, aclk, now_us, stop_pts);
+    }
+    p->msub.cur = -1;
+    p->msub.valid = 0;
+    p->msub.idx = NULL;
+    p->msub.runs = NULL;
+    p->msub.evt_n = 0;
+    p->msub.w = p->msub.h = 0;
+    p->msub.visible_now = 0;
+    p->msub.shown = 0;
+    p->msub.log_state_valid = 0;
+}
+
+/*
+ * Promote/expire against the video frame's PTS (same MPEG timeline as SPU
+ * packet PTS). aclk is logged only; overlay already waits on MrAudio.
+ * Caller holds msub.mu.
+ */
+static void movie_sub_sync_present(Player *p, int64_t now_us)
+{
+    int i, best = -1;
+    int64_t best_from = AV_NOPTS_VALUE;
+    unsigned best_id = 0;
+    int64_t aclk = clock_read(&p->clock, NULL, NULL);
+
+    for (i = 0; i < MSUB_Q_CAP; i++) {
+        MsubDecoded *s = &p->msub.plane[i];
+
+        if (!s->occupied || i == p->msub.cur)
+            continue;
+        if (movie_sub_slot_expired(s, now_us))
+            movie_sub_slot_release(s);
+    }
+
+    for (i = 0; i < MSUB_Q_CAP; i++) {
+        MsubDecoded *s = &p->msub.plane[i];
+
+        if (!s->occupied || !s->valid)
+            continue;
+        if (movie_sub_slot_expired(s, now_us))
+            continue;
+        if (!movie_sub_slot_started(s, now_us))
+            continue;
+        if (best < 0 ||
+            (s->from_us != AV_NOPTS_VALUE &&
+             (best_from == AV_NOPTS_VALUE || s->from_us > best_from)) ||
+            (s->from_us == best_from && s->id > best_id)) {
+            best = i;
+            best_from = s->from_us;
+            best_id = s->id;
+        }
+    }
+
+    if (best >= 0) {
+        for (i = 0; i < MSUB_Q_CAP; i++) {
+            MsubDecoded *s = &p->msub.plane[i];
+
+            if (!s->occupied || i == best || i == p->msub.cur)
+                continue;
+            if (movie_sub_slot_started(s, now_us) &&
+                !movie_sub_slot_expired(s, now_us))
+                movie_sub_slot_release(s);
+        }
+        if (p->msub.cur != best)
+            movie_sub_present_from_slot(p, best, now_us, aclk);
+        return;
+    }
+    if (p->msub.cur >= 0 &&
+        movie_sub_slot_expired(&p->msub.plane[p->msub.cur], now_us))
+        movie_sub_clear_current(p, now_us, aclk);
+}
+
+static void movie_sub_log_enqueue(Player *p, const MsubDecoded *s, int64_t aclk)
+{
+    int64_t ahead = 0;
+
+    fprintf(stderr,
+            "SPU ENQUEUE id=%u packet_pts=%" PRId64
+            " first_start_delay=%" PRId64 " absolute_start=%" PRId64
+            " final_stop_delay=%" PRId64 " absolute_stop=%" PRId64
+            " bitmap=%dx%d@(%d,%d) event_count=%d aclk_at_decode=%" PRId64
+            " q=%d/%d first_contr=%u/%u/%u/%u source=%s\n",
+            s->id, s->packet_pts_us, s->first_start_delay_us, s->from_us,
+            s->final_stop_delay_us, s->until_us, s->w, s->h, s->x, s->y,
+            s->evt_n, aclk, movie_sub_q_depth(p), MSUB_Q_CAP,
+            s->first_alpha[0] & 0xf, s->first_alpha[1] & 0xf,
+            s->first_alpha[2] & 0xf, s->first_alpha[3] & 0xf,
+            s->first_contr_src ? "SET_CONTR" : "default{0,0,0,0}");
+    if (aclk != AV_NOPTS_VALUE && s->from_us != AV_NOPTS_VALUE &&
+        s->from_us > aclk)
+        ahead = s->from_us - aclk;
+    if (ahead > p->msub.max_ahead_us)
+        p->msub.max_ahead_us = ahead;
+}
+
 static int movie_sub_decode_unit(Player *p, const uint8_t *buf, int buf_size,
                                  int64_t packet_pts_us)
 {
@@ -4509,7 +5260,8 @@ static int movie_sub_decode_unit(Player *p, const uint8_t *buf, int buf_size,
     uint8_t alpha[4] = {0, 0, 0, 0};
     int offset1 = -1, offset2 = -1;
     int have_area = 0, have_offsets = 0;
-    int start_date = -1, stop_date = -1, forced = 0;
+    int stop_date = -1, forced = 0;
+    int first_start_date = -1;
     int w, h, size;
     unsigned spu_id;
     int saw_chg = 0, evt_n = 0, chg_n = 0;
@@ -4540,13 +5292,21 @@ static int movie_sub_decode_unit(Player *p, const uint8_t *buf, int buf_size,
             switch (cmd) {
             case 0x00:
                 forced = 1;
-                start_date = (int)date;
+                if (first_start_date < 0)
+                    first_start_date = (int)date;
+                movie_sub_push_evt(evts, &evt_n, evt_time, MSUB_EVT_START,
+                                   NULL, NULL, 0);
                 break;
             case 0x01:
-                start_date = (int)date;
+                if (first_start_date < 0)
+                    first_start_date = (int)date;
+                movie_sub_push_evt(evts, &evt_n, evt_time, MSUB_EVT_START,
+                                   NULL, NULL, 0);
                 break;
             case 0x02:
                 stop_date = (int)date;
+                movie_sub_push_evt(evts, &evt_n, evt_time, MSUB_EVT_STOP,
+                                   NULL, NULL, 0);
                 break;
             case 0x03:
                 if (buf_size - pos < 2)
@@ -4605,86 +5365,169 @@ static int movie_sub_decode_unit(Player *p, const uint8_t *buf, int buf_size,
         cmd_pos = next_cmd_pos;
     }
 
+    if (have_area)
+        movie_sub_log_darea(p, x1, x2, y1, y2,
+                            have_offsets ? offset1 : -1,
+                            have_offsets ? offset2 : -1);
+
     if (have_offsets && have_area && offset1 >= 0 && offset2 >= 0 &&
         offset1 < buf_size && offset2 < buf_size) {
         w = x2 - x1 + 1;
         h = y2 - y1 + 1;
         if (w > 0 && h > 1 && w <= FB_W && h <= FB_H) {
+            MsubDecoded *s;
+            uint8_t *keep_idx;
+            MsubRun *keep_runs;
+            int slot, i;
+            int64_t aclk, start_delay, stop_delay;
+
             if (movie_sub_ensure_bufs(p) < 0)
                 return -1;
             pthread_mutex_lock(&p->msub.mu);
-            if (menu_spu_decode_rle(p->msub.idx, w * 2, w, (h + 1) / 2,
+            aclk = clock_read(&p->clock, NULL, NULL);
+            slot = movie_sub_slot_free_index(p);
+            if (slot < 0) {
+                for (i = 0; i < MSUB_Q_CAP; i++) {
+                    if (i == p->msub.cur)
+                        continue;
+                    if (movie_sub_slot_expired(&p->msub.plane[i], aclk))
+                        movie_sub_slot_release(&p->msub.plane[i]);
+                }
+                slot = movie_sub_slot_free_index(p);
+            }
+            if (slot < 0) {
+                p->msub.q_drop++;
+                pthread_mutex_unlock(&p->msub.mu);
+                fprintf(stderr,
+                        "SPU DROP id=%u q_full=%d aclk=%" PRId64
+                        " start would be pts=%" PRId64 "\n",
+                        spu_id, MSUB_Q_CAP, aclk, packet_pts_us);
+                return -1;
+            }
+            s = &p->msub.plane[slot];
+            keep_idx = s->idx;
+            keep_runs = s->runs;
+            memset(s, 0, sizeof(*s));
+            s->idx = keep_idx;
+            s->runs = keep_runs;
+            if (menu_spu_decode_rle(s->idx, w * 2, w, (h + 1) / 2,
                                     buf, offset1, buf_size) < 0 ||
-                menu_spu_decode_rle(p->msub.idx + w, w * 2, w, h / 2,
+                menu_spu_decode_rle(s->idx + w, w * 2, w, h / 2,
                                     buf, offset2, buf_size) < 0) {
+                movie_sub_slot_release(s);
                 pthread_mutex_unlock(&p->msub.mu);
                 return -1;
             }
-            p->msub.x = x1;
-            p->msub.y = y1;
-            p->msub.w = w;
-            p->msub.h = h;
-            p->msub.top_off = offset1;
-            p->msub.bot_off = offset2;
-            memcpy(p->msub.color, colormap, 4);
-            memcpy(p->msub.alpha, alpha, 4);
-            memcpy(p->msub.evt, evts, sizeof(evts));
-            memcpy(p->msub.chg, chgs, sizeof(chgs));
-            p->msub.evt_n = evt_n;
-            p->msub.chg_n = chg_n;
-            p->msub.saw_chg_colcon = saw_chg;
-            p->msub.valid = 1;
-            p->msub.forced = forced;
-            p->msub.shown = 0;
-            p->msub.last_spu_id = spu_id;
-            p->msub.packet_pts_us = packet_pts_us;
+            start_delay = (first_start_date >= 0)
+                              ? movie_sub_dcsq_delay_us((unsigned)first_start_date)
+                              : 0;
+            stop_delay = (stop_date >= 0)
+                             ? movie_sub_dcsq_delay_us((unsigned)stop_date)
+                             : 0;
+            s->id = spu_id;
+            s->valid = 1;
+            s->forced = forced;
+            s->pes_id = p->msub.pes_id;
+            s->logical = p->msub.logical;
+            s->chosen_physical = p->msub.chosen_physical;
+            s->x = x1;
+            s->y = y1;
+            s->w = w;
+            s->h = h;
+            s->top_off = offset1;
+            s->bot_off = offset2;
+            memcpy(s->color, colormap, 4);
+            memcpy(s->alpha, alpha, 4);
+            memcpy(s->evt, evts, sizeof(evts));
+            memcpy(s->chg, chgs, sizeof(chgs));
+            s->evt_n = evt_n;
+            s->chg_n = chg_n;
+            s->saw_chg_colcon = saw_chg;
+            s->packet_pts_us = packet_pts_us;
+            s->first_start_delay_us = start_delay;
+            s->final_stop_delay_us = (stop_date >= 0) ? stop_delay : AV_NOPTS_VALUE;
             if (packet_pts_us != AV_NOPTS_VALUE) {
-                p->msub.from_us = packet_pts_us;
-                if (start_date >= 0)
-                    p->msub.from_us = packet_pts_us +
-                        movie_sub_dcsq_delay_us((unsigned)start_date);
+                s->from_us = packet_pts_us + start_delay;
+                if (first_start_date < 0)
+                    s->from_us = packet_pts_us;
                 if (stop_date >= 0)
-                    p->msub.until_us = packet_pts_us +
-                        movie_sub_dcsq_delay_us((unsigned)stop_date);
+                    s->until_us = packet_pts_us + stop_delay;
                 else
-                    p->msub.until_us = AV_NOPTS_VALUE;
+                    s->until_us = AV_NOPTS_VALUE;
             } else {
-                p->msub.from_us = AV_NOPTS_VALUE;
-                p->msub.until_us = AV_NOPTS_VALUE;
+                s->from_us = AV_NOPTS_VALUE;
+                s->until_us = AV_NOPTS_VALUE;
+            }
+            movie_sub_analyse_decoded(p, s, x1, x2, y1, y2);
+            movie_sub_crop_ever_visible(s);
+            movie_sub_build_runs(s, s->w, s->h);
+            movie_sub_count_vis_runs(s);
+            s->occupied = 1;
+            p->msub.last_slot = slot;
+            movie_sub_snapshot_decoded(p, s);
+            movie_sub_log_timeline(s);
+            movie_sub_log_enqueue(p, s, aclk);
+            if (p->msub.decoded_spus < MSUB_DAREA_LOG) {
+                fprintf(stderr,
+                        "SPU CROP: authored DAREA %dx%d @ (%d,%d) "
+                        "decoded %dx%d -> overlay %dx%d @ (%d,%d) "
+                        "(DAREA-rel crop x=%d y=%d w=%d h=%d)\n"
+                        "SPU RUNS: count=%d visible=%d overflow=%s "
+                        "(overlay-relative inclusive; all codes kept)\n",
+                        s->darea_w, s->darea_h, s->darea_x, s->darea_y,
+                        s->decoded_w, s->decoded_h,
+                        s->w, s->h, s->x, s->y,
+                        s->crop_x, s->crop_y, s->crop_w, s->crop_h,
+                        s->run_n, s->vis_run_n,
+                        s->run_overflow ? "yes" : "no");
             }
             pthread_mutex_unlock(&p->msub.mu);
             p->msub.decoded_spus++;
-            p->msub.bbox_w_sum += (unsigned)w;
-            p->msub.bbox_h_sum += (unsigned)h;
+            p->msub.bbox_w_sum += (unsigned)(s->w > 0 ? s->w : 0);
+            p->msub.bbox_h_sum += (unsigned)(s->h > 0 ? s->h : 0);
             p->msub.bbox_n++;
-            if (w > (int)p->msub.bbox_w_max)
-                p->msub.bbox_w_max = (unsigned)w;
-            if (h > (int)p->msub.bbox_h_max)
-                p->msub.bbox_h_max = (unsigned)h;
-            sub_dbg("SUBTITLE RECT x=%d y=%d w=%d h=%d\n", x1, y1, w, h);
+            if (s->w > (int)p->msub.bbox_w_max)
+                p->msub.bbox_w_max = (unsigned)s->w;
+            if (s->h > (int)p->msub.bbox_h_max)
+                p->msub.bbox_h_max = (unsigned)s->h;
             if (saw_chg)
                 p->msub.chg_colcon_spus++;
-            sub_dbg("SUBTITLE DCSQ start=%" PRId64 " stop=%" PRId64
-                    " forced=%d\n",
-                    p->msub.from_us, p->msub.until_us, forced);
-            sub_dbg("SUBTITLE SPU id=%u\n"
-                    "  from_us=%" PRId64 "\n"
-                    "  until_us=%" PRId64 "\n"
-                    "  saw_chg_colcon=%s\n",
-                    spu_id, p->msub.from_us, p->msub.until_us,
-                    saw_chg ? "yes" : "no");
             return 0;
         }
     }
 
-    if (stop_date >= 0 && p->msub.valid) {
+    if (stop_date >= 0) {
+        int64_t t;
+        MsubDecoded *s = NULL;
+        int slot;
+
         pthread_mutex_lock(&p->msub.mu);
+        slot = p->msub.last_slot;
+        if (slot >= 0 && slot < MSUB_Q_CAP && p->msub.plane[slot].occupied)
+            s = &p->msub.plane[slot];
+        else if (p->msub.cur >= 0)
+            s = &p->msub.plane[p->msub.cur];
+        if (!s) {
+            pthread_mutex_unlock(&p->msub.mu);
+            return -1;
+        }
         if (packet_pts_us != AV_NOPTS_VALUE)
-            p->msub.until_us = packet_pts_us +
-                movie_sub_dcsq_delay_us((unsigned)stop_date);
+            t = packet_pts_us + movie_sub_dcsq_delay_us((unsigned)stop_date);
+        else
+            t = movie_sub_dcsq_delay_us((unsigned)stop_date);
+        s->until_us = t;
+        s->final_stop_delay_us = (packet_pts_us != AV_NOPTS_VALUE)
+                                     ? t - packet_pts_us
+                                     : t;
+        movie_sub_push_evt(s->evt, &s->evt_n, t, MSUB_EVT_STOP, NULL, NULL, 0);
+        if (p->msub.cur >= 0 && s == &p->msub.plane[p->msub.cur]) {
+            p->msub.until_us = t;
+            movie_sub_push_evt(p->msub.evt, &p->msub.evt_n, t, MSUB_EVT_STOP,
+                               NULL, NULL, 0);
+        }
         pthread_mutex_unlock(&p->msub.mu);
-        sub_dbg("SUBTITLE DCSQ start=%" PRId64 " stop=%" PRId64 " forced=%d\n",
-                p->msub.from_us, p->msub.until_us, p->msub.forced);
+        fprintf(stderr, "SPU TIMELINE id=%u extra STOP t=%" PRId64 "\n",
+                s->id, t);
         return 0;
     }
 
@@ -4752,10 +5595,29 @@ static void movie_sub_feed_packet(Player *p, const uint8_t *data, int size,
 
 static int movie_sub_visible_at(const Player *p, int64_t pvpts_us)
 {
+    int i, vis, has_ss;
+
     if (!p->msub.valid || p->msub.w <= 0 || p->msub.h <= 0)
         return 0;
     if (pvpts_us == AV_NOPTS_VALUE)
         return 1;
+    has_ss = 0;
+    vis = 0;
+    for (i = 0; i < p->msub.evt_n; i++) {
+        uint8_t kind = p->msub.evt[i].kind;
+
+        if (kind != MSUB_EVT_START && kind != MSUB_EVT_STOP)
+            continue;
+        has_ss = 1;
+        if (p->msub.evt[i].time_us > pvpts_us)
+            continue;
+        if (kind == MSUB_EVT_START)
+            vis = 1;
+        else
+            vis = 0;
+    }
+    if (has_ss)
+        return vis;
     if (p->msub.from_us != AV_NOPTS_VALUE && pvpts_us < p->msub.from_us)
         return 0;
     if (p->msub.until_us != AV_NOPTS_VALUE && pvpts_us >= p->msub.until_us)
@@ -4770,14 +5632,17 @@ static int movie_sub_would_be_visible(Player *p, int64_t vpts_us)
     if (!p || !p->msub.inited || p->in_menu)
         return 0;
     pthread_mutex_lock(&p->msub.mu);
+    movie_sub_sync_present(p, vpts_us);
     vis = movie_sub_visible_at(p, vpts_us);
     pthread_mutex_unlock(&p->msub.mu);
     return vis;
 }
 
-static void movie_sub_state_at(const Player *p, int64_t now,
-                               uint8_t color[4], uint8_t alpha[4],
-                               const MsubChg **chg)
+static void movie_sub_replay_events(const MsubEvt *evts, int evt_n,
+                                    const MsubChg *chgs, int chg_n,
+                                    int64_t now,
+                                    uint8_t color[4], uint8_t alpha[4],
+                                    const MsubChg **chg, int *last_contr)
 {
     static const uint8_t def_c[4] = {0, 1, 2, 3};
     static const uint8_t def_a[4] = {0, 0, 0, 0};
@@ -4785,30 +5650,44 @@ static void movie_sub_state_at(const Player *p, int64_t now,
 
     memcpy(color, def_c, 4);
     memcpy(alpha, def_a, 4);
-    *chg = NULL;
-    if (p->msub.evt_n <= 0) {
-        memcpy(color, p->msub.color, 4);
-        memcpy(alpha, p->msub.alpha, 4);
-        return;
-    }
-    for (i = 0; i < p->msub.evt_n; i++) {
-        if (now != AV_NOPTS_VALUE && p->msub.evt[i].time_us > now)
+    if (chg)
+        *chg = NULL;
+    if (last_contr)
+        *last_contr = -1;
+    for (i = 0; i < evt_n; i++) {
+        if (now != AV_NOPTS_VALUE && evts[i].time_us > now)
             continue;
-        switch (p->msub.evt[i].kind) {
+        switch (evts[i].kind) {
         case MSUB_EVT_COLOR:
-            memcpy(color, p->msub.evt[i].color, 4);
+            memcpy(color, evts[i].color, 4);
             break;
         case MSUB_EVT_CONTR:
-            memcpy(alpha, p->msub.evt[i].alpha, 4);
+            memcpy(alpha, evts[i].alpha, 4);
+            if (last_contr)
+                *last_contr = i;
             break;
         case MSUB_EVT_CHG:
-            if (p->msub.evt[i].chg_i < p->msub.chg_n)
-                *chg = &p->msub.chg[p->msub.evt[i].chg_i];
+            if (chg && evts[i].chg_i < chg_n)
+                *chg = &chgs[evts[i].chg_i];
             break;
         default:
             break;
         }
     }
+}
+
+static void movie_sub_state_at(const Player *p, int64_t now,
+                               uint8_t color[4], uint8_t alpha[4],
+                               const MsubChg **chg)
+{
+    if (p->msub.evt_n <= 0) {
+        memcpy(color, p->msub.color, 4);
+        memcpy(alpha, p->msub.alpha, 4);
+        *chg = NULL;
+        return;
+    }
+    movie_sub_replay_events(p->msub.evt, p->msub.evt_n, p->msub.chg,
+                            p->msub.chg_n, now, color, alpha, chg, NULL);
 }
 
 static void movie_sub_maps_xy(const uint8_t base_c[4], const uint8_t base_a[4],
@@ -4843,10 +5722,475 @@ static void movie_sub_maps_xy(const uint8_t base_c[4], const uint8_t base_a[4],
     }
 }
 
+static void movie_sub_build_runs(MsubDecoded *s, int w, int h)
+{
+    int y, x, run_n = 0, overflow = 0;
+    const uint8_t *idx;
+
+    s->run_n = 0;
+    s->vis_run_n = 0;
+    s->run_overflow = 0;
+    if (!s->runs || !s->idx || w <= 0 || h <= 0)
+        return;
+    if (h > FB_H)
+        h = FB_H;
+    idx = s->idx;
+    for (y = 0; y < h; y++) {
+        s->rows[y].run0 = (uint16_t)run_n;
+        s->rows[y].n = 0;
+        if (overflow)
+            continue;
+        x = 0;
+        while (x < w) {
+            int x1 = x;
+            uint8_t code = idx[y * w + x] & 3;
+
+            while (x1 + 1 < w && (idx[y * w + x1 + 1] & 3) == code)
+                x1++;
+            if (run_n >= MSUB_RUN_MAX) {
+                overflow = 1;
+                break;
+            }
+            s->runs[run_n].x0 = (uint16_t)x;
+            s->runs[run_n].x1 = (uint16_t)x1;
+            s->runs[run_n].code = code;
+            s->runs[run_n].pad = 0;
+            run_n++;
+            s->rows[y].n++;
+            x = x1 + 1;
+        }
+    }
+    s->run_n = run_n;
+    s->run_overflow = overflow;
+    if (overflow)
+        fprintf(stderr, "SPU RUNS: overflow at %d (cap %d) — remaining rows dropped\n",
+                run_n, MSUB_RUN_MAX);
+}
+
+static int movie_sub_code_chg_ever(const MsubChg *chgs, int chg_n, int code,
+                                   int ax, int ay)
+{
+    int g, b, i, found;
+
+    for (g = 0; g < chg_n; g++) {
+        const MsubChg *chg = &chgs[g];
+
+        for (b = 0; b < chg->n_bands; b++) {
+            if (ay < (int)chg->bands[b].y0 || ay > (int)chg->bands[b].y1)
+                continue;
+            found = -1;
+            for (i = 0; i < chg->bands[b].n_px; i++) {
+                const MsubPx *e = &chg->px[chg->bands[b].px0 + i];
+
+                if ((int)e->start_col <= ax)
+                    found = i;
+                else
+                    break;
+            }
+            if (found >= 0 && (chg->px[chg->bands[b].px0 + found].alpha[code] & 0xf))
+                return 1;
+        }
+    }
+    return 0;
+}
+
+static void movie_sub_analyse_decoded(Player *p, MsubDecoded *s,
+                                      int sx, int ex, int sy, int ey)
+{
+    int w, h, x, y, i, c, contr_i;
+    uint8_t first_c[4], first_a[4];
+    const MsubChg *chg_now = NULL;
+    int glob_ever[4] = {0, 0, 0, 0};
+    int chg_ever[4] = {0, 0, 0, 0};
+    int64_t t_first;
+    const uint8_t *idx;
+    int init_x0, init_y0, init_x1, init_y1, have_init = 0;
+    int ever_x0, ever_y0, ever_x1, ever_y1, have_ever = 0;
+    int log_it;
+
+    w = s->w;
+    h = s->h;
+    idx = s->idx;
+    s->code_n[0] = s->code_n[1] = s->code_n[2] = s->code_n[3] = 0;
+    s->total_px = 0;
+    s->vis_px = 0;
+    s->ever_px = 0;
+    s->geom_valid = 0;
+    s->code_ever[0] = s->code_ever[1] = 0;
+    s->code_ever[2] = s->code_ever[3] = 0;
+    s->first_contr_src = 0;
+    s->first_contr_evt = -1;
+    s->first_contr_time_us = AV_NOPTS_VALUE;
+    if (!idx || w <= 0 || h <= 0)
+        return;
+
+    t_first = s->from_us;
+    if (t_first == AV_NOPTS_VALUE)
+        t_first = 0;
+    movie_sub_replay_events(s->evt, s->evt_n, s->chg, s->chg_n, t_first,
+                            first_c, first_a, &chg_now, &contr_i);
+    memcpy(s->first_alpha, first_a, 4);
+    if (contr_i >= 0) {
+        s->first_contr_src = 1;
+        s->first_contr_evt = contr_i;
+        s->first_contr_time_us = s->evt[contr_i].time_us;
+    }
+    for (c = 0; c < 4; c++) {
+        glob_ever[c] = (first_a[c] & 0xf) != 0;
+    }
+    for (i = 0; i < s->evt_n; i++) {
+        if (s->evt[i].kind != MSUB_EVT_CONTR)
+            continue;
+        for (c = 0; c < 4; c++) {
+            if (s->evt[i].alpha[c] & 0xf)
+                glob_ever[c] = 1;
+        }
+    }
+    for (i = 0; i < s->chg_n; i++) {
+        int k;
+
+        for (k = 0; k < s->chg[i].n_px; k++) {
+            for (c = 0; c < 4; c++) {
+                if (s->chg[i].px[k].alpha[c] & 0xf)
+                    chg_ever[c] = 1;
+            }
+        }
+    }
+
+    s->total_px = w * h;
+    for (y = 0; y < h; y++) {
+        int ay = sy + y;
+
+        for (x = 0; x < w; x++) {
+            int code = idx[y * w + x] & 3;
+            int ax = sx + x;
+            int ever;
+
+            s->code_n[code]++;
+            if (first_a[code] & 0xf) {
+                s->vis_px++;
+                if (!have_init) {
+                    init_x0 = init_x1 = ax;
+                    init_y0 = init_y1 = ay;
+                    have_init = 1;
+                } else {
+                    if (ax < init_x0)
+                        init_x0 = ax;
+                    if (ax > init_x1)
+                        init_x1 = ax;
+                    if (ay < init_y0)
+                        init_y0 = ay;
+                    if (ay > init_y1)
+                        init_y1 = ay;
+                }
+            }
+            ever = glob_ever[code];
+            if (!ever && chg_ever[code])
+                ever = movie_sub_code_chg_ever(s->chg, s->chg_n, code, ax, ay);
+            if (ever) {
+                s->ever_px++;
+                if (!have_ever) {
+                    ever_x0 = ever_x1 = ax;
+                    ever_y0 = ever_y1 = ay;
+                    have_ever = 1;
+                } else {
+                    if (ax < ever_x0)
+                        ever_x0 = ax;
+                    if (ax > ever_x1)
+                        ever_x1 = ax;
+                    if (ay < ever_y0)
+                        ever_y0 = ay;
+                    if (ay > ever_y1)
+                        ever_y1 = ay;
+                }
+            }
+        }
+    }
+
+    s->last_sx = sx;
+    s->last_ex = ex;
+    s->last_sy = sy;
+    s->last_ey = ey;
+    if (have_init) {
+        s->init_x0 = init_x0;
+        s->init_y0 = init_y0;
+        s->init_x1 = init_x1;
+        s->init_y1 = init_y1;
+    } else {
+        s->init_x0 = s->init_y0 = 0;
+        s->init_x1 = s->init_y1 = -1;
+    }
+    if (have_ever) {
+        s->ever_x0 = ever_x0;
+        s->ever_y0 = ever_y0;
+        s->ever_x1 = ever_x1;
+        s->ever_y1 = ever_y1;
+    } else {
+        s->ever_x0 = s->ever_y0 = 0;
+        s->ever_x1 = s->ever_y1 = -1;
+    }
+
+    for (c = 0; c < 4; c++)
+        s->code_ever[c] = glob_ever[c] || chg_ever[c];
+
+    s->geom_valid = 1;
+
+    log_it = (p->msub.decoded_spus < MSUB_DAREA_LOG);
+    if (log_it) {
+        double pct = s->total_px > 0
+                         ? (100.0 * (double)s->vis_px / (double)s->total_px)
+                         : 0.0;
+        int64_t rel = 0;
+
+        if (s->packet_pts_us != AV_NOPTS_VALUE &&
+            s->first_contr_time_us != AV_NOPTS_VALUE)
+            rel = s->first_contr_time_us - s->packet_pts_us;
+        fprintf(stderr,
+                "SPU PIXEL CODES: 0=%d 1=%d 2=%d 3=%d total=%d\n"
+                "SPU FIRST CONTR alpha: 0=%u 1=%u 2=%u 3=%u "
+                "source=%s evt=%d rel_ms=%.3f\n"
+                "SPU VISIBLE: first=%d ever=%d first_pct=%.3f%%\n"
+                "SPU INITIAL VISIBLE BBOX: ",
+                s->code_n[0], s->code_n[1], s->code_n[2], s->code_n[3],
+                s->total_px,
+                s->first_alpha[0] & 0xf, s->first_alpha[1] & 0xf,
+                s->first_alpha[2] & 0xf, s->first_alpha[3] & 0xf,
+                s->first_contr_src ? "SET_CONTR" : "default{0,0,0,0}",
+                s->first_contr_evt, rel / 1000.0,
+                s->vis_px, s->ever_px, pct);
+        if (have_init)
+            fprintf(stderr, "sx=%d ex=%d sy=%d ey=%d (%dx%d)\n",
+                    init_x0, init_x1, init_y0, init_y1,
+                    init_x1 - init_x0 + 1, init_y1 - init_y0 + 1);
+        else
+            fprintf(stderr, "(none)\n");
+        fprintf(stderr, "SPU EVER-VISIBLE BBOX: ");
+        if (have_ever)
+            fprintf(stderr, "sx=%d ex=%d sy=%d ey=%d (%dx%d)\n",
+                    ever_x0, ever_x1, ever_y0, ever_y1,
+                    ever_x1 - ever_x0 + 1, ever_y1 - ever_y0 + 1);
+        else
+            fprintf(stderr, "(none)\n");
+    }
+}
+
+/*
+ * FFmpeg-style geometry normalisation, but using ever-visible alpha
+ * (any timed SET_CONTR / CHG_COLCON), not only the first palette.
+ * Compact the 2-bit bitmap in place and shift overlay x/y.
+ * Menu/HLI bitmaps are not cropped.
+ */
+static void movie_sub_crop_ever_visible(MsubDecoded *s)
+{
+    int ox, oy, ow, oh, cw, ch, y;
+    uint8_t *idx;
+    uint8_t row[FB_W];
+
+    ox = s->x;
+    oy = s->y;
+    ow = s->w;
+    oh = s->h;
+    s->darea_x = ox;
+    s->darea_y = oy;
+    s->darea_w = ow;
+    s->darea_h = oh;
+    s->decoded_w = ow;
+    s->decoded_h = oh;
+    s->crop_x = 0;
+    s->crop_y = 0;
+    s->crop_w = ow;
+    s->crop_h = oh;
+    if (!s->idx || ow <= 0 || oh <= 0)
+        return;
+    if (s->ever_x1 < s->ever_x0) {
+        s->crop_w = 0;
+        s->crop_h = 0;
+        s->w = 0;
+        s->h = 0;
+        return;
+    }
+    s->crop_x = s->ever_x0 - ox;
+    s->crop_y = s->ever_y0 - oy;
+    s->crop_w = s->ever_x1 - s->ever_x0 + 1;
+    s->crop_h = s->ever_y1 - s->ever_y0 + 1;
+    if (s->crop_x < 0)
+        s->crop_x = 0;
+    if (s->crop_y < 0)
+        s->crop_y = 0;
+    if (s->crop_x + s->crop_w > ow)
+        s->crop_w = ow - s->crop_x;
+    if (s->crop_y + s->crop_h > oh)
+        s->crop_h = oh - s->crop_y;
+    cw = s->crop_w;
+    ch = s->crop_h;
+    if (cw <= 0 || ch <= 0) {
+        s->w = 0;
+        s->h = 0;
+        return;
+    }
+    if (s->crop_x == 0 && s->crop_y == 0 && cw == ow && ch == oh)
+        return;
+    idx = s->idx;
+    for (y = 0; y < ch; y++) {
+        memcpy(row, idx + (size_t)(s->crop_y + y) * (size_t)ow +
+                        (size_t)s->crop_x,
+               (size_t)cw);
+        memcpy(idx + (size_t)y * (size_t)cw, row, (size_t)cw);
+    }
+    s->x = ox + s->crop_x;
+    s->y = oy + s->crop_y;
+    s->w = cw;
+    s->h = ch;
+}
+
+static void movie_sub_count_vis_runs(MsubDecoded *s)
+{
+    int i, n = 0;
+
+    for (i = 0; i < s->run_n; i++) {
+        int code = s->runs[i].code & 3;
+
+        if (s->code_ever[code])
+            n++;
+    }
+    s->vis_run_n = n;
+}
+
+typedef struct {
+    int ax0, ax1;
+    uint8_t color[4];
+    uint8_t alpha[4];
+} MsubSpan;
+
+static int movie_sub_split_run(int darea_x, int rx0, int rx1, int py,
+                               const uint8_t base_c[4], const uint8_t base_a[4],
+                               const MsubChg *chg, MsubSpan *out, int out_max)
+{
+    int ax0 = darea_x + rx0;
+    int ax1 = darea_x + rx1;
+    int n = 0, cur, b, i;
+
+    if (rx1 < rx0 || out_max <= 0)
+        return 0;
+    if (!chg) {
+        out[0].ax0 = ax0;
+        out[0].ax1 = ax1;
+        memcpy(out[0].color, base_c, 4);
+        memcpy(out[0].alpha, base_a, 4);
+        return 1;
+    }
+    for (b = 0; b < chg->n_bands; b++) {
+        if (py < (int)chg->bands[b].y0 || py > (int)chg->bands[b].y1)
+            continue;
+        cur = ax0;
+        while (cur <= ax1 && n < out_max) {
+            int next = ax1 + 1;
+            const MsubBand *band = &chg->bands[b];
+
+            movie_sub_maps_xy(base_c, base_a, chg, cur, py,
+                              out[n].color, out[n].alpha);
+            for (i = 0; i < band->n_px; i++) {
+                int sc = (int)chg->px[band->px0 + i].start_col;
+
+                if (sc > cur && sc < next)
+                    next = sc;
+            }
+            out[n].ax0 = cur;
+            out[n].ax1 = next - 1;
+            n++;
+            cur = next;
+        }
+        return n;
+    }
+    out[0].ax0 = ax0;
+    out[0].ax1 = ax1;
+    memcpy(out[0].color, base_c, 4);
+    memcpy(out[0].alpha, base_a, 4);
+    return 1;
+}
+
+static uint8_t msub_blend_u8(uint8_t bg, uint8_t fg, unsigned a8)
+{
+    unsigned ia;
+
+    if (a8 >= 255)
+        return fg;
+    if (a8 == 0)
+        return bg;
+    ia = 255u - a8;
+    return (uint8_t)((bg * ia + fg * a8 + 127u) * 257u >> 16);
+}
+
+typedef struct {
+    uint8_t n;
+    uint16_t x0[MSUB_CH_ROW_SPANS];
+    uint16_t x1[MSUB_CH_ROW_SPANS];
+} MsubChRow;
+
+static void msub_ch_add(MsubChRow *r, int cx0, int cx1)
+{
+    int i;
+
+    if (cx0 < 0)
+        cx0 = 0;
+    if (cx1 < cx0)
+        return;
+    for (i = 0; i < r->n; i++) {
+        if (cx1 + 1 >= (int)r->x0[i] && cx0 <= (int)r->x1[i] + 1) {
+            if (cx0 < (int)r->x0[i])
+                r->x0[i] = (uint16_t)cx0;
+            if (cx1 > (int)r->x1[i])
+                r->x1[i] = (uint16_t)cx1;
+            return;
+        }
+    }
+    if (r->n < MSUB_CH_ROW_SPANS) {
+        r->x0[r->n] = (uint16_t)cx0;
+        r->x1[r->n] = (uint16_t)cx1;
+        r->n++;
+        return;
+    }
+    {
+        int mn = cx0, mx = cx1;
+
+        for (i = 0; i < r->n; i++) {
+            if ((int)r->x0[i] < mn)
+                mn = r->x0[i];
+            if ((int)r->x1[i] > mx)
+                mx = r->x1[i];
+        }
+        r->n = 1;
+        r->x0[0] = (uint16_t)mn;
+        r->x1[0] = (uint16_t)mx;
+    }
+}
+
+static void msub_ch_merge(MsubChRow *r)
+{
+    int i, j;
+
+    for (i = 0; i < r->n; i++) {
+        for (j = i + 1; j < r->n; ) {
+            if ((int)r->x1[i] + 1 >= (int)r->x0[j] &&
+                (int)r->x0[i] <= (int)r->x1[j] + 1) {
+                if (r->x0[j] < r->x0[i])
+                    r->x0[i] = r->x0[j];
+                if (r->x1[j] > r->x1[i])
+                    r->x1[i] = r->x1[j];
+                r->x0[j] = r->x0[r->n - 1];
+                r->x1[j] = r->x1[r->n - 1];
+                r->n--;
+            } else {
+                j++;
+            }
+        }
+    }
+}
+
 static int movie_sub_overlay(Player *p, uint8_t *dst, int stride,
                              int64_t pvpts_us, int64_t *blend_us_out)
 {
-    int x0, y0, w, h, x, y, vis, max_h;
+    int x0, y0, w, h, y, vis, max_h;
     uint8_t color[4], alpha[4];
     uint32_t clut[16];
     int clut_ok;
@@ -4860,6 +6204,8 @@ static int movie_sub_overlay(Player *p, uint8_t *dst, int stride,
         return 0;
     if (p->in_menu)
         return 0;
+    if (!__atomic_load_n(&p->subtitle_enabled, __ATOMIC_RELAXED))
+        return 0;
 
     pthread_mutex_lock(&p->spu.mu);
     clut_ok = p->spu.clut_valid;
@@ -4870,6 +6216,7 @@ static int movie_sub_overlay(Player *p, uint8_t *dst, int stride,
         return 0;
 
     pthread_mutex_lock(&p->msub.mu);
+    movie_sub_sync_present(p, pvpts_us);
     vis = movie_sub_visible_at(p, pvpts_us);
     if (vis && !p->msub.visible_now) {
         p->msub.visible_now = 1;
@@ -4882,7 +6229,10 @@ static int movie_sub_overlay(Player *p, uint8_t *dst, int stride,
         pthread_mutex_lock(&p->msub.mu);
         vis = movie_sub_visible_at(p, pvpts_us);
     } else if (!vis && p->msub.visible_now) {
+        uint8_t zc[4] = {0}, za[4] = {0};
+
         p->msub.visible_now = 0;
+        movie_sub_note_state(p, 0, zc, za, NULL, pvpts_us);
         pthread_mutex_unlock(&p->msub.mu);
         sub_dbg("SUBTITLE CLEAR\n");
         return 0;
@@ -4898,44 +6248,375 @@ static int movie_sub_overlay(Player *p, uint8_t *dst, int stride,
     h = p->msub.h;
     idx = p->msub.idx;
     movie_sub_state_at(p, pvpts_us, color, alpha, &chg);
+    movie_sub_note_state(p, 1, color, alpha, chg, pvpts_us);
     max_h = player_active_h(p);
-    if (w <= 0 || h <= 0 || !idx) {
+    if (w <= 0 || h <= 0 || !idx || !p->msub.runs) {
         pthread_mutex_unlock(&p->msub.mu);
         return 0;
     }
     t0 = av_gettime_relative();
     for (y = 0; y < h; y++) {
         int py = y0 + y;
+        const MsubRow *row;
+        int ri;
 
         if (py < 0 || py >= max_h)
             continue;
-        for (x = 0; x < w; x++) {
-            int px = x0 + x;
-            int code, a4, ci;
-            uint8_t cc[4], aa[4];
-            uint8_t *pix;
+        if (y >= FB_H)
+            break;
+        row = &p->msub.rows[y];
+        for (ri = 0; ri < row->n; ri++) {
+            const MsubRun *run = &p->msub.runs[row->run0 + ri];
+            MsubSpan spans[MSUB_SPAN_MAX];
+            int ns, s;
 
-            if (px < 0 || px >= FB_W)
-                continue;
-            code = idx[y * w + x] & 3;
-            if (chg) {
-                movie_sub_maps_xy(color, alpha, chg, px, py, cc, aa);
-                a4 = aa[code] & 0xf;
-                ci = cc[code] & 0xf;
-            } else {
-                a4 = alpha[code] & 0xf;
-                ci = color[code] & 0xf;
+            ns = movie_sub_split_run(x0, run->x0, run->x1, py, color, alpha,
+                                     chg, spans, MSUB_SPAN_MAX);
+            for (s = 0; s < ns; s++) {
+                int px, a4, ci, ax0, ax1;
+                uint8_t code = run->code & 3;
+
+                a4 = spans[s].alpha[code] & 0xf;
+                if (a4 <= 0)
+                    continue;
+                ci = spans[s].color[code] & 0xf;
+                ax0 = spans[s].ax0;
+                ax1 = spans[s].ax1;
+                if (ax0 < 0)
+                    ax0 = 0;
+                if (ax1 >= FB_W)
+                    ax1 = FB_W - 1;
+                for (px = ax0; px <= ax1; px++) {
+                    uint8_t *pix = dst + (size_t)py * (size_t)stride +
+                                   (size_t)px * 4;
+
+                    menu_blend_pixel(pix, clut[ci], a4 * 17);
+                }
             }
-            if (a4 <= 0)
-                continue;
-            pix = dst + (size_t)py * (size_t)stride + (size_t)px * 4;
-            menu_blend_pixel(pix, clut[ci], a4 * 17);
         }
     }
     if (blend_us_out)
         *blend_us_out = av_gettime_relative() - t0;
     pthread_mutex_unlock(&p->msub.mu);
     return 1;
+}
+
+static int yuv_sub_ensure_scratch(Player *p, const AVFrame *src)
+{
+    if (!p || !src)
+        return -1;
+    if (p->yuv_sub_scratch &&
+        p->yuv_sub_scratch->format == src->format &&
+        p->yuv_sub_scratch->width == src->width &&
+        p->yuv_sub_scratch->height == src->height)
+        return 0;
+    av_frame_free(&p->yuv_sub_scratch);
+    p->yuv_sub_scratch = av_frame_alloc();
+    if (!p->yuv_sub_scratch)
+        return -1;
+    p->yuv_sub_scratch->format = src->format;
+    p->yuv_sub_scratch->width = src->width;
+    p->yuv_sub_scratch->height = src->height;
+    if (av_frame_get_buffer(p->yuv_sub_scratch, 32) < 0) {
+        av_frame_free(&p->yuv_sub_scratch);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Compose one timed SPU into a writable cached YUV420 frame.
+ *
+ * CLUT is authored YUV (byte2=Y, byte1=Cr, byte0=Cb). No YUV→RGB→YUV.
+ * Walks predecoded overlay-relative RLE runs (after ever-visible crop).
+ * Luma: skip alpha 0, memset alpha 255, blend partial. Chroma 4:2:0:
+ * one U/V per video-aligned 2x2, only for chroma blocks touched by
+ * visible spans. CHG_COLCON splits runs at regional boundaries.
+ */
+static int movie_sub_overlay_yuv(Player *p, AVFrame *dst, int64_t pvpts_us,
+                                 int64_t *blend_us_out)
+{
+    int x0, y0, w, h, vis, max_h, y;
+    uint8_t color[4], alpha[4];
+    uint32_t clut[16];
+    int clut_ok;
+    uint8_t *idx;
+    const MsubChg *chg;
+    int64_t t0;
+    MsubChRow ch_rows[(FB_H + 1) / 2];
+    int cy_max, ch_w;
+
+    if (blend_us_out)
+        *blend_us_out = 0;
+    if (!p || !dst || !dst->data[0] || !dst->data[1] || !dst->data[2] ||
+        !p->msub.inited)
+        return 0;
+    if (p->in_menu)
+        return 0;
+    if (!__atomic_load_n(&p->subtitle_enabled, __ATOMIC_RELAXED))
+        return 0;
+    if (dst->format != AV_PIX_FMT_YUV420P && dst->format != AV_PIX_FMT_YUVJ420P)
+        return 0;
+
+    pthread_mutex_lock(&p->spu.mu);
+    clut_ok = p->spu.clut_valid;
+    if (clut_ok)
+        memcpy(clut, p->spu.clut, sizeof(clut));
+    pthread_mutex_unlock(&p->spu.mu);
+    if (!clut_ok)
+        return 0;
+
+    pthread_mutex_lock(&p->msub.mu);
+    movie_sub_sync_present(p, pvpts_us);
+    vis = movie_sub_visible_at(p, pvpts_us);
+    if (vis && !p->msub.visible_now) {
+        p->msub.visible_now = 1;
+        if (!p->msub.shown) {
+            p->msub.shown = 1;
+            p->msub.displayed_spus++;
+        }
+        pthread_mutex_unlock(&p->msub.mu);
+        sub_dbg("SUBTITLE ACTIVE\n");
+        pthread_mutex_lock(&p->msub.mu);
+        vis = movie_sub_visible_at(p, pvpts_us);
+    } else if (!vis && p->msub.visible_now) {
+        uint8_t zc[4] = {0}, za[4] = {0};
+
+        p->msub.visible_now = 0;
+        movie_sub_note_state(p, 0, zc, za, NULL, pvpts_us);
+        pthread_mutex_unlock(&p->msub.mu);
+        sub_dbg("SUBTITLE CLEAR\n");
+        return 0;
+    }
+    if (!vis) {
+        pthread_mutex_unlock(&p->msub.mu);
+        return 0;
+    }
+
+    x0 = p->msub.x;
+    y0 = p->msub.y;
+    w = p->msub.w;
+    h = p->msub.h;
+    idx = p->msub.idx;
+    movie_sub_state_at(p, pvpts_us, color, alpha, &chg);
+    movie_sub_note_state(p, 1, color, alpha, chg, pvpts_us);
+    max_h = player_active_h(p);
+    if (dst->height > 0 && dst->height < max_h)
+        max_h = dst->height;
+    if (w <= 0 || h <= 0 || !idx || !p->msub.runs) {
+        pthread_mutex_unlock(&p->msub.mu);
+        return 0;
+    }
+    if (!p->yuv_sub_algo_logged) {
+        p->yuv_sub_algo_logged = 1;
+        fprintf(stderr,
+                "FPGA YUV SUB: sparse-run YUV420 compose (scratch copy; "
+                "decoder AVFrame not mutated)\n"
+                "FPGA YUV SUB: luma = skip/copy/blend per visible run; "
+                "chroma = alpha-weighted 2x2 on touched blocks only\n");
+    }
+    t0 = av_gettime_relative();
+    memset(ch_rows, 0, sizeof(ch_rows));
+    cy_max = (max_h + 1) / 2;
+    ch_w = dst->width > 0 ? (dst->width + 1) / 2 : (FB_W + 1) / 2;
+    if (cy_max > (FB_H + 1) / 2)
+        cy_max = (FB_H + 1) / 2;
+
+    for (y = 0; y < h; y++) {
+        int py = y0 + y;
+        const MsubRow *row;
+        int ri;
+        uint8_t *yline;
+
+        if (py < 0 || py >= max_h)
+            continue;
+        if (y >= FB_H)
+            break;
+        yline = dst->data[0] + (size_t)py * (size_t)dst->linesize[0];
+        row = &p->msub.rows[y];
+        for (ri = 0; ri < row->n; ri++) {
+            const MsubRun *run = &p->msub.runs[row->run0 + ri];
+            MsubSpan spans[MSUB_SPAN_MAX];
+            int ns, s;
+            uint8_t code = run->code & 3;
+
+            ns = movie_sub_split_run(x0, run->x0, run->x1, py, color, alpha,
+                                     chg, spans, MSUB_SPAN_MAX);
+            for (s = 0; s < ns; s++) {
+                int a4, a8, ci, ax0, ax1, len, ys, cx0, cx1, cy;
+
+                a4 = spans[s].alpha[code] & 0xf;
+                if (a4 <= 0)
+                    continue;
+                a8 = a4 * 17;
+                ci = spans[s].color[code] & 0xf;
+                ys = (int)((clut[ci] >> 16) & 0xff);
+                ax0 = spans[s].ax0;
+                ax1 = spans[s].ax1;
+                if (ax0 < 0)
+                    ax0 = 0;
+                if (dst->width > 0 && ax1 >= dst->width)
+                    ax1 = dst->width - 1;
+                if (ax1 >= FB_W)
+                    ax1 = FB_W - 1;
+                if (ax1 < ax0)
+                    continue;
+                len = ax1 - ax0 + 1;
+                if (a8 >= 255)
+                    memset(yline + ax0, (uint8_t)ys, (size_t)len);
+                else {
+                    int px;
+
+                    for (px = ax0; px <= ax1; px++)
+                        yline[px] = msub_blend_u8(yline[px], (uint8_t)ys,
+                                                  (unsigned)a8);
+                }
+                cy = py >> 1;
+                cx0 = ax0 >> 1;
+                cx1 = ax1 >> 1;
+                if (cy >= 0 && cy < cy_max)
+                    msub_ch_add(&ch_rows[cy], cx0, cx1);
+            }
+        }
+    }
+
+    for (y = 0; y < cy_max; y++) {
+        int si;
+
+        if (!ch_rows[y].n)
+            continue;
+        if (dst->height > 0 && y >= (dst->height + 1) / 2)
+            break;
+        msub_ch_merge(&ch_rows[y]);
+        for (si = 0; si < ch_rows[y].n; si++) {
+            int cx, cx0 = (int)ch_rows[y].x0[si], cx1 = (int)ch_rows[y].x1[si];
+
+            if (cx1 >= ch_w)
+                cx1 = ch_w - 1;
+            for (cx = cx0; cx <= cx1; cx++) {
+                int dy, dx, a_sum = 0, cb_wsum = 0, cr_wsum = 0;
+                uint8_t *up, *vp;
+
+                for (dy = 0; dy < 2; dy++) {
+                    int py = y * 2 + dy;
+
+                    if (py < 0 || py >= max_h)
+                        continue;
+                    for (dx = 0; dx < 2; dx++) {
+                        int px = cx * 2 + dx;
+                        int sx, sy, code, a4, ci, a8;
+                        uint8_t cc[4], aa[4];
+                        int cbs, crs;
+
+                        if (px < 0 || px >= FB_W)
+                            continue;
+                        if (dst->width > 0 && px >= dst->width)
+                            continue;
+                        sx = px - x0;
+                        sy = py - y0;
+                        if (sx < 0 || sy < 0 || sx >= w || sy >= h)
+                            continue;
+                        code = idx[sy * w + sx] & 3;
+                        if (chg)
+                            movie_sub_maps_xy(color, alpha, chg, px, py, cc, aa);
+                        else {
+                            memcpy(cc, color, 4);
+                            memcpy(aa, alpha, 4);
+                        }
+                        a4 = aa[code] & 0xf;
+                        if (a4 <= 0)
+                            continue;
+                        a8 = a4 * 17;
+                        ci = cc[code] & 0xf;
+                        crs = (int)((clut[ci] >> 8) & 0xff);
+                        cbs = (int)(clut[ci] & 0xff);
+                        a_sum += a8;
+                        cb_wsum += a8 * cbs;
+                        cr_wsum += a8 * crs;
+                    }
+                }
+                if (a_sum <= 0)
+                    continue;
+                up = dst->data[1] + (size_t)y * (size_t)dst->linesize[1] +
+                     (size_t)cx;
+                vp = dst->data[2] + (size_t)y * (size_t)dst->linesize[2] +
+                     (size_t)cx;
+                {
+                    int cover = a_sum >> 2;
+                    int cbs = cb_wsum / a_sum;
+                    int crs = cr_wsum / a_sum;
+
+                    *up = msub_blend_u8(*up, (uint8_t)cbs, (unsigned)cover);
+                    *vp = msub_blend_u8(*vp, (uint8_t)crs, (unsigned)cover);
+                }
+            }
+        }
+    }
+    if (blend_us_out)
+        *blend_us_out = av_gettime_relative() - t0;
+    pthread_mutex_unlock(&p->msub.mu);
+    return 1;
+}
+
+static int fpga_yuv_present_planes(Player *p, AVFrame *frame, uint8_t *slot,
+                                   int64_t vpts_us, int frame_menu,
+                                   int *sub_active, int64_t *sub_blend_us,
+                                   int64_t *copy_us, int64_t *scratch_copy_us,
+                                   int64_t *compose_us)
+{
+    const AVFrame *src = frame;
+    int64_t t0, t1, t_copy1, t_comp = 0;
+    int blended = 0;
+
+    if (sub_active)
+        *sub_active = 0;
+    if (sub_blend_us)
+        *sub_blend_us = 0;
+    if (copy_us)
+        *copy_us = 0;
+    if (scratch_copy_us)
+        *scratch_copy_us = 0;
+    if (compose_us)
+        *compose_us = 0;
+    if (!p || !frame || !slot)
+        return -1;
+
+    /*
+     * Full cached AVFrame copy then sparse overlay then DDR copy.
+     * Hardware (PAL 25): scratch copy ~1.65 ms mean; compose ~4.2 ms mean.
+     * Do not add line-overlay or FPGA composition; this path is PAL-safe.
+     */
+    if (p->fpga_yuv420_subtitles &&
+        __atomic_load_n(&p->subtitle_enabled, __ATOMIC_RELAXED) &&
+        !frame_menu && !p->in_menu &&
+        movie_sub_would_be_visible(p, vpts_us)) {
+        t0 = av_gettime_relative();
+        if (yuv_sub_ensure_scratch(p, frame) < 0)
+            return -1;
+        if (av_frame_copy(p->yuv_sub_scratch, frame) < 0)
+            return -1;
+        t_copy1 = av_gettime_relative();
+        if (scratch_copy_us)
+            *scratch_copy_us = t_copy1 - t0;
+        blended = movie_sub_overlay_yuv(p, p->yuv_sub_scratch, vpts_us, &t_comp);
+        if (compose_us)
+            *compose_us = t_comp;
+        if (sub_blend_us)
+            *sub_blend_us = (t_copy1 - t0) + t_comp;
+        if (blended > 0) {
+            src = p->yuv_sub_scratch;
+            if (sub_active)
+                *sub_active = 1;
+        }
+    }
+
+    t0 = av_gettime_relative();
+    if (copy_yuv420_to_slot(slot, src, player_active_h(p)) < 0)
+        return -1;
+    t1 = av_gettime_relative();
+    if (copy_us)
+        *copy_us = t1 - t0;
+    return 0;
 }
 
 static void menu_hl_clear(Player *p)
@@ -6467,6 +8148,9 @@ static void *input_thread(void *opaque)
     note_unpinned_cpu("input", &p->sched_input_cpu);
     fprintf(stderr, "DVD menu navigation: enabled\n");
     fprintf(stderr, "Hold CANCEL/B 3000 ms to return to launcher.\n");
+    fprintf(stderr,
+            "Movie subtitles: --subtitles-on / --subtitles-off "
+            "(default OFF). No runtime toggle.\n");
     dbg("Controller: FPGA status 0x30400008  "
         "{DVD1, display_buf, joystick_0[30:0]}\n"
         "  bits: 0 Right  1 Left  2 Down  3 Up\n"
@@ -6476,7 +8160,7 @@ static void *input_thread(void *opaque)
         "for demux/dvdnav thread.\n",
         CTRL_REPEAT_DELAY_US / 1000.0, CTRL_REPEAT_RATE_US / 1000.0);
 
-    while (!p->fail && !g_interrupt) {
+    while (!p->fail && !g_interrupt && !p->bench_complete) {
         uint32_t bits = 0;
         int64_t now = av_gettime_relative();
 
@@ -7589,6 +9273,7 @@ static void subperf_push(int64_t *arr, int *n, int64_t *sum, int64_t v)
 }
 
 static void subperf_note_present(Player *p, int sub_active, int64_t blend_us,
+                                 int64_t scratch_us, int64_t compose_us,
                                  int64_t sws_us, int64_t ack_us, int ack_waited,
                                  int64_t cycle_us)
 {
@@ -7601,6 +9286,18 @@ static void subperf_note_present(Player *p, int sub_active, int64_t blend_us,
             p->subperf.act_blend_max = blend_us;
         subperf_push(p->subperf.act_blend, &p->subperf.act_blend_n,
                      &p->subperf.act_blend_sum, blend_us);
+        if (scratch_us < 0)
+            scratch_us = 0;
+        if (scratch_us > p->subperf.act_scratch_max)
+            p->subperf.act_scratch_max = scratch_us;
+        subperf_push(p->subperf.act_scratch, &p->subperf.act_scratch_n,
+                     &p->subperf.act_scratch_sum, scratch_us);
+        if (compose_us < 0)
+            compose_us = 0;
+        if (compose_us > p->subperf.act_compose_max)
+            p->subperf.act_compose_max = compose_us;
+        subperf_push(p->subperf.act_compose, &p->subperf.act_compose_n,
+                     &p->subperf.act_compose_sum, compose_us);
         subperf_push(p->subperf.act_sws, &p->subperf.act_sws_n,
                      &p->subperf.act_sws_sum, sws_us);
         subperf_push(p->subperf.act_sws_sub, &p->subperf.act_combo_n,
@@ -8293,6 +9990,174 @@ static int bench_select_inactive_ddr(Player *p)
     return 0;
 }
 
+static const char *unbounded_title(int mode)
+{
+    switch (mode) {
+    case UNBOUNDED_DECODE:
+        return "PERF UNBOUNDED DECODE";
+    case UNBOUNDED_YUV_DDR:
+        return "PERF UNBOUNDED YUV DDR";
+    case UNBOUNDED_BGR_DDR:
+        return "PERF UNBOUNDED BGR DDR";
+    default:
+        return "PERF UNBOUNDED";
+    }
+}
+
+static void unbounded_note_pts(Player *p, AVCodecContext *vdec, AVFrame *frame)
+{
+    int64_t vpts_us;
+
+    assign_video_pts(p, frame, vdec);
+    vpts_us = (p->assigned_pts != AV_NOPTS_VALUE)
+              ? tb_to_us(p->vtb, p->assigned_pts)
+              : AV_NOPTS_VALUE;
+    if (vpts_us != AV_NOPTS_VALUE && p->last_video_pts_us != AV_NOPTS_VALUE) {
+        int64_t gap = vpts_us - p->last_video_pts_us;
+        if (gap < 0)
+            gap = -gap;
+        if (gap > DISC_JUMP_US)
+            p->video_disc++;
+    }
+    if (vpts_us != AV_NOPTS_VALUE)
+        p->last_video_pts_us = vpts_us;
+}
+
+/*
+ * Unpaced MPEG-2 decode (+ optional inactive O_SYNC DDR write + DSB).
+ * Timestamps:
+ *   A  immediately before sws_scale / copy_yuv420_to_slot
+ *   B  immediately after that call returns
+ *   C  immediately after __sync_synchronize()
+ * Decode-only has no DDR write and no barrier.
+ */
+static int unbounded_process_frame(Player *p, AVFrame *frame,
+                                   AVCodecContext *vdec,
+                                   struct SwsContext **sws, int64_t decode_us)
+{
+    uint8_t *dst_data[4] = {0};
+    int dst_linesize[4] = {0};
+    uint8_t *dest = NULL;
+    int64_t tA, tB, tC;
+    int64_t prep_us = 0, barrier_us = 0, combo_us = 0;
+    int warmup = (p->unbounded_warmup_left > 0);
+    int active_h;
+
+    if (player_accept_video_frame(p, frame, vdec) < 0)
+        return -1;
+    unbounded_note_pts(p, vdec, frame);
+    p->video_decoded++;
+    p->bench_decoded++;
+    active_h = player_active_h(p);
+
+    if (p->unbounded_mode == UNBOUNDED_BGR_DDR && !*sws) {
+        AVRational fps0 = detect_fps(p, vdec);
+        fprintf(stderr,
+                "UNBOUNDED BGR DDR: %dx%d %s  %.3f fps\n"
+                "Path: decode → sws_scale inactive O_SYNC BGR0 → "
+                "__sync_synchronize (no ACK/PTS/mailbox)\n"
+                "SWS flags=SWS_FAST_BILINEAR dest stride=%d  "
+                "map=/dev/mem O_RDWR|O_SYNC\n",
+                frame->width, frame->height,
+                av_get_pix_fmt_name(frame->format)
+                    ? av_get_pix_fmt_name(frame->format) : "?",
+                (fps0.num > 0 && fps0.den > 0) ? av_q2d(fps0) : 0.0,
+                FB_STRIDE);
+        *sws = sws_getContext(FB_W, active_h, frame->format,
+                              FB_W, active_h, AV_PIX_FMT_BGR0,
+                              SWS_FAST_BILINEAR, NULL, NULL, NULL);
+        if (!*sws) {
+            fprintf(stderr, "sws_getContext failed\n");
+            player_abort(p);
+            return -1;
+        }
+    } else if (p->unbounded_mode == UNBOUNDED_YUV_DDR &&
+               p->bench_decoded == 1) {
+        fprintf(stderr,
+                "UNBOUNDED YUV DDR: planar Y/U/V copy into inactive O_SYNC "
+                "slot + __sync_synchronize (no ACK/PTS/mailbox)\n"
+                "Y +0 U +0x%05x V +0x%05x  Y stride=%d  C stride=%d\n",
+                YUV_U_OFF, YUV_V_OFF, YUV_Y_STRIDE, YUV_C_STRIDE);
+    } else if (p->unbounded_mode == UNBOUNDED_DECODE &&
+               p->bench_decoded == 1) {
+        fprintf(stderr,
+                "UNBOUNDED DECODE: MPEG-2 decode only "
+                "(no DDR write, no barrier, no ACK/PTS/mailbox)\n");
+    }
+
+    if (p->unbounded_mode != UNBOUNDED_DECODE) {
+        dest = p->bench_target_buf ? p->fb->fb_b : p->fb->fb_a;
+        dst_data[0] = dest;
+        dst_linesize[0] = FB_STRIDE;
+    }
+
+    tA = av_gettime_relative();
+    if (p->unbounded_mode == UNBOUNDED_YUV_DDR) {
+        log_yuv_frame_meta_once(p, frame);
+        if (copy_yuv420_to_slot(dest, frame, active_h) < 0) {
+            fprintf(stderr, "FAIL: unbounded YUV420 plane copy\n");
+            player_abort(p);
+            return -1;
+        }
+        tB = av_gettime_relative();
+        __sync_synchronize();
+        tC = av_gettime_relative();
+        prep_us = tB - tA;
+        barrier_us = tC - tB;
+        combo_us = tC - tA;
+    } else if (p->unbounded_mode == UNBOUNDED_BGR_DDR) {
+        sws_scale(*sws, (const uint8_t * const *)frame->data, frame->linesize,
+                  0, active_h, dst_data, dst_linesize);
+        tB = av_gettime_relative();
+        __sync_synchronize();
+        tC = av_gettime_relative();
+        prep_us = tB - tA;
+        barrier_us = tC - tB;
+        combo_us = tC - tA;
+    } else {
+        tB = tA;
+        tC = tA;
+    }
+    if (prep_us < 0)
+        prep_us = 0;
+    if (barrier_us < 0)
+        barrier_us = 0;
+    if (combo_us < 0)
+        combo_us = 0;
+
+    p->bench_converted++;
+    p->bench_t1_us = tC;
+    if (warmup) {
+        p->unbounded_warmup_left--;
+        p->bench_last_mark_us = tC;
+        return 0;
+    }
+
+    if (!p->bench_t0_us)
+        p->bench_t0_us = (p->bench_last_mark_us > 0) ? p->bench_last_mark_us : tA;
+
+    if (p->bench_last_mark_us > 0 && decode_us >= 0)
+        stat_add(&p->bench_dec_n, &p->bench_dec_sum, &p->bench_dec_min,
+                 &p->bench_dec_max, decode_us);
+    if (p->unbounded_mode != UNBOUNDED_DECODE) {
+        stat_add(&p->bench_sws_n, &p->bench_sws_sum, &p->bench_sws_min,
+                 &p->bench_sws_max, prep_us);
+        stat_add(&p->bench_barrier_n, &p->bench_barrier_sum,
+                 &p->bench_barrier_min, &p->bench_barrier_max, barrier_us);
+        stat_add(&p->bench_combo_n, &p->bench_combo_sum, &p->bench_combo_min,
+                 &p->bench_combo_max, combo_us);
+        p->convert_us += prep_us;
+    }
+    p->bench_timed++;
+    p->bench_last_mark_us = tC;
+
+    if (p->unbounded_frames > 0 && p->bench_timed >= p->unbounded_frames) {
+        player_bench_stop(p);
+        return -1;
+    }
+    return 0;
+}
+
 static int bench_convert_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
                                struct SwsContext **sws, int64_t decode_us)
 {
@@ -8300,6 +10165,9 @@ static int bench_convert_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
     int dst_linesize[4] = {0};
     int64_t now;
     int64_t cpu0, cpu1, c0, sws_wall, sws_cpu;
+
+    if (p->unbounded_mode)
+        return unbounded_process_frame(p, frame, vdec, sws, decode_us);
 
     if (player_accept_video_frame(p, frame, vdec) < 0)
         return -1;
@@ -8554,13 +10422,16 @@ static int present_video_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
     int64_t sws_wall;
     int64_t cpu1;
     if (p->fpga_yuv420) {
+        int64_t copy_us = 0;
+
         log_yuv_frame_meta_once(p, frame);
-        if (copy_yuv420_to_slot(dst_data[0], frame, player_active_h(p)) < 0) {
+        if (fpga_yuv_present_planes(p, frame, dst_data[0], vpts_us, p->in_menu,
+                                    NULL, NULL, &copy_us, NULL, NULL) < 0) {
             fprintf(stderr, "FAIL: FPGA YUV420 plane copy\n");
             player_abort(p);
             return -1;
         }
-        sws_wall = av_gettime_relative() - c0;
+        sws_wall = copy_us;
         cpu1 = (p->sws_cpu_ok && cpu0 >= 0) ? thread_cpu_us() : -1;
         p->convert_us += sws_wall;
         yuv_copy_note(p, sws_wall);
@@ -9304,7 +11175,9 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
             "Total presentation phase: %.3f ms  (hold and stale)\n"
             "sws CPU: %s\n",
             p->fpga_yuv420
-                ? "copy YUV planes to DDR"
+                ? (p->fpga_yuv420_subtitles
+                       ? "cached-YUV subtitle compose (if ON) + plane copy"
+                       : "copy YUV planes to DDR")
                 : p->perf_present_no_convert
                 ? "warmup sws then skip convert"
                 : "sws YUV DIRECT DDR",
@@ -9370,16 +11243,22 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
     int64_t cpu1 = -1;
     int sub_active = 0;
     int64_t sub_blend_us = 0;
+    int64_t sub_scratch_us = 0;
+    int64_t sub_compose_us = 0;
 
     if (p->fpga_yuv420) {
+        int64_t copy_us = 0;
+
         log_yuv_frame_meta_once(p, frame);
         phase_sws_enter(p);
-        if (copy_yuv420_to_slot(dst_data[0], frame, player_active_h(p)) < 0) {
+        if (fpga_yuv_present_planes(p, frame, dst_data[0], vpts_us, frame_menu,
+                                    &sub_active, &sub_blend_us, &copy_us,
+                                    &sub_scratch_us, &sub_compose_us) < 0) {
             fprintf(stderr, "FAIL: FPGA YUV420 plane copy\n");
             player_abort(p);
             return -1;
         }
-        sws_wall = av_gettime_relative() - c0;
+        sws_wall = copy_us;
         cpu1 = (p->sws_cpu_ok && cpu0 >= 0) ? thread_cpu_us() : -1;
         p->convert_us += sws_wall;
         yuv_copy_note(p, sws_wall);
@@ -9583,6 +11462,7 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
         phase_note_present(p, skip_sws ? 0 : sws_wall, ack_wait_us, ack_waited,
                            cycle);
         subperf_note_present(p, sub_active, sub_blend_us,
+                             sub_scratch_us, sub_compose_us,
                              skip_sws ? 0 : sws_wall, ack_wait_us, ack_waited,
                              cycle);
     }
@@ -10025,9 +11905,26 @@ static void *video_thread(void *opaque)
 
     if (p->uncapped_bench) {
         p->bench_video_cpu0 = thread_cpu_us();
-        if (bench_select_inactive_ddr(p) < 0) {
+        if (p->unbounded_mode != UNBOUNDED_DECODE &&
+            bench_select_inactive_ddr(p) < 0) {
             player_abort(p);
             goto done;
+        }
+        if (p->unbounded_mode) {
+            fprintf(stderr,
+                    "=== %s ===\n"
+                    "Unpaced MPEG-2. No ACK, PTS hold, mailbox, or audio.\n"
+                    "Warmup %d then %d timed frames.\n",
+                    unbounded_title(p->unbounded_mode),
+                    UNBOUNDED_WARMUP_FRAMES, p->unbounded_frames);
+            if (p->unbounded_mode != UNBOUNDED_DECODE && p->bench_bufs_ok)
+                fprintf(stderr,
+                        "FPGA display_buf (scanout): %s\n"
+                        "Inactive dest:              %s  phys 0x%08lx  "
+                        "/dev/mem O_RDWR|O_SYNC\n",
+                        fb_letter(p->bench_active_buf),
+                        fb_letter(p->bench_target_buf),
+                        p->bench_target_buf ? FB_B_PHYS : FB_A_PHYS);
         }
     }
     if (player_buffered(p) && p->initial_skip_left > 0)
@@ -10486,11 +12383,72 @@ static int run_perf_sws_ddr(FBPair *fb)
     return 0;
 }
 
+static void print_unbounded_us(const char *name, unsigned long n,
+                               int64_t sum, int64_t minv, int64_t maxv)
+{
+    double avg = n ? (double)sum / (double)n : 0.0;
+
+    fprintf(stderr,
+            "    %-18s n=%lu  min=%" PRId64 "  avg=%.1f  max=%" PRId64 "\n",
+            name, n, n ? minv : 0, avg, n ? maxv : 0);
+}
+
+static void print_unbounded_report(const Player *p)
+{
+    double bench_dur = 0.0;
+    double fps = 0.0;
+    int frames;
+
+    if (p->bench_t0_us && p->bench_t1_us >= p->bench_t0_us)
+        bench_dur = (p->bench_t1_us - p->bench_t0_us) / 1e6;
+    frames = p->bench_timed;
+    if (bench_dur > 0.0 && frames > 0)
+        fps = frames / bench_dur;
+
+    fprintf(stderr, "\n=== %s ===\n", unbounded_title(p->unbounded_mode));
+    fprintf(stderr,
+            "    timed_frames=%d  warmup=%d  decoded=%d\n"
+            "    duration_s=%.3f\n"
+            "    throughput_fps=%.3f\n",
+            frames, UNBOUNDED_WARMUP_FRAMES, p->bench_decoded,
+            bench_dur, fps);
+    print_unbounded_us("decode_us", p->bench_dec_n, p->bench_dec_sum,
+                       p->bench_dec_min, p->bench_dec_max);
+    if (p->unbounded_mode == UNBOUNDED_YUV_DDR) {
+        print_unbounded_us("yuv_copy_us", p->bench_sws_n, p->bench_sws_sum,
+                           p->bench_sws_min, p->bench_sws_max);
+        print_unbounded_us("barrier_us", p->bench_barrier_n,
+                           p->bench_barrier_sum, p->bench_barrier_min,
+                           p->bench_barrier_max);
+        print_unbounded_us("copy+barrier_us", p->bench_combo_n,
+                           p->bench_combo_sum, p->bench_combo_min,
+                           p->bench_combo_max);
+    } else if (p->unbounded_mode == UNBOUNDED_BGR_DDR) {
+        print_unbounded_us("sws_us", p->bench_sws_n, p->bench_sws_sum,
+                           p->bench_sws_min, p->bench_sws_max);
+        print_unbounded_us("barrier_us", p->bench_barrier_n,
+                           p->bench_barrier_sum, p->bench_barrier_min,
+                           p->bench_barrier_max);
+        print_unbounded_us("sws+barrier_us", p->bench_combo_n,
+                           p->bench_combo_sum, p->bench_combo_min,
+                           p->bench_combo_max);
+    }
+    fprintf(stderr,
+            "    A = before sws_scale/copy   B = after return   "
+            "C = after __sync_synchronize\n"
+            "    decode-only has no A/B/C DDR window; barrier is inside "
+            "yuv/bgr paths every timed frame.\n"
+            "    No ACK, PTS, mailbox, or presentation pacing.\n");
+}
+
 int main(int argc, char **argv)
 {
     install_sigill_handler();
     install_interrupt_handler();
     setvbuf(stderr, NULL, _IONBF, 0);
+
+    if (movie_sub_rle_field_selftest() < 0)
+        return 1;
 
     Cli cli;
     if (parse_cli(argc, argv, &cli) < 0)
@@ -10514,6 +12472,12 @@ int main(int argc, char **argv)
     fprintf(stderr, "=== SS1 THREADED DVD A/V ===\n");
     if (cli.uncapped_video_benchmark)
         fprintf(stderr, "Player mode: uncapped video benchmark\n");
+    else if (cli_unbounded_mode(&cli) == UNBOUNDED_DECODE)
+        fprintf(stderr, "Player mode: PERF unbounded decode\n");
+    else if (cli_unbounded_mode(&cli) == UNBOUNDED_YUV_DDR)
+        fprintf(stderr, "Player mode: PERF unbounded YUV DDR\n");
+    else if (cli_unbounded_mode(&cli) == UNBOUNDED_BGR_DDR)
+        fprintf(stderr, "Player mode: PERF unbounded BGR DDR\n");
     else if (cli.buffered_yuv)
         fprintf(stderr, "Player mode: buffered-YUV%s%s\n",
                 cli.perf_present_no_convert ? " (ACK isolation, no per-frame sws)" : "",
@@ -10650,13 +12614,21 @@ int main(int argc, char **argv)
     p.audio_follow_fmt = -1;
     p.avf = fmt;
     p.last_audio_pts_us = AV_NOPTS_VALUE;
-    p.uncapped_bench = cli.uncapped_video_benchmark;
+    p.uncapped_bench = cli.uncapped_video_benchmark ||
+                       (cli_unbounded_mode(&cli) != UNBOUNDED_OFF);
+    p.unbounded_mode = cli_unbounded_mode(&cli);
+    p.unbounded_frames = cli.unbounded_frames;
+    p.unbounded_warmup_left = p.unbounded_mode ? UNBOUNDED_WARMUP_FRAMES : 0;
     p.buffered_video = cli.buffered_video;
     p.buffered_yuv = cli.buffered_yuv;
     p.perf_present_no_convert = cli.perf_present_no_convert;
     p.phase_decode = cli.phase_decode;
     p.fpga_yuv420 = cli.fpga_yuv420;
+    p.fpga_yuv420_subtitles = cli.fpga_yuv420_subtitles;
+    p.subtitle_enabled = cli.subtitles_on ? 1 : 0;
     p.subperf.act_blend = calloc(ISO_SAMPLE_CAP, sizeof(int64_t));
+    p.subperf.act_scratch = calloc(ISO_SAMPLE_CAP, sizeof(int64_t));
+    p.subperf.act_compose = calloc(ISO_SAMPLE_CAP, sizeof(int64_t));
     p.subperf.act_sws = calloc(ISO_SAMPLE_CAP, sizeof(int64_t));
     p.subperf.act_ack = calloc(ISO_SAMPLE_CAP, sizeof(int64_t));
     p.subperf.act_cyc = calloc(ISO_SAMPLE_CAP, sizeof(int64_t));
@@ -10664,7 +12636,8 @@ int main(int argc, char **argv)
     p.subperf.inact_sws = calloc(ISO_SAMPLE_CAP, sizeof(int64_t));
     p.subperf.inact_ack = calloc(ISO_SAMPLE_CAP, sizeof(int64_t));
     p.subperf.inact_cyc = calloc(ISO_SAMPLE_CAP, sizeof(int64_t));
-    p.subperf.inited = p.subperf.act_blend && p.subperf.act_sws &&
+    p.subperf.inited = p.subperf.act_blend && p.subperf.act_scratch &&
+                       p.subperf.act_compose && p.subperf.act_sws &&
                        p.subperf.act_ack && p.subperf.act_cyc &&
                        p.subperf.act_sws_sub && p.subperf.inact_sws &&
                        p.subperf.inact_ack && p.subperf.inact_cyc;
@@ -10701,7 +12674,9 @@ int main(int argc, char **argv)
     }
     p.first_audio_pts_us = AV_NOPTS_VALUE;
     p.initial_skip_req = cli.initial_video_skip;
-    p.initial_skip_left = cli.uncapped_video_benchmark ? 0 : cli.initial_video_skip;
+    p.initial_skip_left = (cli.uncapped_video_benchmark ||
+                           cli_unbounded_mode(&cli))
+                          ? 0 : cli.initial_video_skip;
     p.video_advance_ms = cli.buffered_yuv ? cli.video_advance_ms : 0;
     if (cli.buffered_yuv)
         fprintf(stderr, "Buffered YUV queue: enabled (%d frames)\n",
@@ -10709,9 +12684,10 @@ int main(int argc, char **argv)
     else if (cli.buffered_video)
         fprintf(stderr, "Buffered video queue: enabled (%d frames)\n",
                 VIDEO_BUFFER_FRAMES);
-    if (cli.uncapped_video_benchmark && cli.initial_video_skip)
+    if ((cli.uncapped_video_benchmark || cli_unbounded_mode(&cli)) &&
+        cli.initial_video_skip)
         fprintf(stderr,
-                "Initial video skip %d ignored in uncapped benchmark.\n",
+                "Initial video skip %d ignored in throughput benchmark.\n",
                 cli.initial_video_skip);
     else
         fprintf(stderr, "Initial video skip: %d\n", cli.initial_video_skip);
@@ -10750,9 +12726,22 @@ int main(int argc, char **argv)
         }
         fprintf(stderr,
                 "FPGA YUV420 MODE: planar Y/U/V copy, mailbox bit1, "
-                "FPGA BT.601. sws_scale skipped.\n"
-                "FPGA YUV420 MODE: subtitles/menu overlays disabled for experiment\n");
+                "FPGA BT.601. sws_scale skipped.\n");
+        if (cli.fpga_yuv420_subtitles)
+            fprintf(stderr,
+                    "FPGA YUV420 MODE: cached-YUV movie subtitle compose "
+                    "before O_SYNC copy. No BGR0 blend. Menu highlights still "
+                    "skipped in this experiment.\n");
+        else
+            fprintf(stderr,
+                    "FPGA YUV420 MODE: movie subtitle overlay off unless "
+                    "--fpga-yuv420-subtitles. Menu highlights skipped.\n");
     }
+    fprintf(stderr,
+            "Movie subtitles: %s (--subtitles-on / --subtitles-off). "
+            "Forced DCSQ is parsed but OFF hides all movie SPUs "
+            "(no forced-only path yet).\n",
+            p.subtitle_enabled ? "ON" : "OFF (default)");
     clock_init(&p.clock);
     navq_init(&p);
     d.player = &p;
@@ -10801,7 +12790,7 @@ int main(int argc, char **argv)
     dbg("\nDemuxing (continuous, backpressure on full queues)...\n");
 
     for (;;) {
-        if (p.fail || g_interrupt)
+        if (p.fail || g_interrupt || p.bench_complete)
             break;
         dvdio_process_nav_cmds(&d);
         if (d.stopped)
@@ -11044,6 +13033,8 @@ int main(int argc, char **argv)
     if (g_interrupt) {
         stop_reason = "Ctrl+C / SIGTERM";
         player_abort(&p);
+    } else if (p.bench_complete) {
+        stop_reason = "unbounded frame count reached";
     } else if (p.fail) {
         stop_reason = "fatal error";
     } else if (d.stopped) {
@@ -11087,7 +13078,9 @@ int main(int argc, char **argv)
     int timed_decoded = p.video_decoded;
     int accounted = p.rendered + p.stale_dropped;
 
-    if (p.uncapped_bench) {
+    if (p.unbounded_mode) {
+        print_unbounded_report(&p);
+    } else if (p.uncapped_bench) {
         double bench_dur = 0.0;
         if (p.bench_t0_us && p.bench_t1_us >= p.bench_t0_us)
             bench_dur = (p.bench_t1_us - p.bench_t0_us) / 1e6;
@@ -11288,7 +13281,7 @@ int main(int argc, char **argv)
                     sr, avg_still, avg_px, avg_bbox, p.spu_perf.bbox_max);
         }
         if (g_debug_subtitles || p.msub.complete_spus || p.msub.displayed_spus ||
-            p.msub.spu_fragments) {
+            p.msub.spu_fragments || p.msub.decoded_spus || p.msub.geom_valid) {
             fprintf(stderr,
                     "SUBTITLE STATS:\n"
                     "  spu_fragments=%lu\n"
@@ -11303,24 +13296,102 @@ int main(int argc, char **argv)
                     p.msub.decoded_spus, p.msub.displayed_spus,
                     p.msub.malformed_spus, p.msub.chg_colcon_spus,
                     p.msub.chg_colcon_events, p.msub.malformed_chg_colcon);
+            fprintf(stderr,
+                    "  q_cap=%d\n"
+                    "  q_drop=%lu\n"
+                    "  max_decode_ahead_us=%" PRId64 "\n",
+                    MSUB_Q_CAP, p.msub.q_drop, p.msub.max_ahead_us);
             if (p.msub.bbox_n)
                 fprintf(stderr,
                         "  bbox avg=%ux%u max=%ux%u n=%u\n",
                         (unsigned)(p.msub.bbox_w_sum / p.msub.bbox_n),
                         (unsigned)(p.msub.bbox_h_sum / p.msub.bbox_n),
                         p.msub.bbox_w_max, p.msub.bbox_h_max, p.msub.bbox_n);
+            if (p.msub.geom_valid) {
+                double pct = p.msub.total_px > 0
+                                 ? (100.0 * (double)p.msub.vis_px /
+                                    (double)p.msub.total_px)
+                                 : 0.0;
+
+                fprintf(stderr,
+                        "SPU GEOMETRY (last decoded):\n"
+                        "  authored DAREA sx=%d ex=%d sy=%d ey=%d (%dx%d)\n"
+                        "  decoded bitmap %dx%d\n"
+                        "  ever-visible crop DAREA-rel x=%d y=%d w=%d h=%d\n"
+                        "  overlay origin (%d,%d) size %dx%d\n",
+                        p.msub.last_sx, p.msub.last_ex, p.msub.last_sy,
+                        p.msub.last_ey,
+                        p.msub.last_ex - p.msub.last_sx + 1,
+                        p.msub.last_ey - p.msub.last_sy + 1,
+                        p.msub.decoded_w, p.msub.decoded_h,
+                        p.msub.crop_x, p.msub.crop_y,
+                        p.msub.crop_w, p.msub.crop_h,
+                        p.msub.x, p.msub.y, p.msub.w, p.msub.h);
+                if (p.msub.init_x1 >= p.msub.init_x0)
+                    fprintf(stderr,
+                            "  initial visible bbox sx=%d ex=%d sy=%d ey=%d "
+                            "(%dx%d)\n",
+                            p.msub.init_x0, p.msub.init_x1, p.msub.init_y0,
+                            p.msub.init_y1,
+                            p.msub.init_x1 - p.msub.init_x0 + 1,
+                            p.msub.init_y1 - p.msub.init_y0 + 1);
+                else
+                    fprintf(stderr, "  initial visible bbox (none)\n");
+                if (p.msub.ever_x1 >= p.msub.ever_x0)
+                    fprintf(stderr,
+                            "  ever-visible bbox sx=%d ex=%d sy=%d ey=%d "
+                            "(%dx%d)\n",
+                            p.msub.ever_x0, p.msub.ever_x1, p.msub.ever_y0,
+                            p.msub.ever_y1,
+                            p.msub.ever_x1 - p.msub.ever_x0 + 1,
+                            p.msub.ever_y1 - p.msub.ever_y0 + 1);
+                else
+                    fprintf(stderr, "  ever-visible bbox (none)\n");
+                fprintf(stderr,
+                        "  total pixels=%d\n"
+                        "  first-visible pixels=%d / %.3f%%\n"
+                        "  ever-visible pixels=%d\n"
+                        "  pixel codes 0=%d 1=%d 2=%d 3=%d\n"
+                        "  first CONTR alpha 0=%u 1=%u 2=%u 3=%u\n"
+                        "  run count=%d\n"
+                        "  visible-run count=%d\n"
+                        "  run overflow=%s\n",
+                        p.msub.total_px, p.msub.vis_px, pct, p.msub.ever_px,
+                        p.msub.code_n[0], p.msub.code_n[1], p.msub.code_n[2],
+                        p.msub.code_n[3],
+                        p.msub.first_alpha[0] & 0xf, p.msub.first_alpha[1] & 0xf,
+                        p.msub.first_alpha[2] & 0xf, p.msub.first_alpha[3] & 0xf,
+                        p.msub.run_n, p.msub.vis_run_n,
+                        p.msub.run_overflow ? "yes" : "no");
+            }
         }
         if (p.subperf.act_frames || p.subperf.inact_frames) {
+            int yuv_sub = p.fpga_yuv420;
             fprintf(stderr, "SUBTITLE BLEND PERF:\n");
             fprintf(stderr, "  ACTIVE frames=%lu stale=%lu missed_boundaries=%lu\n",
                     p.subperf.act_frames, p.subperf.act_stale,
                     p.subperf.act_miss);
-            subperf_print_dist("blend_us", p.subperf.act_blend,
+            subperf_print_dist(yuv_sub ? "yuv_sub_blend_us" : "blend_us",
+                               p.subperf.act_blend,
                                p.subperf.act_blend_n, p.subperf.act_blend_sum,
                                p.subperf.act_blend_max);
-            subperf_print_dist("sws_us", p.subperf.act_sws,
+            if (yuv_sub) {
+                subperf_print_dist("yuv_scratch_copy_us",
+                                   p.subperf.act_scratch,
+                                   p.subperf.act_scratch_n,
+                                   p.subperf.act_scratch_sum,
+                                   p.subperf.act_scratch_max);
+                subperf_print_dist("yuv_sub_compose_us",
+                                   p.subperf.act_compose,
+                                   p.subperf.act_compose_n,
+                                   p.subperf.act_compose_sum,
+                                   p.subperf.act_compose_max);
+            }
+            subperf_print_dist(yuv_sub ? "yuv_copy_us" : "sws_us",
+                               p.subperf.act_sws,
                                p.subperf.act_sws_n, p.subperf.act_sws_sum, 0);
-            subperf_print_dist("sws+blend_us", p.subperf.act_sws_sub,
+            subperf_print_dist(yuv_sub ? "blend+yuv_copy_us" : "sws+blend_us",
+                               p.subperf.act_sws_sub,
                                p.subperf.act_combo_n, p.subperf.act_combo_sum,
                                0);
             subperf_print_dist("ack_us", p.subperf.act_ack,
@@ -11331,7 +13402,8 @@ int main(int argc, char **argv)
                     "  INACTIVE frames=%lu stale=%lu missed_boundaries=%lu\n",
                     p.subperf.inact_frames, p.subperf.inact_stale,
                     p.subperf.inact_miss);
-            subperf_print_dist("sws_us", p.subperf.inact_sws,
+            subperf_print_dist(yuv_sub ? "yuv_copy_us" : "sws_us",
+                               p.subperf.inact_sws,
                                p.subperf.inact_sws_n, p.subperf.inact_sws_sum,
                                0);
             subperf_print_dist("ack_us", p.subperf.inact_ack,
@@ -12062,7 +14134,10 @@ int main(int argc, char **argv)
         free(p.phase_cyc);
     }
     free(p.yuv_copy);
+    av_frame_free(&p.yuv_sub_scratch);
     free(p.subperf.act_blend);
+    free(p.subperf.act_scratch);
+    free(p.subperf.act_compose);
     free(p.subperf.act_sws);
     free(p.subperf.act_ack);
     free(p.subperf.act_cyc);
@@ -12091,6 +14166,14 @@ int main(int argc, char **argv)
     }
     if (p.fail)
         return 10;
+    if (p.unbounded_mode) {
+        if (p.bench_timed <= 0)
+            return 9;
+        fprintf(stderr,
+                "PASS: %s  %.3f s  timed=%d\n",
+                unbounded_title(p.unbounded_mode), wall, p.bench_timed);
+        return 0;
+    }
     if (p.uncapped_bench) {
         if (p.bench_converted <= 0)
             return 9;
