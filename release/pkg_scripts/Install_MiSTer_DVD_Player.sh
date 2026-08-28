@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# MiSTer DVD Player 0.1.0-private-beta installer.
+# MiSTer DVD Player 0.1.0-public-beta installer.
 #
 # Run from the MiSTer Scripts menu after extracting the ZIP to the SD root.
 # Idempotent.
@@ -16,7 +16,7 @@
 
 set -e
 
-VERSION="0.1.0-private-beta"
+VERSION="0.1.0-public-beta"
 DVD_ROOT=/media/fat/DVD
 DEVDIR=$DVD_ROOT/dev
 BINDIR=$DVD_ROOT/bin
@@ -182,8 +182,8 @@ ls "$LIBDIR"/libdvdread.so* >/dev/null 2>&1 || \
     die "missing libdvdread in $LIBDIR"
 ls "$LIBDIR"/libdvdnav.so* >/dev/null 2>&1 || \
     die "missing libdvdnav in $LIBDIR"
-ls "$LIBDIR"/libdvdcss.so* >/dev/null 2>&1 || \
-    die "missing libdvdcss in $LIBDIR"
+# libdvdcss is optional and is not distributed with this package.
+# Do not fail if it is absent. Do not download it. Do not delete or overwrite it.
 
 MAIN_SRC=$(find_main) || die "missing MiSTer_DVD (install beside stock MiSTer; do not replace /media/fat/MiSTer)"
 
@@ -319,3 +319,14 @@ info "Games dir:  /media/fat/games/DVD-Player"
 info "Main menu item: MiSTer DVD Player"
 info "Re-running this installer is safe and will not duplicate startup or INI entries."
 info "Library cache and logs were preserved."
+info ""
+info "libdvdcss is not distributed with MiSTer DVD Player."
+info "Encrypted physical DVD playback and ripping require a compatible"
+info "user-supplied libdvdcss.so.2 at /media/fat/DVD/lib/libdvdcss.so.2"
+info "Consult the official VideoLAN libdvdcss project and applicable local law."
+if [ -e "$LIBDIR/libdvdcss.so.2" ] || [ -e "$LIBDIR/libdvdcss.so.2.2.0" ]; then
+    info "An existing libdvdcss library was found and was left unchanged."
+else
+    info "No libdvdcss.so.2 found; unencrypted discs and ISO playback remain available."
+    info "Encrypted physical DVD playback/ripping may be unavailable until CSS is supplied."
+fi

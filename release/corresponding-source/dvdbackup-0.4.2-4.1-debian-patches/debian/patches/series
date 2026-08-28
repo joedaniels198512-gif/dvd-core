@@ -1,0 +1,3 @@
+ignore-automake-warnings.patch
+remove-path_max-limitation.patch
+libdvdread6.1.0.patch

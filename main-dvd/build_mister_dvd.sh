@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Cross-compile MiSTer_DVD from the recorded Main_MiSTer snapshot + DVD overlay.
 # Does not deploy. Requires ARM GNU-A 10.2.1 arm-none-linux-gnueabihf.
 # Refuses Homebrew GCC 15 (GLIBCXX_3.4.32) and armv7-unknown (VFPv4).

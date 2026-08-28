@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // MPEG-2 4:2:0 chroma *row* inside a frame-stored YUV420P plane.
 //
 // Progressive / frame (interlaced=0), FFmpeg YUV420P packing:

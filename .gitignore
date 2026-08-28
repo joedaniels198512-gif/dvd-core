@@ -52,3 +52,10 @@ fpga/*.done
 fpga/*.pin
 fpga/*.qws
 fpga/*.jdi
+
+# --- Generated release staging / zips (pack_*.sh output) ---
+release/MiSTer_DVD_Player_*/
+release/*.zip
+release/*.sha256
+release/src-cache/
+

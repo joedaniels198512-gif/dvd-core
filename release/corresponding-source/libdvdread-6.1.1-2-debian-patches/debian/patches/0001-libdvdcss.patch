@@ -1,0 +1,27 @@
+From: Daniel Baumann <mail@daniel-baumann.ch>
+Date: Tue, 22 Apr 2014 11:14:26 +0200
+Subject: libdvdcss
+
+Print information about the CSS README.
+---
+ src/dvd_input.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+--- a/src/dvd_input.c
++++ b/src/dvd_input.c
+@@ -381,7 +381,14 @@
+ 
+   } else {
+     DVDReadLog(priv, logcb, DVD_LOGGER_LEVEL_WARN,
+-               "Encrypted DVD support unavailable.");
++               "Encrypted DVD support unavailable."
++               "************************************************\n"
++               "**                                            **\n"
++               "**  No css library available. See             **\n"
++               "**  /usr/share/doc/libdvdread4/README.css     **\n"
++               "**  for more information.                     **\n"
++               "**                                            **\n"
++               "************************************************\n");
+ 
+     /* libdvdcss replacement functions */
+     dvdinput_open  = file_open;

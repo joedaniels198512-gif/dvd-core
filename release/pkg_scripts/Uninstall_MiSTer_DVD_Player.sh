@@ -7,7 +7,9 @@
 # and /media/fat/MiSTer_DVD.
 #
 # Does NOT delete /media/fat/MiSTer (stock Main).
-# Does NOT delete /media/fat/DVD/ (library, cache, logs, ISOs, daemon source).
+# Does NOT delete /media/fat/DVD/ (library, cache, logs, ISOs, daemon source,
+# or a user-supplied libdvdcss.so.2).
+
 # Does NOT touch unrelated cores or configuration.
 #
 

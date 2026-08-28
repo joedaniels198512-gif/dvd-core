@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // Planar YUV420P byte-address / 8 (DDRAM_ADDR) inside one 2 MiB A/B slot.
 //
 //   Y  +0x000000  stride 720   (90 beats / line)

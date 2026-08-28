@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 #ifndef DVD_MAIN_H
 #define DVD_MAIN_H
 

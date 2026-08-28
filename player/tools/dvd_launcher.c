@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * dvd_launcher.c — first public-facing SS1 DVD launcher.
  *

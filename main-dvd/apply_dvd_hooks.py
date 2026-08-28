@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Idempotent DVD supervisor hooks for the Main_MiSTer snapshot in .src/."""
 from pathlib import Path
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // Ping-pong line reader for native 480i / 576i CRT.
 //
 // Legacy mode (req_yuv=0, default): 720x576 BGR0, stride 2880.

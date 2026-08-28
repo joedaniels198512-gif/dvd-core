@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // BT.601 limited-range YCbCr → RGB, integer formula matching DVD swscale.
 //
 //   C = Y - 16

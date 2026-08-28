@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * dvd_rip_iso.c — decrypt a physical DVD to a DVD-Video ISO on USB.
  *

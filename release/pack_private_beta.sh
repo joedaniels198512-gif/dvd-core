@@ -1,5 +1,7 @@
 #!/bin/bash
 # Assemble MiSTer DVD Player 0.1.0-private-beta ZIP.
+# NOT the public conservative packager — that is pack_public_beta.sh
+# (private-beta still historically bundled libdvdcss; do not use for public).
 # Does not deploy, commit, or run Quartus.
 set -euo pipefail
 

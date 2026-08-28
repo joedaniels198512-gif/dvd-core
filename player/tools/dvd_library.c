@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * dvd_library.c — DVD-Video ISO discovery, validation, and cache.
  *

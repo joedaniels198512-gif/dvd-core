@@ -1,0 +1,55 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: libdvdnav
+Source: https://www.videolan.org/developers/libdvdnav.html
+
+Files: *
+Copyright: 2000-2001, Björn Englund
+           2006-2007, Diego Pettenò <flameeyes@gmail.com>
+           1989-1991, Free Software Foundation, Inc
+           2000-2001, Håkan Hjort
+           2000-2001, Martin Norbäck
+           2000-2004, Rich Wareham <richwareham@users.sourceforge.net>
+           2001-2004, the libdvdnav project
+           2000-2007, the xine project
+License: GPL-2+
+
+Files: msvc/msvc/contrib/getopt.c
+Copyright: 1987-1997, Free Software Foundation, Inc
+License: LGPL-2+
+ This library is free software; you can redistribute it and/or modify it
+ under the terms of the GNU Library General Public License as published by the
+ Free Software Foundation; either version 2 of the License, or (at your
+ option) any later version.
+ .
+ This library is distributed in the hope that it will be useful, but WITHOUT
+ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License
+ for more details.
+ .
+ You should have received a copy of the GNU Library General Public License
+ along with this library; if not, write to the Free Software Foundation, Inc.,
+ 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA.
+ .
+ On Debian systems, the full text of the GNU Library General Public License
+ version 2 can be found in the file `/usr/share/common-licenses/LGPL-2'.
+
+Files: debian/*
+Copyright: 2008-2013, Daniel Baumann <mail@daniel-baumann.ch>
+License: GPL-2+
+
+License: GPL-2+
+ This program is free software: you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation, either version 2 of the License, or
+ (at your option) any later version.
+ .
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU General Public License for more details.
+ .
+ You should have received a copy of the GNU General Public License
+ along with this program. If not, see <http://www.gnu.org/licenses/>.
+ .
+ The complete text of the GNU General Public License
+ can be found in /usr/share/common-licenses/GPL-2 file.

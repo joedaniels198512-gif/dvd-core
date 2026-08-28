@@ -1,0 +1,101 @@
+From: Mario Holbe <mario.holbe@tu-ilmenau.de>
+Date: Tue, 22 Apr 2014 11:49:42 +0200
+Subject: descriptor
+
+libdvdread is very likely to fail on discs/images that store their File
+System Descriptor at the end of the disc/image rather than at the
+beginning. This is due to the "strategy" libdvdread uses to find it:
+libdvdread scans sequentially from the beginning of the disc/image for
+the File System Descriptor and identifies it by a single byte tag.
+
+Aside from wasting lots of time on discs/images that store their File
+System Descriptor at the end there is quite a good chance to stumble
+across a random data block that accidentally starts with this tag (and
+failing on it) before finding the real File System Descriptor.
+
+As far as I can see, at least CDBurnerXP seems to (be able to) create
+such images - at least if my interpretation of the Implementation
+Identifier "NMS DVDProLib" is correct.
+
+This... well, let's call it ugly hack fixes this by obtaining
+the File System Descriptor location from the Logical Volume Descriptor
+
+Closes: #663512
+---
+ src/dvd_udf.c | 37 ++++++++++++++++++++++++++++++++++---
+ 1 file changed, 34 insertions(+), 3 deletions(-)
+
+--- a/src/dvd_udf.c
++++ b/src/dvd_udf.c
+@@ -82,6 +82,8 @@
+   uint32_t AccessType;
+   uint32_t Start;
+   uint32_t Length;
++  uint32_t FSD_Location;
++  uint32_t FSD_Length;
+ };
+ 
+ struct AD {
+@@ -101,6 +103,12 @@
+   struct extent_ad rvds;
+ };
+ 
++struct fsd_t {
++  uint16_t Partition;
++  uint32_t Location;
++  uint32_t Length;
++};
++
+ struct pvd_t {
+   uint8_t VolumeIdentifier[32];
+   uint8_t VolumeSetIdentifier[128];
+@@ -427,6 +435,16 @@
+   return 0;
+ }
+ 
++/**
++ * Reads the File Set Descriptor from the Logical Volume Descriptor.
++ */
++static void UDFFSD( uint8_t *data, struct fsd_t *fsd )
++{
++  fsd->Length = GETN4(248);    /* always 2048? */
++  fsd->Location = GETN4(252);
++  fsd->Partition = GETN2(256); /* always 0? */
++}
++
+ static int UDFFileEntry( uint8_t *data, uint8_t *FileType,
+                          struct Partition *partition, struct AD *ad )
+ {
+@@ -801,8 +819,18 @@
+         /* Logical Volume Descriptor */
+         if( UDFLogVolume( LogBlock, part->VolumeDesc ) ) {
+           /* TODO: sector size wrong! */
+-        } else
+-          volvalid = 1;
++        } else {
++          struct fsd_t fsd;
++
++          UDFFSD(LogBlock, &fsd);
++          if(part->Number == fsd.Partition) {
++            part->FSD_Location = fsd.Location;
++            part->FSD_Length = fsd.Length;
++            volvalid = 1;
++          } else {
++            /* TODO: Oups, how to handle this? */
++          }
++        }
+       }
+ 
+     } while( ( lbnum <= MVDS_location + ( MVDS_length - 1 )
+@@ -845,7 +873,10 @@
+     SetUDFCache(ctx, PartitionCache, 0, &partition);
+ 
+     /* Find root dir ICB */
+-    lbnum = partition.Start;
++    lbnum = partition.Start + partition.FSD_Location;
++    /*
++    fprintf(stderr, "Looking for FSD at 0x%x\n", lbnum);
++    */
+     do {
+       ret = DVDReadLBUDF( ctx, lbnum++, 1, LogBlock, 0 );
+       if( ret < 0 ) {

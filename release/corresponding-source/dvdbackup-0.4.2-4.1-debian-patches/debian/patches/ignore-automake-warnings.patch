@@ -1,0 +1,17 @@
+Description: Do not treat automake warnings as errors. Gettext caused a warning
+ with automake 1.13.
+Author: Benjamin Drung <bdrung@debian.org>
+Bug-Debian: http://bugs.debian.org/713293
+Applied-Upstream: 0.4.3, https://bazaar.launchpad.net/~dvdbackup-dev/dvdbackup/trunk/revision/99
+
+--- a/configure.ac
++++ b/configure.ac
+@@ -13,7 +13,7 @@
+ dnl Must come before AM_INIT_AUTOMAKE.
+ AC_CONFIG_AUX_DIR([build-aux])
+ AC_CONFIG_MACRO_DIR([m4])
+-AM_INIT_AUTOMAKE([dist-xz -Wall -Werror])
++AM_INIT_AUTOMAKE([dist-xz -Wall])
+ 
+ AM_GNU_GETTEXT_VERSION([0.17])
+ AM_GNU_GETTEXT([external])

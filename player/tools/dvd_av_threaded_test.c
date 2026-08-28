@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * dvd_av_threaded_test.c — threaded A/V player (direct-DDR + stale recovery).
  *
