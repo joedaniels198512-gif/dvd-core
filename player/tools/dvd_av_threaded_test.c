@@ -22,7 +22,8 @@
  *   30.872 s audio consumed, 0 MrAudio underruns, avg fill 139.2 ms
  *   771 frames displayed, avg video−audio offset −30.9 ms
  *   MPEG-PS yields ~340 compressed video packets/s, not 1 packet/frame.
- *     VIDEO_Q_CAP 384 ≈ 1.1 s; 64 was ~0.19 s and HOL-stalled demux.
+ *     VIDEO_Q_SOFT_CAP 2560 ≈ 7.5 s; HARD 4096 is HOL-escape only.
+ *     64 was ~0.19 s and HOL-stalled demux. 384 ≈ 1.1 s starved late audio.
  *   Single-thread dvd_av_test.c is the failed contrast (fill 0/3.6/146 ms,
  *     30 s media in ~146 s wall). Do not patch that scheduler.
  *
@@ -31,8 +32,8 @@
  *   audio  — AC-3 + swr + MrAudio; publishes hardware audio clock
  *   video  — MPEG-2 parser/decode + swscale + mailbox; follows audio clock
  *
- * Queues: audio 32 pkts (~1 s AC-3), video 384 pkts (~1.1 s). Backpressure
- * waits when a queue is genuinely full; compressed packets are not dropped.
+ * Queues: audio 32 pkts (~1 s AC-3), video soft 2560 / hard 4096.
+ * Video HOL escape may use 2560–4096 when aq is low. Packets are not dropped.
  *
  * libdvdnav/custom AVIO run only on the demux thread (the AVIO callback is
  * invoked from av_read_frame). Opening the DVD from two threads would be
@@ -122,7 +123,11 @@ enum {
 };
 
 #define AUDIO_Q_CAP     32
-#define VIDEO_Q_CAP     384
+#define VIDEO_Q_SOFT_CAP 2560
+#define VIDEO_Q_HARD_CAP 4096
+#define VIDEO_Q_CAP     VIDEO_Q_SOFT_CAP
+#define VIDEO_HOL_ENTER_AQ 16
+#define VIDEO_HOL_EXIT_AQ  24
 #define VIDEO_BUFFER_FRAMES   25
 #define VIDEO_PREFILL_FRAMES  12
 #define PHASE_YUV_LOW_WATER   10  /* decode anyway if YUV queue this low */
@@ -329,6 +334,46 @@ typedef struct {
 
 static volatile sig_atomic_t stage = 0;
 static volatile sig_atomic_t g_interrupt = 0;
+static volatile sig_atomic_t g_crash_where = 0;
+static volatile unsigned g_crash_nav_gen = 0;
+static volatile unsigned g_crash_codec_gen = 0;
+
+enum {
+    CRASH_STARTUP = 0,
+    CRASH_AVIO_READ,
+    CRASH_AVIO_VTS_BOUNDARY,
+    CRASH_AV_READ_FRAME,
+    CRASH_AUDIO_SEND_PACKET,
+    CRASH_AUDIO_RECEIVE_FRAME,
+    CRASH_SWR_INIT,
+    CRASH_SWR_CONVERT,
+    CRASH_VIDEO_FRAME_REF,
+    CRASH_YUV_FLUSH,
+    CRASH_NAV_HARD_RESET
+};
+
+static inline void crash_where(int w)
+{
+    __atomic_store_n(&g_crash_where, w, __ATOMIC_RELAXED);
+}
+
+static const char *crash_where_name(int w)
+{
+    switch (w) {
+    case CRASH_AVIO_READ:          return "avio_read";
+    case CRASH_AVIO_VTS_BOUNDARY:  return "avio_vts_boundary";
+    case CRASH_AV_READ_FRAME:      return "av_read_frame";
+    case CRASH_AUDIO_SEND_PACKET:  return "audio_send_packet";
+    case CRASH_AUDIO_RECEIVE_FRAME:return "audio_receive_frame";
+    case CRASH_SWR_INIT:           return "swr_init";
+    case CRASH_SWR_CONVERT:        return "swr_convert";
+    case CRASH_VIDEO_FRAME_REF:    return "video_frame_ref";
+    case CRASH_YUV_FLUSH:          return "yuv_flush";
+    case CRASH_NAV_HARD_RESET:     return "nav_hard_reset";
+    default:                       return "startup";
+    }
+}
+
 static int g_debug_stats = 0;
 static int g_debug_spu = 0;
 static int g_debug_subtitles = 0;
@@ -499,33 +544,46 @@ static const char *stage_names[] = {
     "decoder", "frame decode", "ddr framebuffer", "mraudio/swscale"
 };
 
-static void sigill_handler(int sig, siginfo_t *si, void *ctxv)
+static void crash_signal_handler(int sig, siginfo_t *si, void *ctxv)
 {
-    (void)sig;
     ucontext_t *uc = (ucontext_t *)ctxv;
     unsigned long pc = 0, lr = 0;
+    int where = (int)__atomic_load_n(&g_crash_where, __ATOMIC_RELAXED);
 #if defined(__arm__)
     pc = (unsigned long)uc->uc_mcontext.arm_pc;
     lr = (unsigned long)uc->uc_mcontext.arm_lr;
 #endif
-    dprintf(STDERR_FILENO, "\n*** SIGILL / illegal instruction ***\n");
-    dprintf(STDERR_FILENO, "Stage %d: %s\n", (int)stage,
+    dprintf(STDERR_FILENO, "\nCRASH: signal=%d\n", sig);
+    dprintf(STDERR_FILENO, "PC=0x%08lx\n", pc);
+    dprintf(STDERR_FILENO, "LR=0x%08lx\n", lr);
+    dprintf(STDERR_FILENO, "fault_addr=%p\n", si ? si->si_addr : NULL);
+    dprintf(STDERR_FILENO, "stage=%s\n", crash_where_name(where));
+    dprintf(STDERR_FILENO, "nav_gen=%u\n",
+            (unsigned)__atomic_load_n(&g_crash_nav_gen, __ATOMIC_RELAXED));
+    dprintf(STDERR_FILENO, "codec_gen=%u\n",
+            (unsigned)__atomic_load_n(&g_crash_codec_gen, __ATOMIC_RELAXED));
+    dprintf(STDERR_FILENO, "legacy_stage=%d (%s)\n", (int)stage,
             (stage >= 0 &&
              stage < (int)(sizeof(stage_names) / sizeof(stage_names[0])))
                 ? stage_names[stage] : "unknown");
-    dprintf(STDERR_FILENO, "PC=0x%08lx LR=0x%08lx fault_addr=%p\n",
-            pc, lr, si ? si->si_addr : NULL);
-    _exit(132);
+    if (sig == SIGILL)
+        dprintf(STDERR_FILENO, "*** SIGILL / illegal instruction ***\n");
+    _exit(128 + (sig & 127));
 }
 
-static void install_sigill_handler(void)
+static void install_crash_handlers(void)
 {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = sigill_handler;
+    sa.sa_sigaction = crash_signal_handler;
     sa.sa_flags = SA_SIGINFO;
     sigemptyset(&sa.sa_mask);
+    sigaddset(&sa.sa_mask, SIGILL);
+    sigaddset(&sa.sa_mask, SIGSEGV);
+    sigaddset(&sa.sa_mask, SIGABRT);
     sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
 }
 
 static void interrupt_handler(int sig)
@@ -556,6 +614,18 @@ static int64_t tb_to_us(AVRational tb, int64_t ticks)
         return AV_NOPTS_VALUE;
     return av_rescale_q(ticks, tb, (AVRational){1, 1000000});
 }
+
+static void rawpts_fmt_i64(char *buf, size_t n, int64_t v)
+{
+    if (!buf || n == 0)
+        return;
+    if (v == AV_NOPTS_VALUE)
+        snprintf(buf, n, "NOPTS");
+    else
+        snprintf(buf, n, "%" PRId64, v);
+}
+
+#define RAWPTS_CLAMP_MAX 10
 
 typedef struct Player Player;
 
@@ -607,6 +677,7 @@ typedef struct {
     int act_cellN;
     int soft_hop_active;
     int soft_drop_pre_hop;
+    int soft_media_boundary_pending;
     int post_soft_bytes;
     int post_soft_block_ok;
     int post_soft_mpeg_ret;
@@ -636,7 +707,9 @@ static void player_request_still_drain(Player *p);
 static void player_wait_still_drain(Player *p, DVDIO *d);
 static void prefill_release(Player *p, const char *reason);
 static int prefill_is_released(Player *p);
+static int player_first_video_ready(const Player *p);
 static void player_prefill_release_if_held(Player *p, const char *why);
+static void player_log_startup_buffer(Player *p);
 static int dvdio_follow_nav_after_ps_eof(DVDIO *d);
 static const char *dvdnav_event_name(int32_t event);
 static const char *dvd_domain_name(DVDDomain_t domain);
@@ -665,44 +738,70 @@ static int player_bench_done(const Player *p);
 static void player_abort(Player *p);
 static int copy_yuv420_to_slot(uint8_t *slot, const AVFrame *frame, int active_h);
 
+/* HARD hop/VTS: never splice new-domain BLOCK_OK onto old-domain bytes
+ * already copied into this AVIO fill. Same idea as STILL/WAIT: return
+ * `out` first, then EOF on the next read so MPEG-PS can flush. */
+static int dvdio_hop_boundary_return(DVDIO *d, int out)
+{
+    d->sector_len = 0;
+    d->sector_pos = 0;
+    if (out > 0) {
+        crash_where(CRASH_AVIO_VTS_BOUNDARY);
+        fprintf(stderr,
+                "AVIO DISCONTINUITY: returning old-domain bytes before "
+                "VTS boundary out=%d\n",
+                out);
+        dvdio_note_mpeg_return(d, out);
+        return out;
+    }
+    return AVERROR_EOF;
+}
+
+/* SOFT same-domain menu hop: never splice new-cell BLOCK_OK onto old-cell
+ * bytes already copied into this AVIO fill. Same return shape as HARD
+ * (out>0 then EOF) but a distinct flag so demux does not VTS-reopen. */
+static int dvdio_soft_media_boundary_return(DVDIO *d, int out)
+{
+    d->sector_len = 0;
+    d->sector_pos = 0;
+    if (out > 0) {
+        crash_where(CRASH_AVIO_READ);
+        fprintf(stderr,
+                "AVIO MEDIA BOUNDARY: returning old-cell bytes before "
+                "SOFT hop out=%d\n",
+                out);
+        dvdio_note_mpeg_return(d, out);
+        return out;
+    }
+    return AVERROR_EOF;
+}
+
 static int dvd_read_packet(void *opaque, uint8_t *buf, int buf_size)
 {
     DVDIO *d = opaque;
     int out = 0;
 
+    crash_where(CRASH_AVIO_READ);
     while (out < buf_size) {
         if (d->stopped || g_interrupt || player_bench_done(d->player)) {
             if (out > 0)
                 dvdio_note_mpeg_return(d, out);
             return out ? out : AVERROR_EOF;
         }
-        if (d->hop_pending) {
-            /* Drop any pre-hop sector bytes so MPEG-PS does not mix menu
-             * leftover with the title start. Hard domain change only. */
-            d->sector_len = 0;
-            d->sector_pos = 0;
-            return AVERROR_EOF;
-        }
+        if (d->hop_pending)
+            return dvdio_hop_boundary_return(d, out);
+        if (d->soft_media_boundary_pending)
+            return dvdio_soft_media_boundary_return(d, out);
         dvdio_process_nav_cmds(d);
         if (d->stopped || g_interrupt || player_bench_done(d->player)) {
             if (out > 0)
                 dvdio_note_mpeg_return(d, out);
             return out ? out : AVERROR_EOF;
         }
-        if (d->hop_pending) {
-            d->sector_len = 0;
-            d->sector_pos = 0;
-            return AVERROR_EOF;
-        }
-        if (d->soft_drop_pre_hop) {
-            /* Pre-hop leftover in this fill is the old PGC. Drop it, then
-             * keep reading so the new VOBU reaches MPEG-PS in this or the
-             * next read. Do not EOF/reopen. */
-            out = 0;
-            d->sector_len = 0;
-            d->sector_pos = 0;
-            d->soft_drop_pre_hop = 0;
-        }
+        if (d->hop_pending)
+            return dvdio_hop_boundary_return(d, out);
+        if (d->soft_media_boundary_pending)
+            return dvdio_soft_media_boundary_return(d, out);
         if (d->sector_pos < d->sector_len) {
             int remain = d->sector_len - d->sector_pos;
             int take = buf_size - out;
@@ -1690,12 +1789,14 @@ static void controller_poll(ControllerPad *pad, uint32_t bits, int64_t now_us,
 
 typedef struct {
     AVPacket *pkts;
+    uint32_t *nav_gens;
     int cap, head, tail, count;
     int eof, quit;
     int depth_min, depth_max, depth_n;
     int64_t depth_sum;
     int64_t block_us;
     unsigned long full_n;
+    unsigned long empty_n;
     unsigned long pushed, popped;
     pthread_mutex_t mu;
     pthread_cond_t not_empty;
@@ -1707,8 +1808,14 @@ static int pktq_init(PktQ *q, int cap)
     memset(q, 0, sizeof(*q));
     q->cap = cap;
     q->pkts = av_calloc((size_t)cap, sizeof(*q->pkts));
-    if (!q->pkts)
+    q->nav_gens = av_calloc((size_t)cap, sizeof(*q->nav_gens));
+    if (!q->pkts || !q->nav_gens) {
+        av_free(q->pkts);
+        av_free(q->nav_gens);
+        q->pkts = NULL;
+        q->nav_gens = NULL;
         return -1;
+    }
     q->depth_min = cap;
     pthread_mutex_init(&q->mu, NULL);
     pthread_cond_init(&q->not_empty, NULL);
@@ -1767,7 +1874,7 @@ static void pktq_wait_timeout(pthread_cond_t *cv, pthread_mutex_t *mu)
     pthread_cond_timedwait(cv, mu, &ts);
 }
 
-static void pktq_push(PktQ *q, AVPacket *src)
+static void pktq_push(PktQ *q, AVPacket *src, uint32_t nav_gen)
 {
     int64_t t0 = 0;
     pthread_mutex_lock(&q->mu);
@@ -1788,6 +1895,7 @@ static void pktq_push(PktQ *q, AVPacket *src)
     }
     av_packet_ref(&q->pkts[q->tail], src);
     q->pkts[q->tail].opaque = src->opaque;
+    q->nav_gens[q->tail] = nav_gen;
     q->tail = (q->tail + 1) % q->cap;
     q->count++;
     q->pushed++;
@@ -1796,23 +1904,30 @@ static void pktq_push(PktQ *q, AVPacket *src)
     pthread_mutex_unlock(&q->mu);
 }
 
-static void pktq_push_marker(PktQ *q, void *mark)
+static void pktq_push_marker(PktQ *q, void *mark, uint32_t nav_gen)
 {
     AVPacket *tmp = av_packet_alloc();
 
     if (!tmp)
         return;
     tmp->opaque = mark;
-    pktq_push(q, tmp);
+    pktq_push(q, tmp, nav_gen);
     av_packet_free(&tmp);
 }
 
-/* 1 = packet, 0 = eof/quit */
-static int pktq_pop(PktQ *q, AVPacket *dst)
+/* 1 = packet, 0 = eof/quit. nav_gen_out receives the stamped media generation. */
+static int pktq_pop(PktQ *q, AVPacket *dst, uint32_t *nav_gen_out)
 {
+    int waited = 0;
+
     pthread_mutex_lock(&q->mu);
-    while (q->count == 0 && !q->eof && !q->quit && !g_interrupt)
+    while (q->count == 0 && !q->eof && !q->quit && !g_interrupt) {
+        if (!waited) {
+            waited = 1;
+            q->empty_n++;
+        }
         pktq_wait_timeout(&q->not_empty, &q->mu);
+    }
     if (g_interrupt)
         q->quit = 1;
     if (q->count == 0) {
@@ -1820,6 +1935,9 @@ static int pktq_pop(PktQ *q, AVPacket *dst)
         return 0;
     }
     av_packet_move_ref(dst, &q->pkts[q->head]);
+    if (nav_gen_out)
+        *nav_gen_out = q->nav_gens[q->head];
+    q->nav_gens[q->head] = 0;
     q->head = (q->head + 1) % q->cap;
     q->count--;
     q->popped++;
@@ -1856,6 +1974,21 @@ static int pktq_count(PktQ *q)
     return n;
 }
 
+static void pktq_diag_snapshot(PktQ *q, int *count, unsigned long *pushed,
+                               unsigned long *popped, unsigned long *empty_n)
+{
+    pthread_mutex_lock(&q->mu);
+    if (count)
+        *count = q->count;
+    if (pushed)
+        *pushed = q->pushed;
+    if (popped)
+        *popped = q->popped;
+    if (empty_n)
+        *empty_n = q->empty_n;
+    pthread_mutex_unlock(&q->mu);
+}
+
 /* Drop queued compressed packets. Does not set eof (decoders stay alive). */
 static int pktq_flush(PktQ *q)
 {
@@ -1863,8 +1996,12 @@ static int pktq_flush(PktQ *q)
 
     pthread_mutex_lock(&q->mu);
     n = q->count;
-    for (i = 0; i < n; i++)
-        av_packet_unref(&q->pkts[(q->head + i) % q->cap]);
+    for (i = 0; i < n; i++) {
+        int idx = (q->head + i) % q->cap;
+
+        av_packet_unref(&q->pkts[idx]);
+        q->nav_gens[idx] = 0;
+    }
     q->head = 0;
     q->tail = 0;
     q->count = 0;
@@ -1881,6 +2018,9 @@ static void pktq_free(PktQ *q)
     for (int i = 0; i < q->cap; i++)
         av_packet_unref(&q->pkts[i]);
     av_free(q->pkts);
+    av_free(q->nav_gens);
+    q->pkts = NULL;
+    q->nav_gens = NULL;
     pthread_mutex_destroy(&q->mu);
     pthread_cond_destroy(&q->not_empty);
     pthread_cond_destroy(&q->not_full);
@@ -2280,6 +2420,33 @@ static int yuvring_commit_produce(YuvRing *r, int idx, int64_t raw_vpts_us,
     return 1;
 }
 
+/* av_frame_ref/unref the produce slot under the ring mutex so HARD-reset
+ * yuvring_flush cannot race the producer. Decode stays outside this lock. */
+static int yuvring_fill_slot(YuvRing *r, int idx, unsigned epoch, AVFrame *frame)
+{
+    int ret;
+
+    pthread_mutex_lock(&r->mu);
+    if (epoch != r->epoch) {
+        pthread_mutex_unlock(&r->mu);
+        return 0;
+    }
+    crash_where(CRASH_VIDEO_FRAME_REF);
+    av_frame_unref(r->slots[idx].yuv);
+    ret = av_frame_ref(r->slots[idx].yuv, frame);
+    if (ret < 0) {
+        pthread_mutex_unlock(&r->mu);
+        return -1;
+    }
+    r->slots[idx].width = frame->width;
+    r->slots[idx].height = frame->height;
+    r->slots[idx].format = frame->format;
+    r->slots[idx].interlaced_frame = frame->interlaced_frame ? 1 : 0;
+    r->slots[idx].top_field_first = frame->top_field_first ? 1 : 0;
+    pthread_mutex_unlock(&r->mu);
+    return 1;
+}
+
 /* 1 = filled slot; 2 = idle (check UI redraw); 0 = eof. */
 static int yuvring_acquire_filled(YuvRing *r, AVFrame **fr_out, int64_t *pts_out,
                                   unsigned *gen_out, int *in_menu_out,
@@ -2344,6 +2511,7 @@ static int yuvring_flush(YuvRing *r)
 
     if (!r->inited)
         return 0;
+    crash_where(CRASH_YUV_FLUSH);
     pthread_mutex_lock(&r->mu);
     r->epoch++;
     if (r->held && r->count > 0) {
@@ -2687,6 +2855,31 @@ static void mraudio_drain(MrAudio *a)
             break;
         av_usleep(20000);
     }
+}
+
+/*
+ * /dev/MrAudio has no flush ioctl (MiSTer-audio-spi.c: write + open/read
+ * rptr/len only). Stop feeding and wait until FPGA rptr catches wptr, same
+ * as pause drain. Then rebase the software origin so elapsed starts at 0.
+ */
+static void mraudio_hw_stop_flush(MrAudio *a, unsigned nav_gen)
+{
+    int old_fill = 0;
+
+    a->playing = 0;
+    if (a->hw_pace)
+        mraudio_poll(a);
+    old_fill = a->fill > 0 ? a->fill : 0;
+    fprintf(stderr,
+            "MRAUDIO RESET: hard reset nav_gen=%u old queued/fill=%d (%.1f ms)\n",
+            nav_gen, old_fill,
+            old_fill * 1000.0 / (double)BYTES_PER_SEC);
+    mraudio_drain(a);
+    a->bytes_origin = a->bytes_written - a->prime_bytes;
+    if (a->hw_pace)
+        mraudio_poll(a);
+    fprintf(stderr, "MRAUDIO RESET: complete fill=%d\n",
+            a->fill > 0 ? a->fill : 0);
 }
 
 static void mraudio_close(MrAudio *a)
@@ -3056,7 +3249,38 @@ struct Player {
     } spu_perf;
     unsigned nav_gen;
     unsigned codec_gen;
+    pthread_mutex_t par_mu; /* acp/vcp/ai/vi/atb/vtb vs decode reopen */
+    int par_mu_inited;
     unsigned frames_this_nav_gen;
+    unsigned first_mbox_nav_gen;
+    unsigned first_video_presented_gen; /* nav_gen of last mailbox-committed frame */
+    /* Test 7: once-per-gen RAW PTS / stream identity. Logs only. */
+    struct {
+        pthread_mutex_t mu;
+        int mu_inited;
+        unsigned nav_gen;
+        unsigned codec_gen;
+        int format_logged;
+        int selected_logged;
+        int selected_si;
+        char selected_reason[32];
+        int discovered_ai;
+        int follow_hit;
+        int apkt_logged;
+        int vpkt_logged;
+        int aframe_logged;
+        int vframe_logged;
+        int packet_delta_logged;
+        int frame_delta_logged;
+        int present_logged;
+        int clamp_n;
+        int genuine_n;
+        int64_t apkt_us;
+        int64_t vpkt_us;
+        int64_t aframe_us;
+        int64_t vframe_us;
+    } rawpts;
+    int mraudio_gate_logged;
     int video_fmt_logged;
     unsigned video_fmt_codec_gen;
     unsigned video_init_n;
@@ -3224,6 +3448,11 @@ struct Player {
     int buf_mraudio_started;
     int clock_bootstrapped;   /* presented title frames before audio master */
     int clock_ready_logged;   /* one CLOCK ready/transition line per gen */
+    int64_t startup_buf_log_us; /* 1 Hz STARTUP BUFFER until audio master */
+    int64_t runtime_buf_log_us; /* 1 Hz RUNTIME BUFFER after audio master */
+    int demux_wait_full;      /* 0=none 1=video 2=audio; demux blocked on cap */
+    int vq_hol_escape;        /* 1 = video may use 2560–4096 */
+    int vq_hol_hard_logged;   /* one hard-cap line per escape episode */
     int64_t present_cpu_us;
     int64_t prod_last_end_us;
     unsigned long prod_dec_n;
@@ -3311,6 +3540,455 @@ static unsigned player_codec_gen(const Player *p)
     return __atomic_load_n(&p->codec_gen, __ATOMIC_SEQ_CST);
 }
 
+static void rawpts_sync_gen(Player *p)
+{
+    unsigned ng, cg;
+
+    if (!p)
+        return;
+    ng = player_nav_gen(p);
+    cg = player_codec_gen(p);
+    if (p->rawpts.nav_gen == ng && p->rawpts.codec_gen == cg)
+        return;
+    p->rawpts.nav_gen = ng;
+    p->rawpts.codec_gen = cg;
+    p->rawpts.format_logged = 0;
+    p->rawpts.selected_logged = 0;
+    p->rawpts.selected_si = -1;
+    p->rawpts.selected_reason[0] = 0;
+    p->rawpts.discovered_ai = 0;
+    p->rawpts.follow_hit = 0;
+    p->rawpts.apkt_logged = 0;
+    p->rawpts.vpkt_logged = 0;
+    p->rawpts.aframe_logged = 0;
+    p->rawpts.vframe_logged = 0;
+    p->rawpts.packet_delta_logged = 0;
+    p->rawpts.frame_delta_logged = 0;
+    p->rawpts.present_logged = 0;
+    p->rawpts.clamp_n = 0;
+    p->rawpts.genuine_n = 0;
+    p->rawpts.apkt_us = AV_NOPTS_VALUE;
+    p->rawpts.vpkt_us = AV_NOPTS_VALUE;
+    p->rawpts.aframe_us = AV_NOPTS_VALUE;
+    p->rawpts.vframe_us = AV_NOPTS_VALUE;
+}
+
+static const char *rawpts_media_type(enum AVMediaType t)
+{
+    switch (t) {
+    case AVMEDIA_TYPE_VIDEO: return "video";
+    case AVMEDIA_TYPE_AUDIO: return "audio";
+    case AVMEDIA_TYPE_SUBTITLE: return "subtitle";
+    default: return "other";
+    }
+}
+
+static int rawpts_dvd_substream(const AVStream *st)
+{
+    int id;
+
+    if (!st)
+        return -1;
+    id = st->id & 0xff;
+    return id;
+}
+
+static void rawpts_try_packet_delta(Player *p)
+{
+    char dbuf[32];
+    int64_t d;
+
+    if (!p || p->rawpts.packet_delta_logged)
+        return;
+    if (!p->rawpts.apkt_logged || !p->rawpts.vpkt_logged)
+        return;
+    p->rawpts.packet_delta_logged = 1;
+    if (p->rawpts.apkt_us == AV_NOPTS_VALUE ||
+        p->rawpts.vpkt_us == AV_NOPTS_VALUE)
+        snprintf(dbuf, sizeof(dbuf), "NOPTS");
+    else {
+        d = p->rawpts.apkt_us - p->rawpts.vpkt_us;
+        snprintf(dbuf, sizeof(dbuf), "%" PRId64, d);
+    }
+    fprintf(stderr,
+            "RAWPTS PACKET DELTA nav_gen=%u codec_gen=%u "
+            "audio_minus_video_us=%s\n",
+            p->rawpts.nav_gen, p->rawpts.codec_gen, dbuf);
+}
+
+static void rawpts_try_frame_delta(Player *p)
+{
+    char dbuf[32];
+    int64_t d;
+
+    if (!p || p->rawpts.frame_delta_logged)
+        return;
+    if (!p->rawpts.aframe_logged || !p->rawpts.vframe_logged)
+        return;
+    p->rawpts.frame_delta_logged = 1;
+    if (p->rawpts.aframe_us == AV_NOPTS_VALUE ||
+        p->rawpts.vframe_us == AV_NOPTS_VALUE)
+        snprintf(dbuf, sizeof(dbuf), "NOPTS");
+    else {
+        d = p->rawpts.aframe_us - p->rawpts.vframe_us;
+        snprintf(dbuf, sizeof(dbuf), "%" PRId64, d);
+    }
+    fprintf(stderr,
+            "RAWPTS FRAME DELTA nav_gen=%u codec_gen=%u "
+            "audio_minus_video_us=%s\n",
+            p->rawpts.nav_gen, p->rawpts.codec_gen, dbuf);
+}
+
+static void rawpts_log_format_and_select(Player *p, AVFormatContext *fmt)
+{
+    unsigned i;
+    int ai, si_id;
+    const char *reason;
+    char stbuf[32], tbuf[32];
+    AVStream *st;
+    enum AVMediaType typ;
+    enum AVCodecID cid;
+
+    if (!p || !fmt || !p->rawpts.mu_inited)
+        return;
+    pthread_mutex_lock(&p->rawpts.mu);
+    rawpts_sync_gen(p);
+    if (!p->rawpts.format_logged && fmt->nb_streams > 0) {
+        p->rawpts.format_logged = 1;
+        rawpts_fmt_i64(stbuf, sizeof(stbuf), fmt->start_time);
+        fprintf(stderr,
+                "RAWPTS FORMAT nav_gen=%u codec_gen=%u fmt_start_time=%s "
+                "nb_streams=%u\n",
+                p->rawpts.nav_gen, p->rawpts.codec_gen, stbuf,
+                fmt->nb_streams);
+        pthread_mutex_unlock(&p->rawpts.mu);
+        for (i = 0; i < fmt->nb_streams; i++) {
+            st = fmt->streams[i];
+            if (!st || !st->codecpar)
+                continue;
+            typ = st->codecpar->codec_type;
+            cid = st->codecpar->codec_id;
+            rawpts_fmt_i64(stbuf, sizeof(stbuf), st->start_time);
+            rawpts_fmt_i64(tbuf, sizeof(tbuf),
+                           tb_to_us(st->time_base, st->start_time));
+            fprintf(stderr,
+                    "RAWPTS STREAM si=%u type=%s codec=%s codec_id=%d "
+                    "id=0x%x tb=%d/%d start_time=%s start_us=%s\n",
+                    i, rawpts_media_type(typ),
+                    avcodec_get_name(cid), (int)cid,
+                    st->id, st->time_base.num, st->time_base.den,
+                    stbuf, tbuf);
+            if (typ == AVMEDIA_TYPE_AUDIO)
+                fprintf(stderr,
+                        "AUDIO STREAM CANDIDATE si=%u id=0x%x codec=%s "
+                        "tb=%d/%d substream=0x%02x\n",
+                        i, st->id, avcodec_get_name(cid),
+                        st->time_base.num, st->time_base.den,
+                        st->id & 0xff);
+        }
+        pthread_mutex_lock(&p->rawpts.mu);
+        rawpts_sync_gen(p);
+    }
+    ai = p->ai;
+    if (ai < 0) {
+        pthread_mutex_unlock(&p->rawpts.mu);
+        return;
+    }
+    if (p->rawpts.follow_hit)
+        reason = "dvdnav_mapping";
+    else if (p->rawpts.discovered_ai)
+        reason = "first_ffmpeg_stream";
+    else
+        reason = "existing";
+    if (p->rawpts.selected_logged &&
+        p->rawpts.selected_si == ai &&
+        !strcmp(p->rawpts.selected_reason, reason)) {
+        pthread_mutex_unlock(&p->rawpts.mu);
+        return;
+    }
+    p->rawpts.selected_logged = 1;
+    p->rawpts.selected_si = ai;
+    snprintf(p->rawpts.selected_reason, sizeof(p->rawpts.selected_reason),
+             "%s", reason);
+    pthread_mutex_unlock(&p->rawpts.mu);
+    si_id = 0;
+    if ((unsigned)ai < fmt->nb_streams && fmt->streams[ai])
+        si_id = fmt->streams[ai]->id;
+    fprintf(stderr,
+            "AUDIO STREAM SELECTED si=%d id=0x%x reason=%s\n",
+            ai, si_id, reason);
+}
+
+static void rawpts_log_first_packet(Player *p, AVFormatContext *fmt,
+                                    const AVPacket *pkt, int is_audio)
+{
+    AVStream *st;
+    AVRational tb;
+    int si, sid, pkt0;
+    int64_t pts_us, dts_us;
+    char pbuf[32], dbuf[32], pu[32], du[32];
+    const char *cname;
+
+    if (!p || !fmt || !pkt || !p->rawpts.mu_inited)
+        return;
+    si = pkt->stream_index;
+    if (si < 0 || (unsigned)si >= fmt->nb_streams)
+        return;
+    st = fmt->streams[si];
+    if (!st)
+        return;
+    tb = st->time_base;
+    sid = st->id;
+    cname = st->codecpar ? avcodec_get_name(st->codecpar->codec_id) : "?";
+    pts_us = tb_to_us(tb, pkt->pts);
+    dts_us = tb_to_us(tb, pkt->dts);
+    pkt0 = (pkt->data && pkt->size > 0) ? (int)pkt->data[0] : -1;
+    pthread_mutex_lock(&p->rawpts.mu);
+    rawpts_sync_gen(p);
+    if (is_audio) {
+        if (p->rawpts.apkt_logged) {
+            pthread_mutex_unlock(&p->rawpts.mu);
+            return;
+        }
+        p->rawpts.apkt_logged = 1;
+        p->rawpts.apkt_us = pts_us;
+    } else {
+        if (p->rawpts.vpkt_logged) {
+            pthread_mutex_unlock(&p->rawpts.mu);
+            return;
+        }
+        p->rawpts.vpkt_logged = 1;
+        p->rawpts.vpkt_us = pts_us;
+    }
+    rawpts_try_packet_delta(p);
+    pthread_mutex_unlock(&p->rawpts.mu);
+    rawpts_fmt_i64(pbuf, sizeof(pbuf), pkt->pts);
+    rawpts_fmt_i64(dbuf, sizeof(dbuf), pkt->dts);
+    rawpts_fmt_i64(pu, sizeof(pu), pts_us);
+    rawpts_fmt_i64(du, sizeof(du), dts_us);
+    if (is_audio)
+        fprintf(stderr,
+                "RAWPTS APKT nav_gen=%u codec_gen=%u si=%d id=0x%x "
+                "codec=%s pts=%s dts=%s tb=%d/%d pts_us=%s dts_us=%s "
+                "substream=0x%02x pkt0=0x%02x\n",
+                player_nav_gen(p), player_codec_gen(p), si, sid, cname,
+                pbuf, dbuf, tb.num, tb.den, pu, du,
+                rawpts_dvd_substream(st), pkt0 < 0 ? 0 : pkt0);
+    else
+        fprintf(stderr,
+                "RAWPTS VPKT nav_gen=%u codec_gen=%u si=%d id=0x%x "
+                "codec=%s pts=%s dts=%s tb=%d/%d pts_us=%s dts_us=%s\n",
+                player_nav_gen(p), player_codec_gen(p), si, sid, cname,
+                pbuf, dbuf, tb.num, tb.den, pu, du);
+}
+
+static void rawpts_log_aframe(Player *p, const AVFrame *frame, AVRational atb)
+{
+    int64_t pts_us, best_us;
+    char pbuf[32], bbuf[32], pu[32], bu[32], layout[64];
+
+    if (!p || !frame || !p->rawpts.mu_inited)
+        return;
+    pts_us = tb_to_us(atb, frame->pts);
+    best_us = tb_to_us(atb, frame->best_effort_timestamp);
+    pthread_mutex_lock(&p->rawpts.mu);
+    rawpts_sync_gen(p);
+    if (p->rawpts.aframe_logged) {
+        pthread_mutex_unlock(&p->rawpts.mu);
+        return;
+    }
+    p->rawpts.aframe_logged = 1;
+    p->rawpts.aframe_us = pts_us;
+    rawpts_try_frame_delta(p);
+    pthread_mutex_unlock(&p->rawpts.mu);
+    rawpts_fmt_i64(pbuf, sizeof(pbuf), frame->pts);
+    rawpts_fmt_i64(bbuf, sizeof(bbuf), frame->best_effort_timestamp);
+    rawpts_fmt_i64(pu, sizeof(pu), pts_us);
+    rawpts_fmt_i64(bu, sizeof(bu), best_us);
+    if (av_channel_layout_describe(&frame->ch_layout, layout,
+                                   sizeof(layout)) < 0)
+        snprintf(layout, sizeof(layout), "?");
+    fprintf(stderr,
+            "RAWPTS AFRAME nav_gen=%u codec_gen=%u pts=%s best=%s "
+            "tb=%d/%d pts_us=%s best_us=%s ch=%d rate=%d layout=%s\n",
+            player_nav_gen(p), player_codec_gen(p), pbuf, bbuf,
+            atb.num, atb.den, pu, bu,
+            frame->ch_layout.nb_channels, frame->sample_rate, layout);
+}
+
+static void rawpts_on_assign_video(Player *p, const AVFrame *frame,
+                                   int64_t genuine, int64_t previous,
+                                   int64_t disc_raw, int clamped,
+                                   int64_t assigned)
+{
+    AVRational vtb;
+    int64_t raw_us, best_us, assigned_us, prev_us, delta_us;
+    int first_frame, genuine_n, log_clamp;
+    char pbuf[32], bbuf[32], ru[32], au[32];
+
+    if (!p || !frame || !p->rawpts.mu_inited)
+        return;
+    vtb = p->vtb;
+    raw_us = tb_to_us(vtb, genuine);
+    best_us = tb_to_us(vtb, frame->best_effort_timestamp);
+    assigned_us = tb_to_us(vtb, assigned);
+    prev_us = tb_to_us(vtb, previous);
+    delta_us = tb_to_us(vtb, disc_raw);
+    pthread_mutex_lock(&p->rawpts.mu);
+    rawpts_sync_gen(p);
+    first_frame = !p->rawpts.vframe_logged;
+    if (first_frame) {
+        p->rawpts.vframe_logged = 1;
+        p->rawpts.vframe_us = raw_us;
+        rawpts_try_frame_delta(p);
+    }
+    if (genuine != AV_NOPTS_VALUE)
+        p->rawpts.genuine_n++;
+    genuine_n = p->rawpts.genuine_n;
+    log_clamp = 0;
+    if (clamped && genuine_n > 0 && genuine_n <= RAWPTS_CLAMP_MAX &&
+        p->rawpts.clamp_n < RAWPTS_CLAMP_MAX) {
+        p->rawpts.clamp_n++;
+        log_clamp = 1;
+    }
+    pthread_mutex_unlock(&p->rawpts.mu);
+    if (first_frame) {
+        char cdelta[32], bu[32];
+
+        rawpts_fmt_i64(pbuf, sizeof(pbuf), genuine);
+        rawpts_fmt_i64(bbuf, sizeof(bbuf), frame->best_effort_timestamp);
+        rawpts_fmt_i64(ru, sizeof(ru), raw_us);
+        rawpts_fmt_i64(bu, sizeof(bu), best_us);
+        rawpts_fmt_i64(au, sizeof(au), assigned_us);
+        if (!clamped)
+            snprintf(cdelta, sizeof(cdelta), "0");
+        else
+            rawpts_fmt_i64(cdelta, sizeof(cdelta), delta_us);
+        fprintf(stderr,
+                "RAWPTS VFRAME nav_gen=%u codec_gen=%u raw_pts=%s best=%s "
+                "raw_us=%s best_us=%s assigned_us=%s clamp=%d "
+                "clamp_delta_us=%s genuine=%d\n",
+                player_nav_gen(p), player_codec_gen(p), pbuf, bbuf, ru, bu,
+                au, clamped ? 1 : 0, cdelta,
+                genuine != AV_NOPTS_VALUE ? 1 : 0);
+    }
+    if (log_clamp) {
+        char r[32], pr[32], d[32], a[32];
+
+        rawpts_fmt_i64(r, sizeof(r), raw_us);
+        rawpts_fmt_i64(pr, sizeof(pr), prev_us);
+        rawpts_fmt_i64(d, sizeof(d), delta_us);
+        rawpts_fmt_i64(a, sizeof(a), assigned_us);
+        fprintf(stderr,
+                "VIDEO PTS CLAMP nav_gen=%u codec_gen=%u genuine_n=%d "
+                "raw=%s previous=%s delta=%s assigned=%s\n",
+                player_nav_gen(p), player_codec_gen(p), genuine_n,
+                r, pr, d, a);
+    }
+}
+
+static void rawpts_log_present(Player *p, int64_t raw_vpts_us, int64_t pvpts_us)
+{
+    int64_t aclk;
+    char rv[32], pv[32], ac[32], fa[32];
+
+    if (!p || !p->rawpts.mu_inited)
+        return;
+    if (raw_vpts_us == AV_NOPTS_VALUE)
+        return;
+    pthread_mutex_lock(&p->rawpts.mu);
+    rawpts_sync_gen(p);
+    if (p->rawpts.present_logged) {
+        pthread_mutex_unlock(&p->rawpts.mu);
+        return;
+    }
+    p->rawpts.present_logged = 1;
+    pthread_mutex_unlock(&p->rawpts.mu);
+    aclk = clock_read(&p->clock, NULL, NULL);
+    rawpts_fmt_i64(rv, sizeof(rv), raw_vpts_us);
+    rawpts_fmt_i64(pv, sizeof(pv), pvpts_us);
+    rawpts_fmt_i64(ac, sizeof(ac), aclk);
+    rawpts_fmt_i64(fa, sizeof(fa), p->first_audio_pts_us);
+    fprintf(stderr,
+            "RAWPTS PRESENT nav_gen=%u codec_gen=%u raw_vpts=%s pvpts=%s "
+            "aclk=%s first_audio_pts=%s\n",
+            player_nav_gen(p), player_codec_gen(p), rv, pv, ac, fa);
+}
+
+static int player_first_video_ready(const Player *p)
+{
+    if (!p)
+        return 0;
+    return __atomic_load_n(&p->first_video_presented_gen, __ATOMIC_SEQ_CST)
+        == player_nav_gen(p);
+}
+
+static void player_wake_mraudio_gate(Player *p)
+{
+    if (!p)
+        return;
+    if (player_buffered(p)) {
+        pthread_mutex_lock(&p->prefill_mu);
+        pthread_cond_broadcast(&p->prefill_cv);
+        pthread_mutex_unlock(&p->prefill_mu);
+    }
+    pthread_mutex_lock(&p->aq.mu);
+    pthread_cond_broadcast(&p->aq.not_empty);
+    pthread_mutex_unlock(&p->aq.mu);
+}
+
+static void player_note_first_video_presented(Player *p, unsigned frame_gen,
+                                             int64_t vpts_us)
+{
+    unsigned g;
+
+    if (!p || frame_gen == 0)
+        return;
+    g = player_nav_gen(p);
+    if (frame_gen != g)
+        return;
+    if (__atomic_load_n(&p->first_video_presented_gen, __ATOMIC_SEQ_CST) == g)
+        return;
+    __atomic_store_n(&p->first_video_presented_gen, g, __ATOMIC_SEQ_CST);
+    fprintf(stderr,
+            "A/V START: first video presented nav_gen=%u codec_gen=%u "
+            "wall_us=%" PRId64 " vpts=%" PRId64 "\n",
+            g, player_codec_gen(p), av_gettime_relative(),
+            vpts_us == AV_NOPTS_VALUE ? (int64_t)-1 : vpts_us);
+    player_wake_mraudio_gate(p);
+}
+
+static inline void crash_enter(int w, const Player *p)
+{
+    crash_where(w);
+    if (!p)
+        return;
+    __atomic_store_n(&g_crash_nav_gen, player_nav_gen(p), __ATOMIC_RELAXED);
+    __atomic_store_n(&g_crash_codec_gen, player_codec_gen(p), __ATOMIC_RELAXED);
+}
+
+static int pkt_is_stale_codec_gen(const AVPacket *pkt, unsigned now)
+{
+    uintptr_t op;
+
+    if (!pkt || pkt->opaque == VQ_MARK_STILL_BOUNDARY)
+        return 0;
+    op = (uintptr_t)pkt->opaque;
+    if (op == 0)
+        return 0;
+    return (unsigned)op != now;
+}
+
+static int pkt_is_stale_nav_gen(const AVPacket *pkt, uint32_t pkt_nav_gen,
+                                unsigned now)
+{
+    if (!pkt || pkt->opaque == VQ_MARK_STILL_BOUNDARY)
+        return 0;
+    if (pkt_nav_gen == 0)
+        return 0;
+    return pkt_nav_gen != now;
+}
+
 static void dvdio_note_mpeg_return(DVDIO *d, int n)
 {
     if (!d || !d->soft_hop_active || n <= 0)
@@ -3358,6 +4036,16 @@ static void navq_init(Player *p)
     p->msub.max_ahead_us = 0;
     p->nav_gen = 1;
     p->codec_gen = 1;
+    pthread_mutex_init(&p->par_mu, NULL);
+    p->par_mu_inited = 1;
+    memset(&p->rawpts, 0, sizeof(p->rawpts));
+    pthread_mutex_init(&p->rawpts.mu, NULL);
+    p->rawpts.mu_inited = 1;
+    p->rawpts.selected_si = -1;
+    p->rawpts.apkt_us = AV_NOPTS_VALUE;
+    p->rawpts.vpkt_us = AV_NOPTS_VALUE;
+    p->rawpts.aframe_us = AV_NOPTS_VALUE;
+    p->rawpts.vframe_us = AV_NOPTS_VALUE;
     memset(&p->pause, 0, sizeof(p->pause));
     pthread_mutex_init(&p->pause.mu, NULL);
     pthread_cond_init(&p->pause.cv, NULL);
@@ -3415,6 +4103,14 @@ static void navq_destroy(Player *p)
         pthread_mutex_destroy(&p->pause.mu);
         pthread_cond_destroy(&p->pause.cv);
         p->pause.inited = 0;
+    }
+    if (p->par_mu_inited) {
+        pthread_mutex_destroy(&p->par_mu);
+        p->par_mu_inited = 0;
+    }
+    if (p->rawpts.mu_inited) {
+        pthread_mutex_destroy(&p->rawpts.mu);
+        p->rawpts.mu_inited = 0;
     }
 }
 
@@ -3611,26 +4307,81 @@ static void pause_debug_threads(Player *p, const char *why)
             navq_count(p));
 }
 
-/* 1 = pushed, 0 = not pushed (quit, interrupt, or pending nav). */
+/* 1 = pushed, 0 = not pushed (quit, interrupt, or pending nav).
+ * vq->mu must NOT be held: this reads aq. Callers snapshot vq after relock. */
+static int vq_apply_hol_escape(Player *p, int vq_n, int aq_n)
+{
+    int escape;
+
+    escape = __atomic_load_n(&p->vq_hol_escape, __ATOMIC_RELAXED);
+    if (escape) {
+        if (aq_n >= VIDEO_HOL_EXIT_AQ) {
+            __atomic_store_n(&p->vq_hol_escape, 0, __ATOMIC_RELAXED);
+            p->vq_hol_hard_logged = 0;
+            fprintf(stderr,
+                    "VIDEO HOL ESCAPE: audio recovered aq=%d vq=%d\n",
+                    aq_n, vq_n);
+            escape = 0;
+        }
+    } else if (vq_n >= VIDEO_Q_SOFT_CAP && aq_n <= VIDEO_HOL_ENTER_AQ) {
+        __atomic_store_n(&p->vq_hol_escape, 1, __ATOMIC_RELAXED);
+        fprintf(stderr,
+                "VIDEO HOL ESCAPE: enter aq=%d vq=%d\n",
+                aq_n, vq_n);
+        escape = 1;
+    }
+    return escape ? VIDEO_Q_HARD_CAP : VIDEO_Q_SOFT_CAP;
+}
+
 static int player_pktq_push(Player *p, PktQ *q, AVPacket *src)
 {
     int64_t t0 = 0;
     const char *qname;
+    int limit;
+    int aq_n = 0;
 
     if (!p || !q || !src)
         return 0;
     qname = (q == &p->aq) ? "audio" : (q == &p->vq) ? "video" : "packet";
     pthread_mutex_lock(&q->mu);
-    while (q->count >= q->cap && !q->quit && !g_interrupt) {
+    for (;;) {
+        if (q->quit || g_interrupt)
+            break;
+        if (q == &p->vq) {
+            int escape = __atomic_load_n(&p->vq_hol_escape, __ATOMIC_RELAXED);
+
+            if (q->count < VIDEO_Q_SOFT_CAP && !escape)
+                break;
+            pthread_mutex_unlock(&q->mu);
+            aq_n = pktq_count(&p->aq);
+            pthread_mutex_lock(&q->mu);
+            if (q->quit || g_interrupt)
+                break;
+            limit = vq_apply_hol_escape(p, q->count, aq_n);
+        } else {
+            limit = q->cap;
+        }
+        if (q->count < limit)
+            break;
         if (!t0) {
             t0 = av_gettime_relative();
             q->full_n++;
             pause_thr_set(&p->pause.st_demux, THR_QFULL);
+            __atomic_store_n(&p->demux_wait_full,
+                             q == &p->aq ? 2 : 1, __ATOMIC_RELAXED);
+            if (q == &p->vq && q->count >= VIDEO_Q_HARD_CAP &&
+                !p->vq_hol_hard_logged) {
+                p->vq_hol_hard_logged = 1;
+                fprintf(stderr,
+                        "VIDEO HOL ESCAPE: hard cap reached aq=%d vq=%d\n",
+                        aq_n, q->count);
+            }
         }
         if (navq_count(p) > 0) {
             if (t0)
                 q->block_us += av_gettime_relative() - t0;
             pthread_mutex_unlock(&q->mu);
+            __atomic_store_n(&p->demux_wait_full, 0, __ATOMIC_RELAXED);
             pause_thr_set(&p->pause.st_demux, THR_RUN);
             return 0;
         }
@@ -3653,8 +4404,7 @@ static int player_pktq_push(Player *p, PktQ *q, AVPacket *src)
                 ? "demux audio-queue backpressure during prefill"
                 : "demux video-queue backpressure during prefill");
             pthread_mutex_lock(&q->mu);
-            if (q->count < q->cap || q->quit || g_interrupt)
-                continue;
+            continue;
         }
         pktq_wait_timeout(&q->not_full, &q->mu);
     }
@@ -3662,13 +4412,17 @@ static int player_pktq_push(Player *p, PktQ *q, AVPacket *src)
         q->quit = 1;
     if (t0)
         q->block_us += av_gettime_relative() - t0;
+    __atomic_store_n(&p->demux_wait_full, 0, __ATOMIC_RELAXED);
     pause_thr_set(&p->pause.st_demux, THR_RUN);
     if (q->quit) {
         pthread_mutex_unlock(&q->mu);
         return 0;
     }
     av_packet_ref(&q->pkts[q->tail], src);
-    q->pkts[q->tail].opaque = src->opaque;
+    q->pkts[q->tail].opaque = src->opaque
+        ? src->opaque
+        : (void *)(uintptr_t)player_codec_gen(p);
+    q->nav_gens[q->tail] = player_nav_gen(p);
     q->tail = (q->tail + 1) % q->cap;
     q->count++;
     q->pushed++;
@@ -7204,6 +7958,58 @@ static void dvdio_apply_highlight(DVDIO *d, int log_event)
     }
 }
 
+static void player_mpegps_hard_boundary(Player *p, DVDIO *d, AVFormatContext *fmt,
+                                        const char *why)
+{
+    crash_enter(CRASH_AV_READ_FRAME, p);
+    if (d)
+        d->hop_pending = 0;
+    if (p)
+        p->demux_reopen_req = 0;
+    if (fmt && fmt->pb) {
+        fmt->pb->eof_reached = 0;
+        fmt->pb->error = 0;
+        fmt->pb->buf_ptr = fmt->pb->buf_end;
+        fmt->pb->buf_ptr_max = fmt->pb->buf_end;
+    }
+    if (fmt)
+        avformat_flush(fmt);
+    if (p) {
+        pthread_mutex_lock(&p->par_mu);
+        p->vi = -1;
+        p->ai = -1;
+        pthread_mutex_unlock(&p->par_mu);
+        fprintf(stderr,
+                "NAV: MPEG-PS boundary flush (%s) gen=%u codec_gen=%u "
+                "(codecpar kept)\n",
+                why ? why : "hop",
+                player_nav_gen(p), player_codec_gen(p));
+    }
+}
+
+static void player_mpegps_soft_boundary(Player *p, DVDIO *d, AVFormatContext *fmt,
+                                        const char *why)
+{
+    crash_enter(CRASH_AV_READ_FRAME, p);
+    if (d)
+        d->soft_media_boundary_pending = 0;
+    if (fmt && fmt->pb) {
+        fmt->pb->eof_reached = 0;
+        fmt->pb->error = 0;
+        fmt->pb->buf_ptr = fmt->pb->buf_end;
+        fmt->pb->buf_ptr_max = fmt->pb->buf_end;
+    }
+    if (fmt)
+        avformat_flush(fmt);
+    if (p) {
+        fprintf(stderr,
+                "NAV: MPEG-PS SOFT media flush (%s) nav_gen=%u codec_gen=%u "
+                "(same AVIO/VTS, codecpar kept)\n",
+                why ? why : "soft hop",
+                player_nav_gen(p), player_codec_gen(p));
+    }
+}
+
 static void player_nav_discontinuity(Player *p, const char *why)
 {
     int n_a = 0, n_v = 0, n_y = 0;
@@ -7214,6 +8020,7 @@ static void player_nav_discontinuity(Player *p, const char *why)
     pause_cancel(p);
     gen = __atomic_add_fetch(&p->nav_gen, 1, __ATOMIC_SEQ_CST);
     __atomic_add_fetch(&p->codec_gen, 1, __ATOMIC_SEQ_CST);
+    crash_enter(CRASH_NAV_HARD_RESET, p);
     __atomic_store_n(&p->frames_this_nav_gen, 0, __ATOMIC_SEQ_CST);
     p->still_drain_req = 0;
     p->still_drain_done = 0;
@@ -7234,8 +8041,16 @@ static void player_nav_discontinuity(Player *p, const char *why)
     p->soft_log_yuv = 0;
     clock_reset(&p->clock);
     p->buf_mraudio_started = 0;
+    p->mraudio_gate_logged = 0;
+    __atomic_store_n(&p->first_video_presented_gen, 0, __ATOMIC_SEQ_CST);
+    p->first_mbox_nav_gen = 0;
     p->clock_bootstrapped = 0;
     p->clock_ready_logged = 0;
+    p->startup_buf_log_us = 0;
+    p->runtime_buf_log_us = 0;
+    __atomic_store_n(&p->demux_wait_full, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&p->vq_hol_escape, 0, __ATOMIC_RELAXED);
+    p->vq_hol_hard_logged = 0;
     p->pcm_hold_len = 0;
     p->first_audio_pts_us = AV_NOPTS_VALUE;
     p->last_audio_pts_us = AV_NOPTS_VALUE;
@@ -7280,7 +8095,7 @@ static void player_nav_soft_reset(Player *p, const char *reason,
                                   const char *old_pos, const char *new_pos,
                                   int pending_avio)
 {
-    int n_v = 0, n_y = 0;
+    int n_a = 0, n_v = 0, n_y = 0;
     unsigned gen;
 
     if (!p)
@@ -7291,22 +8106,42 @@ static void player_nav_soft_reset(Player *p, const char *reason,
     p->still_drain_req = 0;
     p->still_drain_done = 0;
     p->soft_decode_trace = 1;
+    n_a = pktq_flush(&p->aq);
     n_v = pktq_flush(&p->vq);
     if (p->buffered_yuv)
         n_y = yuvring_flush(&p->yuvring);
     p->flush_n++;
-    p->nav_flush_pkts += (unsigned long)n_v;
+    p->nav_flush_pkts += (unsigned long)(n_a + n_v);
     p->nav_flush_yuv += (unsigned long)n_y;
-    /* Presentation gen invalidates old YUV/highlight. Codec parameters
-     * are unchanged: do not flush/reinit MPEG-2 parser or decoder. */
+    /* Same-domain menu hop: media lifetime changes, codec does not.
+     * Parser/decoder flush runs on the video/audio threads, never here. */
     p->menu_still_drop = 1;
     p->soft_nav_log = 1;
     p->soft_nav_gen = gen;
     p->soft_log_pkt = 1;
     p->soft_log_decode = 1;
     p->soft_log_yuv = 1;
-    /* Same-domain menu hop: keep MPEG-PS/AVIO, audio, clock, and skip
-     * arming. The new VOBU's pending bytes must reach FFmpeg. */
+    p->video_reset_req = 1;
+    p->audio_reset_req = 1;
+    clock_reset(&p->clock);
+    p->buf_mraudio_started = 0;
+    p->mraudio_gate_logged = 0;
+    __atomic_store_n(&p->first_video_presented_gen, 0, __ATOMIC_SEQ_CST);
+    p->first_mbox_nav_gen = 0;
+    p->clock_bootstrapped = 0;
+    p->clock_ready_logged = 0;
+    p->startup_buf_log_us = 0;
+    p->runtime_buf_log_us = 0;
+    __atomic_store_n(&p->demux_wait_full, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&p->vq_hol_escape, 0, __ATOMIC_RELAXED);
+    p->vq_hol_hard_logged = 0;
+    p->pcm_hold_len = 0;
+    p->first_audio_pts_us = AV_NOPTS_VALUE;
+    p->last_audio_pts_us = AV_NOPTS_VALUE;
+    p->last_video_pts_us = AV_NOPTS_VALUE;
+    p->first_genuine_pts = AV_NOPTS_VALUE;
+    p->timeline_pts = AV_NOPTS_VALUE;
+    p->assigned_pts = AV_NOPTS_VALUE;
     if (player_buffered(p)) {
         pthread_mutex_lock(&p->prefill_mu);
         p->prefill_released = 0;
@@ -7315,12 +8150,15 @@ static void player_nav_soft_reset(Player *p, const char *reason,
         p->prefill_reason = NULL;
         pthread_cond_broadcast(&p->prefill_cv);
         pthread_mutex_unlock(&p->prefill_mu);
+        pthread_mutex_lock(&p->aq.mu);
+        pthread_cond_broadcast(&p->aq.not_empty);
+        pthread_mutex_unlock(&p->aq.mu);
         pthread_mutex_lock(&p->vq.mu);
         pthread_cond_broadcast(&p->vq.not_empty);
         pthread_mutex_unlock(&p->vq.mu);
     }
     fprintf(stderr,
-            "NAV RESET: SOFT\n"
+            "NAV RESET: SOFT MEDIA\n"
             "  reason=%s\n"
             "  old domain/pgcn/cell=%s\n"
             "  new domain/pgcn/cell=%s\n"
@@ -7329,10 +8167,13 @@ static void player_nav_soft_reset(Player *p, const char *reason,
             old_pos ? old_pos : "?",
             new_pos ? new_pos : "?",
             pending_avio);
-    dbg("DVD MENU: navigation reset: SOFT same-domain menu hop\n"
-        "  nav_gen=%u  codec_gen=%u (unchanged)  flush qV=%d yuv=%d  "
-        "(parser/decoder preserved)\n",
-        gen, player_codec_gen(p), n_v, n_y);
+    if (player_buffered(p))
+        fprintf(stderr,
+                "  prefill re-armed  target=%d  buffer=%d\n",
+                p->prefill_req, VIDEO_BUFFER_FRAMES);
+    dbg("DVD MENU: navigation reset: SOFT MEDIA same-domain menu hop\n"
+        "  nav_gen=%u  codec_gen=%u (unchanged)  flush qA=%d qV=%d yuv=%d\n",
+        gen, player_codec_gen(p), n_a, n_v, n_y);
     menu_spu_invalidate(p, reason);
 }
 
@@ -8376,7 +9217,7 @@ static void player_request_still_drain(Player *p)
     p->still_drain_gen = gen;
     p->still_drain_done = 0;
     p->still_drain_req = 1;
-    pktq_push_marker(&p->vq, VQ_MARK_STILL_BOUNDARY);
+    pktq_push_marker(&p->vq, VQ_MARK_STILL_BOUNDARY, gen);
     dbg("DVD MENU: STILL-BOUNDARY marker queued  nav_gen=%u  "
         "codec_gen=%u  frames_this_gen=%u\n",
         gen, player_codec_gen(p),
@@ -8631,10 +9472,9 @@ static int dvdio_pump(DVDIO *d, int32_t event, int32_t len)
             if (was && !in_menu)
                 dvdio_leave_menu(d);
         }
-        /* Same-domain menu page change is not a media discontinuity.
-         * VTSMenu->VTSMenu / VMGM->VMGM keep MPEG-PS/AVIO so the new
-         * still VOBU reaches FFmpeg. Menu<->title, VMGM<->VTSMenu, and
-         * already-armed hard hops keep the full reopen. */
+        /* Same-domain menu page change is a SOFT media boundary, not a
+         * VTS/codec discontinuity. VTSMenu->VTSMenu / VMGM->VMGM keep
+         * MPEG-PS/AVIO/codec_gen; old and new cell bytes must not splice. */
         if (!d->hop_pending && old_menu && in_menu &&
             old_dom == d->domain &&
             (d->domain == DVD_DOMAIN_VTSMenu ||
@@ -8654,12 +9494,13 @@ static int dvdio_pump(DVDIO *d, int32_t event, int32_t len)
                         : "same-domain VMGM HOP",
                     oldbuf, newbuf, pending);
                 d->soft_hop_active = 1;
-                d->soft_drop_pre_hop = 1;
+                d->soft_drop_pre_hop = 0;
+                d->soft_media_boundary_pending = 1;
                 d->post_soft_bytes = 0;
                 d->post_soft_block_ok = 0;
                 d->post_soft_mpeg_ret = 0;
-                dbg("DVD MENU: bytes preserved through HOP  "
-                    "sector_leftover=%d (not discarded; no AVIO drain)\n",
+                dbg("DVD MENU: SOFT MEDIA BOUNDARY armed  "
+                    "sector_leftover=%d (old-only/EOF; no byte splice)\n",
                     pending);
             } else {
                 const char *why = "HOP_CHANNEL (media/VTS change)";
@@ -8823,15 +9664,18 @@ static int dvdio_pump(DVDIO *d, int32_t event, int32_t len)
                 logical, physical, pes < 0 ? 0 : pes);
         dvdio_audio_log_context(d);
         if (d->player && ev) {
-            if (logical >= 0 && logical <= 7)
+            if (logical < 0 || logical > 7) {
+                fprintf(stderr,
+                        "AUDIO FOLLOW: ignoring invalid DVD logical stream %d\n",
+                        logical);
+            } else {
                 d->player->current_audio_logical = logical;
-            else
-                d->player->current_audio_logical = -1;
-            d->player->audio_pending_logical = -1;
-            d->player->audio_follow_logical = logical;
-            d->player->audio_follow_physical = physical;
-            d->player->audio_follow_fmt =
-                (fmt == 0xffff) ? -1 : (int)fmt;
+                d->player->audio_pending_logical = -1;
+                d->player->audio_follow_logical = logical;
+                d->player->audio_follow_physical = physical;
+                d->player->audio_follow_fmt =
+                    (fmt == 0xffff) ? -1 : (int)fmt;
+            }
         }
         return 0;
     }
@@ -9063,9 +9907,10 @@ static int copy_codecpar(AVCodecParameters **dst, const AVCodecParameters *src)
     return 0;
 }
 
-static int replace_codecpar(AVCodecParameters **dst, const AVCodecParameters *src)
+static int refresh_codecpar(AVCodecParameters **dst, const AVCodecParameters *src)
 {
-    avcodec_parameters_free(dst);
+    if (*dst)
+        return avcodec_parameters_copy(*dst, src) < 0 ? -1 : 0;
     return copy_codecpar(dst, src);
 }
 
@@ -9127,6 +9972,12 @@ static void player_apply_audio_follow(Player *p)
     physical = p->audio_follow_physical;
     dvd_fmt = p->audio_follow_fmt;
     logical = p->audio_follow_logical;
+    if (logical < 0 || logical > 7) {
+        p->audio_follow_physical = -1;
+        p->audio_follow_logical = -1;
+        p->audio_follow_fmt = -1;
+        return;
+    }
     for (i = 0; i < (int)fmt->nb_streams; i++) {
         if (dvd_audio_ffmpeg_matches(fmt->streams[i], physical, dvd_fmt)) {
             found = i;
@@ -9140,17 +9991,26 @@ static void player_apply_audio_follow(Player *p)
             logical, physical, found,
             fmt->streams[found]->id & 0xffff,
             found == p->ai ? " (already bound)" : "");
+    if (p->rawpts.mu_inited) {
+        pthread_mutex_lock(&p->rawpts.mu);
+        rawpts_sync_gen(p);
+        p->rawpts.follow_hit = 1;
+        pthread_mutex_unlock(&p->rawpts.mu);
+    }
     p->audio_follow_physical = -1;
     p->audio_follow_logical = -1;
     p->audio_follow_fmt = -1;
     if (found == p->ai)
         return;
-    if (replace_codecpar(&p->acp, fmt->streams[found]->codecpar) < 0) {
+    pthread_mutex_lock(&p->par_mu);
+    if (refresh_codecpar(&p->acp, fmt->streams[found]->codecpar) < 0) {
+        pthread_mutex_unlock(&p->par_mu);
         fprintf(stderr, "AUDIO: follow failed (codecpar)\n");
         return;
     }
     p->ai = found;
     p->atb = fmt->streams[found]->time_base;
+    pthread_mutex_unlock(&p->par_mu);
     flushed = pktq_flush(&p->aq);
     if (p->audio_started)
         p->audio_switch_req = 1;
@@ -9187,6 +10047,20 @@ static AVCodecContext *open_decoder(const AVCodecParameters *cp, AVRational tb,
         avcodec_free_context(&ctx);
         return NULL;
     }
+    return ctx;
+}
+
+static AVCodecContext *open_audio_decoder(Player *p)
+{
+    AVCodecContext *ctx;
+
+    pthread_mutex_lock(&p->par_mu);
+    if (!p->acp) {
+        pthread_mutex_unlock(&p->par_mu);
+        return NULL;
+    }
+    ctx = open_decoder(p->acp, p->atb, AVMEDIA_TYPE_AUDIO);
+    pthread_mutex_unlock(&p->par_mu);
     return ctx;
 }
 
@@ -9237,6 +10111,68 @@ static void clock_log_master_ready(Player *p, int fill, int64_t first_pts_us)
  * video-paced fallback. Returning here lets YUV drain so demux can reach
  * audio packets; clock_publish then binds the audio master.
  */
+static void player_log_startup_buffer(Player *p)
+{
+    int64_t now;
+    int yuv, yuv_cap, aq_n, vq_n, ready, fill;
+    int wait;
+    int64_t aclk, vpts;
+    unsigned long vpush, apush, vpop, apop, aq_empty;
+    const char *wait_s;
+
+    if (!p || p->fail || g_interrupt || p->in_menu || p->still_active)
+        return;
+    if (p->uncapped_bench)
+        return;
+    now = av_gettime_relative();
+    ready = clock_is_ready(&p->clock);
+    if (!ready) {
+        if (p->startup_buf_log_us && now - p->startup_buf_log_us < 1000000)
+            return;
+        p->startup_buf_log_us = now;
+        yuv = player_buffered(p) ? buffered_queue_count(p) : 0;
+        yuv_cap = VIDEO_BUFFER_FRAMES;
+        fprintf(stderr,
+                "STARTUP BUFFER: yuv=%d/%d aq=%d/%d vq=%d/%d(hard=%d)\n",
+                yuv, yuv_cap,
+                pktq_count(&p->aq), AUDIO_Q_CAP,
+                pktq_count(&p->vq), VIDEO_Q_SOFT_CAP, VIDEO_Q_HARD_CAP);
+        return;
+    }
+    if (p->runtime_buf_log_us && now - p->runtime_buf_log_us < 1000000)
+        return;
+    p->runtime_buf_log_us = now;
+    yuv = player_buffered(p) ? buffered_queue_count(p) : 0;
+    yuv_cap = VIDEO_BUFFER_FRAMES;
+    pktq_diag_snapshot(&p->aq, &aq_n, &apush, &apop, &aq_empty);
+    pktq_diag_snapshot(&p->vq, &vq_n, &vpush, &vpop, NULL);
+    pthread_mutex_lock(&p->clock.mu);
+    aclk = p->clock.clock_us;
+    fill = p->clock.fill;
+    pthread_mutex_unlock(&p->clock.mu);
+    vpts = p->last_video_pts_us;
+    wait = __atomic_load_n(&p->demux_wait_full, __ATOMIC_RELAXED);
+    if (wait == 2)
+        wait_s = "audio";
+    else if (wait == 1)
+        wait_s = "video";
+    else
+        wait_s = "none";
+    fprintf(stderr,
+            "RUNTIME BUFFER: yuv=%d/%d aq=%d/%d vq=%d/%d(hard=%d) audio_fill=%d "
+            "clock_ready=%d aclk=%" PRId64 " vpts=%" PRId64
+            " demux_wait=%s hol_escape_active=%d  vpush=%lu apush=%lu "
+            "vpop=%lu apop=%lu underrun=%d aq_empty=%lu\n",
+            yuv, yuv_cap, aq_n, AUDIO_Q_CAP, vq_n, VIDEO_Q_SOFT_CAP,
+            VIDEO_Q_HARD_CAP, fill,
+            ready,
+            aclk == AV_NOPTS_VALUE ? (int64_t)-1 : aclk,
+            vpts == AV_NOPTS_VALUE ? (int64_t)-1 : vpts,
+            wait_s,
+            __atomic_load_n(&p->vq_hol_escape, __ATOMIC_RELAXED) ? 1 : 0,
+            vpush, apush, vpop, apop, p->live_underruns, aq_empty);
+}
+
 static void clock_wait_ready(Player *p)
 {
     int boot = 0;
@@ -9246,6 +10182,7 @@ static void clock_wait_ready(Player *p)
     while (!p->clock.ready && !p->fail && !g_interrupt &&
            !p->in_menu && !p->still_active) {
         pthread_mutex_unlock(&p->clock.mu);
+        player_log_startup_buffer(p);
         yuv = player_buffered(p) ? buffered_queue_count(p) : 0;
         if (player_buffered(p) && prefill_is_released(p) && yuv >= 1) {
             pthread_mutex_lock(&p->clock.mu);
@@ -9271,16 +10208,21 @@ done:
         return;
     p->clock_bootstrapped = 1;
     fprintf(stderr,
-            "CLOCK: provisional video bootstrap  gen=%u yuv=%d aq=%d vq=%d "
-            "(audio master not ready)\n",
-            player_nav_gen(p), yuv, pktq_count(&p->aq), pktq_count(&p->vq));
+            "CLOCK: provisional video bootstrap  gen=%u yuv=%d aq=%d/%d "
+            "vq=%d/%d(hard=%d) (audio master not ready)\n",
+            player_nav_gen(p), yuv,
+            pktq_count(&p->aq), AUDIO_Q_CAP,
+            pktq_count(&p->vq), VIDEO_Q_SOFT_CAP, VIDEO_Q_HARD_CAP);
 }
 
 static void prefill_release(Player *p, const char *reason)
 {
     int got;
+    int aq_n, vq_n;
 
     got = buffered_queue_count(p);
+    aq_n = pktq_count(&p->aq);
+    vq_n = pktq_count(&p->vq);
 
     pthread_mutex_lock(&p->prefill_mu);
     if (!p->prefill_released) {
@@ -9290,11 +10232,21 @@ static void prefill_release(Player *p, const char *reason)
         p->prefill_reason = reason ? reason : "released";
         pthread_cond_broadcast(&p->prefill_cv);
         fprintf(stderr,
-                "video prefill gate released: %d / %d frames in %.3f s (%s)\n",
+                "video prefill gate released: %d / %d frames in %.3f s (%s)  "
+                "yuv=%d aq=%d/%d vq=%d/%d(hard=%d)\n",
                 p->prefill_got, p->prefill_req,
                 p->prefill_t0_us
                     ? (p->prefill_t1_us - p->prefill_t0_us) / 1e6 : 0.0,
-                p->prefill_reason);
+                p->prefill_reason,
+                got, aq_n, AUDIO_Q_CAP, vq_n, VIDEO_Q_SOFT_CAP,
+                VIDEO_Q_HARD_CAP);
+        fprintf(stderr,
+                "A/V START: prefill release nav_gen=%u codec_gen=%u "
+                "wall_us=%" PRId64 " reason=%s yuv=%d\n",
+                player_nav_gen(p), player_codec_gen(p),
+                p->prefill_t1_us,
+                p->prefill_reason ? p->prefill_reason : "?",
+                got);
     }
     pthread_mutex_unlock(&p->prefill_mu);
 
@@ -9325,8 +10277,16 @@ static void player_prefill_release_if_held(Player *p, const char *why)
 static void prefill_wait(Player *p)
 {
     pthread_mutex_lock(&p->prefill_mu);
-    while (!p->prefill_released && !p->fail && !g_interrupt)
+    while (!p->prefill_released && !p->fail && !g_interrupt &&
+           !p->audio_reset_req) {
+        pthread_mutex_unlock(&p->prefill_mu);
+        player_log_startup_buffer(p);
+        pthread_mutex_lock(&p->prefill_mu);
+        if (p->prefill_released || p->fail || g_interrupt ||
+            p->audio_reset_req)
+            break;
         pktq_wait_timeout(&p->prefill_cv, &p->prefill_mu);
+    }
     pthread_mutex_unlock(&p->prefill_mu);
 }
 
@@ -9381,6 +10341,15 @@ static int buffered_start_mraudio(Player *p, MrAudio *mr, uint8_t *chunk,
      * used to set started=1 and leave clock.ready=0 forever. */
     if (p->first_audio_pts_us == AV_NOPTS_VALUE)
         return 0;
+    if (!player_first_video_ready(p)) {
+        if (!p->mraudio_gate_logged) {
+            p->mraudio_gate_logged = 1;
+            fprintf(stderr,
+                    "MRAUDIO GATE: waiting for first video nav_gen=%u\n",
+                    player_nav_gen(p));
+        }
+        return 0;
+    }
 
     hold_bytes = p->pcm_hold_len;
     p->pcm_hold_at_release = p->pcm_hold_len;
@@ -9437,6 +10406,15 @@ static int buffered_start_mraudio(Player *p, MrAudio *mr, uint8_t *chunk,
         dbg("MrAudio fill after prime/flush: %d bytes\n", mr->fill);
 
     p->buf_mraudio_started = 1;
+    fprintf(stderr,
+            "A/V START: MrAudio start nav_gen=%u codec_gen=%u "
+            "wall_us=%" PRId64 " hold_ms=%.1f first_pts=%s%.6f\n",
+            player_nav_gen(p), player_codec_gen(p),
+            av_gettime_relative(),
+            hold_bytes * 1000.0 / (double)BYTES_PER_SEC,
+            p->first_audio_pts_us == AV_NOPTS_VALUE ? "(none) " : "",
+            p->first_audio_pts_us == AV_NOPTS_VALUE
+                ? 0.0 : p->first_audio_pts_us / 1e6);
     dbg("MrAudio writes enabled — same prime/write loop as normal playback.\n");
     return 0;
 }
@@ -9446,8 +10424,11 @@ static int buffered_start_mraudio(Player *p, MrAudio *mr, uint8_t *chunk,
  * (audio must start MrAudio immediately, then retry the pop).
  * 3 = audio_reset_req. 4 = pause drain/hold (do not consume a packet).
  */
-static int pktq_pop_or_prefill_gate(PktQ *q, AVPacket *dst, Player *p)
+static int pktq_pop_or_prefill_gate(PktQ *q, AVPacket *dst, Player *p,
+                                    uint32_t *nav_gen_out)
 {
+    int waited_empty = 0;
+
     pthread_mutex_lock(&q->mu);
     for (;;) {
         if (pause_should_hold_audio(p)) {
@@ -9474,6 +10455,10 @@ static int pktq_pop_or_prefill_gate(PktQ *q, AVPacket *dst, Player *p)
         pthread_mutex_lock(&q->mu);
         if (q->count > 0 || q->eof || q->quit || g_interrupt)
             continue;
+        if (!waited_empty) {
+            waited_empty = 1;
+            q->empty_n++;
+        }
         pktq_wait_timeout(&q->not_empty, &q->mu);
         if (p->audio_reset_req) {
             pthread_mutex_unlock(&q->mu);
@@ -9491,6 +10476,9 @@ static int pktq_pop_or_prefill_gate(PktQ *q, AVPacket *dst, Player *p)
         return 0;
     }
     av_packet_move_ref(dst, &q->pkts[q->head]);
+    if (nav_gen_out)
+        *nav_gen_out = q->nav_gens[q->head];
+    q->nav_gens[q->head] = 0;
     q->head = (q->head + 1) % q->cap;
     q->count--;
     q->popped++;
@@ -9528,13 +10516,11 @@ static int buffered_try_start_mraudio(Player *p, MrAudio *mr, uint8_t *chunk,
 static int buffered_emit_pcm(Player *p, MrAudio *mr, uint8_t *chunk,
                              int *chunk_used, const uint8_t *src, int remain)
 {
-    if (!prefill_is_released(p)) {
+    if (!p->buf_mraudio_started) {
         if (pcm_hold_append(p, src, remain) < 0)
             return -1;
-        return 0;
+        return buffered_start_mraudio(p, mr, chunk, chunk_used);
     }
-    if (buffered_start_mraudio(p, mr, chunk, chunk_used) < 0)
-        return -1;
     return emit_pcm(p, mr, chunk, chunk_used, src, remain);
 }
 
@@ -9583,7 +10569,7 @@ static void *audio_thread(void *opaque)
     int hold_full_logged = 0;
     clock_epoch = clock_epoch_now(&p->clock);
 
-    adec = open_decoder(p->acp, p->atb, AVMEDIA_TYPE_AUDIO);
+    adec = open_audio_decoder(p);
     if (!adec) {
         player_abort(p);
         goto done;
@@ -9591,21 +10577,32 @@ static void *audio_thread(void *opaque)
 
     for (;;) {
         int got_pkt;
+        uint32_t pkt_nav_gen = 0;
+
+        player_log_startup_buffer(p);
 
         if (p->audio_reset_req) {
+            crash_enter(CRASH_NAV_HARD_RESET, p);
             p->audio_reset_req = 0;
+            mraudio_hw_stop_flush(&mr, player_nav_gen(p));
             if (adec)
-                avcodec_flush_buffers(adec);
+                avcodec_free_context(&adec);
+            if (swr)
+                swr_free(&swr);
             first_pts_us = AV_NOPTS_VALUE;
             p->first_audio_pts_us = AV_NOPTS_VALUE;
             p->pcm_hold_len = 0;
             p->buf_mraudio_started = 0;
-            mr.bytes_origin = mr.bytes_written - mr.prime_bytes;
+            p->mraudio_gate_logged = 0;
             clock_epoch = clock_epoch_now(&p->clock);
             hold_full_logged = 0;
-            dbg("DVD MENU: audio decoder/clock reset  gen=%u  "
-                "origin_bytes=%" PRId64 "\n",
-                player_nav_gen(p), mr.bytes_origin);
+            adec = open_audio_decoder(p);
+            fprintf(stderr,
+                    "AUDIO: HARD reset decoder %s swr freed  gen=%u "
+                    "codec_gen=%u origin_bytes=%" PRId64 "\n",
+                    adec ? "reopened" : "pending codecpar",
+                    player_nav_gen(p), player_codec_gen(p),
+                    mr.bytes_origin);
         }
 
         if (p->audio_switch_req) {
@@ -9617,8 +10614,7 @@ static void *audio_thread(void *opaque)
                 avcodec_free_context(&adec);
             if (swr)
                 swr_free(&swr);
-            nctx = p->acp ? open_decoder(p->acp, p->atb, AVMEDIA_TYPE_AUDIO)
-                          : NULL;
+            nctx = open_audio_decoder(p);
             if (!nctx) {
                 fprintf(stderr, "AUDIO: decoder reopen failed\n");
                 player_abort(p);
@@ -9655,7 +10651,7 @@ static void *audio_thread(void *opaque)
                     break;
                 continue;
             }
-            got_pkt = pktq_pop_or_prefill_gate(&p->aq, pkt, p);
+            got_pkt = pktq_pop_or_prefill_gate(&p->aq, pkt, p, &pkt_nav_gen);
             if (got_pkt == 2 || got_pkt == 3 || got_pkt == 5)
                 continue;
             if (got_pkt == 4) {
@@ -9667,7 +10663,7 @@ static void *audio_thread(void *opaque)
             if (got_pkt == 0)
                 break;
         } else {
-            got_pkt = pktq_pop_or_prefill_gate(&p->aq, pkt, p);
+            got_pkt = pktq_pop_or_prefill_gate(&p->aq, pkt, p, &pkt_nav_gen);
             if (got_pkt == 2 || got_pkt == 3 || got_pkt == 5)
                 continue;
             if (got_pkt == 4) {
@@ -9679,15 +10675,38 @@ static void *audio_thread(void *opaque)
             if (got_pkt == 0)
                 break;
         }
+        if (pkt_is_stale_codec_gen(pkt, player_codec_gen(p))) {
+            av_packet_unref(pkt);
+            continue;
+        }
+        if (pkt_is_stale_nav_gen(pkt, pkt_nav_gen, player_nav_gen(p))) {
+            av_packet_unref(pkt);
+            continue;
+        }
+        if (p->audio_reset_req) {
+            av_packet_unref(pkt);
+            continue;
+        }
+        if (!adec) {
+            av_packet_unref(pkt);
+            continue;
+        }
         p->audio_packets++;
+        crash_enter(CRASH_AUDIO_SEND_PACKET, p);
         if (avcodec_send_packet(adec, pkt) < 0) {
             av_packet_unref(pkt);
             continue;
         }
         av_packet_unref(pkt);
+        crash_enter(CRASH_AUDIO_RECEIVE_FRAME, p);
         while (avcodec_receive_frame(adec, frame) == 0) {
+            if (pkt_nav_gen != player_nav_gen(p) || p->audio_reset_req) {
+                av_frame_unref(frame);
+                break;
+            }
             p->audio_frames++;
             p->src_samples += frame->nb_samples;
+            rawpts_log_aframe(p, frame, p->atb);
             if (frame->pts == AV_NOPTS_VALUE) {
                 p->audio_missing_pts++;
             } else {
@@ -9695,8 +10714,7 @@ static void *audio_thread(void *opaque)
                 if (first_pts_us == AV_NOPTS_VALUE && pus != AV_NOPTS_VALUE) {
                     first_pts_us = pus;
                     p->first_audio_pts_us = pus;
-                    dbg("First decoded audio PTS: %.6f s (clock origin)\n",
-                        pus / 1e6);
+                    dbg("First decoded audio PTS: %.6f s\n", pus / 1e6);
                 }
                 if (p->last_audio_pts_us != AV_NOPTS_VALUE &&
                     pus != AV_NOPTS_VALUE) {
@@ -9711,6 +10729,7 @@ static void *audio_thread(void *opaque)
             if (!swr) {
                 AVChannelLayout out_layout;
                 av_channel_layout_default(&out_layout, OUT_CHANNELS);
+                crash_enter(CRASH_SWR_INIT, p);
                 if (swr_alloc_set_opts2(
                         &swr, &out_layout, AV_SAMPLE_FMT_S16, OUT_RATE,
                         &frame->ch_layout, (enum AVSampleFormat)frame->format,
@@ -9746,10 +10765,20 @@ static void *audio_thread(void *opaque)
                     }
                     out_cap = max_out;
                 }
+                if (frame->nb_samples <= 0 || !frame->extended_data ||
+                    !frame->extended_data[0]) {
+                    av_frame_unref(frame);
+                    continue;
+                }
+                crash_enter(CRASH_SWR_CONVERT, p);
                 int got = swr_convert(swr, out_data, max_out,
                                       (const uint8_t **)frame->extended_data,
                                       frame->nb_samples);
                 if (got > 0) {
+                    if (pkt_nav_gen != player_nav_gen(p) || p->audio_reset_req) {
+                        av_frame_unref(frame);
+                        break;
+                    }
                     p->out_samples += got;
                     if (player_buffered(p)) {
                         if (buffered_emit_pcm(p, &mr, chunk, &chunk_used,
@@ -9899,12 +10928,17 @@ static void assign_video_pts(Player *p, const AVFrame *frame,
                              const AVCodecContext *vdec)
 {
     AVRational detected = detect_fps(p, vdec);
-    if (detected.num > 0 && detected.den > 0)
-        p->fps = detected;
+    int clamped = 0;
+    int64_t previous;
+    int64_t disc_raw = 0;
+    int64_t timeline = AV_NOPTS_VALUE;
     const int64_t genuine =
         (frame->pts != AV_NOPTS_VALUE) ? frame->pts : AV_NOPTS_VALUE;
     const int64_t dur = frame_duration_tb(p);
-    int64_t timeline = AV_NOPTS_VALUE;
+
+    if (detected.num > 0 && detected.den > 0)
+        p->fps = detected;
+    previous = p->timeline_pts;
     if (genuine != AV_NOPTS_VALUE && p->vtb.num > 0 && p->vtb.den > 0) {
         p->genuine_pts_count++;
         if (p->first_genuine_pts == AV_NOPTS_VALUE) {
@@ -9914,11 +10948,15 @@ static void assign_video_pts(Player *p, const AVFrame *frame,
         } else if (dur > 0) {
             int64_t expected = p->timeline_pts + dur;
             int64_t disc = genuine - expected;
+            disc_raw = disc;
             timeline = expected;
-            if (disc > dur)
+            if (disc > dur) {
                 disc = dur;
-            else if (disc < -dur)
+                clamped = 1;
+            } else if (disc < -dur) {
                 disc = -dur;
+                clamped = 1;
+            }
             p->timeline_pts = expected + disc;
         } else {
             timeline = genuine;
@@ -9932,6 +10970,8 @@ static void assign_video_pts(Player *p, const AVFrame *frame,
         p->fallback_frames++;
     }
     p->assigned_pts = timeline;
+    rawpts_on_assign_video(p, frame, genuine, previous, disc_raw, clamped,
+                           timeline);
 }
 
 /* Diagnostics and stale recovery. Source frame duration from detected fps. */
@@ -10937,7 +11977,6 @@ static int frame_is_stale(Player *p, int64_t vpts_us, int timed, int64_t *off_ou
     pthread_mutex_unlock(&p->clock.mu);
     if (!ready || aclk == AV_NOPTS_VALUE)
         return 0;
-
     if (off_out)
         *off_out = vpts_us - aclk;
     return vpts_us + T <= aclk + EARLY_SLACK_US;
@@ -11442,6 +12481,8 @@ static int present_video_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
     }
 
     mailbox_write_frame(p, next, frame);
+    player_note_first_video_presented(p, player_nav_gen(p), vpts_us);
+    rawpts_log_present(p, vpts_us, pvpts_us);
     p->last_mbox_wall_us = av_gettime_relative();
     if (next)
         p->frames_b++;
@@ -11737,17 +12778,17 @@ static int producer_enqueue_yuv(Player *p, AVFrame *frame, AVCodecContext *vdec,
     if (p->fail)
         return -1;
 
-    av_frame_unref(p->yuvring.slots[idx].yuv);
-    if (av_frame_ref(p->yuvring.slots[idx].yuv, frame) < 0) {
-        fprintf(stderr, "av_frame_ref failed for YUV queue slot\n");
-        player_abort(p);
-        return -1;
+    {
+        int filled = yuvring_fill_slot(&p->yuvring, idx, epoch, frame);
+
+        if (filled < 0) {
+            fprintf(stderr, "av_frame_ref failed for YUV queue slot\n");
+            player_abort(p);
+            return -1;
+        }
+        if (filled == 0)
+            return 0;
     }
-    p->yuvring.slots[idx].width = frame->width;
-    p->yuvring.slots[idx].height = frame->height;
-    p->yuvring.slots[idx].format = frame->format;
-    p->yuvring.slots[idx].interlaced_frame = frame->interlaced_frame ? 1 : 0;
-    p->yuvring.slots[idx].top_field_first = frame->top_field_first ? 1 : 0;
 
     now = av_gettime_relative();
     p->video_decoded++;
@@ -11872,6 +12913,8 @@ static int present_cached_frame(Player *p, uint8_t *src, int64_t vpts_us)
     }
 
     mailbox_write_request(p, next, 0, 0);
+    player_note_first_video_presented(p, player_nav_gen(p), vpts_us);
+    rawpts_log_present(p, vpts_us, pvpts_us);
     p->last_mbox_wall_us = av_gettime_relative();
     if (next)
         p->frames_b++;
@@ -12077,11 +13120,6 @@ static int present_menu_skip_clock(Player *p, int ui_redraw, int frame_menu)
     return 0;
 }
 
-/*
- * phase_us is mailbox-write -> display_buf ACK of the previous request
- * (p->last_mbox_to_ack_us). It is NOT a raster/latch phase: ARM cannot
- * observe the FPGA line counters without inventing a clock.
- */
 static void log_present_perf(Player *p, int64_t raw_vpts_us, int64_t pvpts_us,
                              int64_t aclk, int64_t av_delta_us,
                              int64_t ack_wait_us, int ack_instant,
@@ -12113,7 +13151,8 @@ static void log_present_perf(Player *p, int64_t raw_vpts_us, int64_t pvpts_us,
 
 static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
                              struct SwsContext **sws, int ui_redraw,
-                             int frame_menu, int slot_intl, int slot_tff)
+                             int frame_menu, int slot_intl, int slot_tff,
+                             unsigned frame_nav_gen)
 {
     uint8_t *dst_data[4] = {0};
     int dst_linesize[4] = {0};
@@ -12317,6 +13356,10 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
     mailbox_write_request(p, next,
                           p->fpga_yuv420 ? (slot_intl ? 1 : 0) : 0,
                           p->fpga_yuv420 ? (slot_tff ? 1 : 0) : 0);
+    if (!ui_redraw)
+        player_note_first_video_presented(p, frame_nav_gen, vpts_us);
+    if (!ui_redraw)
+        rawpts_log_present(p, vpts_us, pvpts_us);
     p->last_mbox_wall_us = av_gettime_relative();
     int64_t mbox_write_us = p->last_mbox_wall_us - mbox_t0;
     if (mbox_write_us < 0)
@@ -12536,6 +13579,8 @@ static void *present_thread(void *opaque)
         unsigned g = player_nav_gen(p);
         int redraw = 0;
 
+        player_log_startup_buffer(p);
+
         if (g != seen_gen) {
             seen_gen = g;
             if (p->in_menu) {
@@ -12553,9 +13598,12 @@ static void *present_thread(void *opaque)
                         p->prefill_short_pgc, p->still_active, p->in_menu);
                 prefill_wait(p);
                 fprintf(stderr,
-                        "PRESENT: prefill released  gen=%u yuv=%d reason=%s\n",
+                        "PRESENT: prefill released  gen=%u yuv=%d aq=%d/%d "
+                        "vq=%d/%d(hard=%d) reason=%s\n",
                         g,
                         p->buffered_yuv ? yuvring_count(&p->yuvring) : -1,
+                        pktq_count(&p->aq), AUDIO_Q_CAP,
+                        pktq_count(&p->vq), VIDEO_Q_SOFT_CAP, VIDEO_Q_HARD_CAP,
                         p->prefill_reason ? p->prefill_reason : "?");
                 if (p->fail || g_interrupt)
                     break;
@@ -12584,7 +13632,7 @@ static void *present_thread(void *opaque)
             p->cur_decode_us = 0;
             pr = present_yuv_frame(p, menu_hold, AV_NOPTS_VALUE, &sws, 1, 1,
                                    menu_hold->interlaced_frame,
-                                   menu_hold->top_field_first);
+                                   menu_hold->top_field_first, menu_hold_gen);
             p->menu_redraws++;
             if (pr < 0)
                 break;
@@ -12622,7 +13670,7 @@ static void *present_thread(void *opaque)
                 continue;
             }
             pr = present_yuv_frame(p, yf, vpts_us, &sws, 0, slot_menu,
-                                   slot_intl, slot_tff);
+                                   slot_intl, slot_tff, slot_gen);
             if (pr == 0 && slot_menu && yf) {
                 av_frame_unref(menu_hold);
                 av_frame_ref(menu_hold, yf);
@@ -12955,12 +14003,13 @@ static void *video_thread(void *opaque)
 
     unsigned dec_nav_gen = player_nav_gen(p);
     unsigned dec_codec_gen = player_codec_gen(p);
+    uint32_t pkt_nav_gen = 0;
 
-    while (pktq_pop(&p->vq, pkt)) {
+    while (pktq_pop(&p->vq, pkt, &pkt_nav_gen)) {
         const uint8_t *in = pkt->data;
         int in_size = pkt->size;
         int64_t in_pts = pkt->pts, in_dts = pkt->dts, in_pos = pkt->pos;
-        unsigned pkt_gen = player_nav_gen(p);
+        unsigned pkt_gen = pkt_nav_gen;
         unsigned pkt_codec = player_codec_gen(p);
         int trace = video_trace_active(p);
 
@@ -12972,6 +14021,15 @@ static void *video_thread(void *opaque)
             if (video_drain_still_boundary(p, parser, vdec, ppkt, frame, &sws,
                                            pkt_gen, timed) < 0)
                 break;
+            continue;
+        }
+
+        if (pkt_is_stale_codec_gen(pkt, pkt_codec)) {
+            av_packet_unref(pkt);
+            continue;
+        }
+        if (pkt_is_stale_nav_gen(pkt, pkt_nav_gen, player_nav_gen(p))) {
+            av_packet_unref(pkt);
             continue;
         }
 
@@ -12994,11 +14052,24 @@ static void *video_thread(void *opaque)
             dbg("DVD MENU: video decoder/parser HARD reset  "
                 "codec_gen=%u nav_gen=%u\n",
                 pkt_codec, pkt_gen);
-        } else if (pkt_gen != dec_nav_gen) {
-            dbg("DVD MENU: presentation gen %u -> %u  "
-                "codec_gen=%u unchanged (parser/decoder preserved)\n",
-                dec_nav_gen, pkt_gen, pkt_codec);
+        } else if (p->video_reset_req || pkt_gen != dec_nav_gen) {
+            p->video_reset_req = 0;
             dec_nav_gen = pkt_gen;
+            avcodec_flush_buffers(vdec);
+            av_parser_close(parser);
+            parser = av_parser_init(AV_CODEC_ID_MPEG2VIDEO);
+            if (!parser) {
+                fprintf(stderr, "video parser re-init failed\n");
+                av_packet_unref(pkt);
+                player_abort(p);
+                break;
+            }
+            p->first_genuine_pts = AV_NOPTS_VALUE;
+            p->timeline_pts = AV_NOPTS_VALUE;
+            p->assigned_pts = AV_NOPTS_VALUE;
+            dbg("DVD MENU: video parser/decoder MEDIA flush  "
+                "nav_gen=%u codec_gen=%u (codec unchanged)\n",
+                pkt_gen, pkt_codec);
         }
 
         if (trace)
@@ -13462,7 +14533,7 @@ static void print_unbounded_report(const Player *p)
 
 int main(int argc, char **argv)
 {
-    install_sigill_handler();
+    install_crash_handlers();
     install_interrupt_handler();
     setvbuf(stderr, NULL, _IONBF, 0);
 
@@ -13529,7 +14600,9 @@ int main(int argc, char **argv)
                 "Run ~60-90s then Ctrl+C.\n");
     }
     dbg("FFmpeg CPU flags: 0x%x\n", av_get_cpu_flags());
-    dbg("Queues: audio %d pkts (~1 s AC-3), video %d pkts (~1.1 s at ~340 pkt/s).\n"
+    fprintf(stderr, "Packet queues: video cap=%d hard=%d audio cap=%d\n",
+            VIDEO_Q_SOFT_CAP, VIDEO_Q_HARD_CAP, AUDIO_Q_CAP);
+    dbg("Queues: audio %d pkts (~1 s AC-3), video %d pkts (~7.5 s at ~340 pkt/s).\n"
         "Plays until title end, dvdnav stop, error, or Ctrl+C.\n",
         AUDIO_Q_CAP, VIDEO_Q_CAP);
     if (g_debug_stats)
@@ -13799,7 +14872,8 @@ int main(int argc, char **argv)
         print_cpu_mask(p.cpu_aff_mask);
         fprintf(stderr, "  (all player threads unpinned)\n");
     }
-    if (pktq_init(&p.aq, AUDIO_Q_CAP) < 0 || pktq_init(&p.vq, VIDEO_Q_CAP) < 0)
+    if (pktq_init(&p.aq, AUDIO_Q_CAP) < 0 ||
+        pktq_init(&p.vq, VIDEO_Q_HARD_CAP) < 0)
         return 6;
     if (player_buffered(&p)) {
         p.prefill_req = VIDEO_PREFILL_FRAMES;
@@ -13842,34 +14916,32 @@ int main(int argc, char **argv)
         dvdio_process_nav_cmds(&d);
         if (d.stopped)
             break;
-        if (pause_is_held(&p) && !d.hop_pending && !p.demux_reopen_req) {
+        if (pause_is_held(&p) && !d.hop_pending && !p.demux_reopen_req &&
+            !d.soft_media_boundary_pending) {
             pause_wait_control(&p);
             continue;
         }
+        crash_enter(CRASH_AV_READ_FRAME, &p);
         read_ret = av_read_frame(fmt, pkt);
+        if (d.soft_media_boundary_pending) {
+            if (read_ret >= 0)
+                av_packet_unref(pkt);
+            player_mpegps_soft_boundary(&p, &d, fmt,
+                read_ret < 0
+                    ? "av_read_frame EOF at SOFT media boundary"
+                    : "discard in-flight packet at SOFT media boundary");
+            continue;
+        }
+        if (d.hop_pending || p.demux_reopen_req) {
+            if (read_ret >= 0)
+                av_packet_unref(pkt);
+            player_mpegps_hard_boundary(&p, &d, fmt,
+                read_ret < 0
+                    ? "av_read_frame EOF at hop"
+                    : "discard in-flight packet at VTS/HARD boundary");
+            continue;
+        }
         if (read_ret < 0) {
-            if (!p.fail && !g_interrupt && !d.stopped &&
-                (d.hop_pending || p.demux_reopen_req)) {
-                d.hop_pending = 0;
-                p.demux_reopen_req = 0;
-                if (fmt->pb) {
-                    fmt->pb->eof_reached = 0;
-                    fmt->pb->error = 0;
-                    /* Discard pre-hop MPEG-PS still sitting in the AVIO
-                     * buffer so the title start is not mixed with menu packs. */
-                    fmt->pb->buf_ptr = fmt->pb->buf_end;
-                    fmt->pb->buf_ptr_max = fmt->pb->buf_end;
-                }
-                avformat_flush(fmt);
-                avcodec_parameters_free(&p.vcp);
-                avcodec_parameters_free(&p.acp);
-                p.vi = -1;
-                p.ai = -1;
-                dbg("DVD MENU: MPEG-PS demux flushed/reopened for "
-                    "domain change  gen=%u\n",
-                    player_nav_gen(&p));
-                continue;
-            }
             if (!p.fail && !g_interrupt && !d.stopped) {
                 int follow = dvdio_follow_nav_after_ps_eof(&d);
 
@@ -13878,23 +14950,8 @@ int main(int argc, char **argv)
                     break;
                 }
                 if (follow > 0 || d.hop_pending || p.demux_reopen_req) {
-                    d.hop_pending = 0;
-                    p.demux_reopen_req = 0;
-                    if (fmt->pb) {
-                        fmt->pb->eof_reached = 0;
-                        fmt->pb->error = 0;
-                        fmt->pb->buf_ptr = fmt->pb->buf_end;
-                        fmt->pb->buf_ptr_max = fmt->pb->buf_end;
-                    }
-                    avformat_flush(fmt);
-                    avcodec_parameters_free(&p.vcp);
-                    avcodec_parameters_free(&p.acp);
-                    p.vi = -1;
-                    p.ai = -1;
-                    fprintf(stderr,
-                            "NAV: MPEG-PS reopened after leftover dvdnav "
-                            "gen=%u\n",
-                            player_nav_gen(&p));
+                    player_mpegps_hard_boundary(&p, &d, fmt,
+                                               "leftover dvdnav after PS EOF");
                     continue;
                 }
             }
@@ -13904,16 +14961,19 @@ int main(int argc, char **argv)
             for (unsigned i = 0; i < fmt->nb_streams; ++i) {
                 AVCodecParameters *cp = fmt->streams[i]->codecpar;
                 if (p.vi < 0 && cp->codec_type == AVMEDIA_TYPE_VIDEO) {
+                    pthread_mutex_lock(&p.par_mu);
                     p.vi = (int)i;
                     p.vtb = fmt->streams[i]->time_base;
                     p.avg_fr = fmt->streams[i]->avg_frame_rate;
                     p.r_fr = fmt->streams[i]->r_frame_rate;
-                    if (copy_codecpar(&p.vcp, cp) < 0) {
+                    if (refresh_codecpar(&p.vcp, cp) < 0) {
+                        pthread_mutex_unlock(&p.par_mu);
                         player_abort(&p);
                         break;
                     }
                     if (p.vcp->codec_id == AV_CODEC_ID_NONE)
                         p.vcp->codec_id = AV_CODEC_ID_MPEG2VIDEO;
+                    pthread_mutex_unlock(&p.par_mu);
                     dbg("Video stream #%d %s tb %d/%d\n",
                         p.vi, avcodec_get_name(p.vcp->codec_id),
                         p.vtb.num, p.vtb.den);
@@ -13922,23 +14982,42 @@ int main(int argc, char **argv)
                             "(decoder flushed on gen, not reopened)\n");
                 }
                 if (p.ai < 0 && cp->codec_type == AVMEDIA_TYPE_AUDIO) {
+                    pthread_mutex_lock(&p.par_mu);
                     p.ai = (int)i;
                     p.atb = fmt->streams[i]->time_base;
-                    if (copy_codecpar(&p.acp, cp) < 0) {
+                    if (refresh_codecpar(&p.acp, cp) < 0) {
+                        pthread_mutex_unlock(&p.par_mu);
                         player_abort(&p);
                         break;
+                    }
+                    pthread_mutex_unlock(&p.par_mu);
+                    if (p.rawpts.mu_inited) {
+                        pthread_mutex_lock(&p.rawpts.mu);
+                        rawpts_sync_gen(&p);
+                        p.rawpts.discovered_ai = 1;
+                        pthread_mutex_unlock(&p.rawpts.mu);
                     }
                     dbg("Audio stream #%d %s %d Hz %d ch tb %d/%d\n",
                         p.ai, avcodec_get_name(p.acp->codec_id),
                         p.acp->sample_rate, p.acp->ch_layout.nb_channels,
                         p.atb.num, p.atb.den);
-                    if (p.audio_started)
-                        dbg("DVD MENU: audio stream parameters refreshed "
-                            "(decoder flushed on gen, not reopened)\n");
+                    if (p.audio_started) {
+                        p.audio_switch_req = 1;
+                        pthread_mutex_lock(&p.aq.mu);
+                        pthread_cond_broadcast(&p.aq.not_empty);
+                        pthread_mutex_unlock(&p.aq.mu);
+                        fprintf(stderr,
+                                "AUDIO: new-generation codecpar armed "
+                                "switch  gen=%u codec_gen=%u #%d %s\n",
+                                player_nav_gen(&p), player_codec_gen(&p),
+                                p.ai, avcodec_get_name(p.acp->codec_id));
+                    }
                 }
             }
         }
         player_apply_audio_follow(&p);
+        rawpts_log_format_and_select(&p, fmt);
+        player_log_startup_buffer(&p);
 
         if (p.in_menu)
             menu_spu_log_streams(&p, fmt);
@@ -13980,6 +15059,7 @@ int main(int argc, char **argv)
         if (p.uncapped_bench && p.ai >= 0 && pkt->stream_index == p.ai) {
             p.bench_audio_discarded++;
         } else if (p.audio_started && pkt->stream_index == p.ai) {
+            rawpts_log_first_packet(&p, fmt, pkt, 1);
             player_pktq_push(&p, &p.aq, pkt);
         } else if (p.video_started && pkt->stream_index == p.vi) {
             if (p.soft_log_pkt &&
@@ -13989,6 +15069,7 @@ int main(int argc, char **argv)
                     "gen=%u size=%d\n",
                     player_nav_gen(&p), pkt->size);
             }
+            rawpts_log_first_packet(&p, fmt, pkt, 0);
             player_pktq_push(&p, &p.vq, pkt);
         } else if (p.in_menu && pkt->data && pkt->size > 0) {
             menu_spu_note_decoder(&p);
