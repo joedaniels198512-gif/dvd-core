@@ -42,6 +42,7 @@
 
 #include <dvdnav/dvdnav.h>
 #include <dvdnav/dvdnav_events.h>
+#include <dvdread/dvd_reader.h>
 
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -74,6 +75,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -379,6 +381,118 @@ static void dvdnav_log_cb(void *priv, dvdnav_logger_level_t level,
 
 static const dvdnav_logger_cb g_dvdnav_logcb = { .pf_log = dvdnav_log_cb };
 
+/*
+ * Physical-drive CSS warmup. libdvdread 6.1.1 only runs initAllCSSKeys()
+ * (the "Attempting to retrieve all CSS keys" / "Get key for /VIDEO_TS/..."
+ * walk) from DVDOpenVOBUDF when css_state==1, i.e. the first DVDOpenFile()
+ * of a MENU or TITLE VOB on a CSS block device. dvdnav_open does not do
+ * that before the first encrypted dvdnav_get_next_block().
+ *
+ * Public API only: DVDOpen2 + DVDOpenFile(VOB domain) + DVDCloseFile +
+ * DVDClose. That is the same path dvdbackup -I hits. No private symbols,
+ * no DVDReadBlocks, no rip.
+ */
+static void css_warmup_logcb(void *priv, dvd_logger_level_t level,
+                             const char *fmt, va_list ap)
+{
+    const char *tag;
+
+    (void)priv;
+    switch (level) {
+    case DVD_LOGGER_LEVEL_ERROR:
+        tag = "error";
+        break;
+    case DVD_LOGGER_LEVEL_WARN:
+        tag = "warn";
+        break;
+    case DVD_LOGGER_LEVEL_INFO:
+        tag = "info";
+        break;
+    default:
+        tag = "debug";
+        break;
+    }
+    fprintf(stderr, "CSS: [%s] ", tag);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+}
+
+static int path_is_block_dvd(const char *path)
+{
+    struct stat st;
+
+    if (!path || !path[0])
+        return 0;
+    if (stat(path, &st) != 0)
+        return 0;
+    return S_ISBLK(st.st_mode);
+}
+
+static int css_warmup_physical(const char *device)
+{
+    static const dvd_logger_cb logcb = { .pf_log = css_warmup_logcb };
+    dvd_reader_t *dvd;
+    dvd_file_t *f;
+    int64_t t0, t1;
+    int vts;
+
+    if (!path_is_block_dvd(device)) {
+        fprintf(stderr, "CSS: warmup skipped (not a block device)\n");
+        return 0;
+    }
+
+    fprintf(stderr, "CSS: warmup start device=%s\n", device);
+    t0 = av_gettime_relative();
+
+    if (g_interrupt) {
+        fprintf(stderr, "CSS: warmup interrupted\n");
+        return -1;
+    }
+
+    dvd = DVDOpen2(NULL, &logcb, device);
+    if (!dvd) {
+        fprintf(stderr, "CSS: warmup failed: DVDOpen2(%s)\n", device);
+        return -1;
+    }
+
+    /*
+     * Title 0 MENU_VOBS is VIDEO_TS.VOB. Opening it on a CSS image/device
+     * runs initAllCSSKeys(): VMG VOB + VTS_nn_0.VOB + VTS_nn_1.VOB.
+     */
+    f = DVDOpenFile(dvd, 0, DVD_READ_MENU_VOBS);
+    if (f) {
+        fprintf(stderr, "CSS: warming VTS 0 / VIDEO_TS.VOB (triggers all-title keys)\n");
+        DVDCloseFile(f);
+    } else {
+        fprintf(stderr,
+                "CSS: VIDEO_TS.VOB missing, trying title-set VOBs\n");
+        f = NULL;
+        for (vts = 1; vts <= 99; vts++) {
+            if (g_interrupt)
+                break;
+            f = DVDOpenFile(dvd, vts, DVD_READ_TITLE_VOBS);
+            if (f) {
+                fprintf(stderr,
+                        "CSS: warming VTS %d title VOBs (triggers all-title keys)\n",
+                        vts);
+                DVDCloseFile(f);
+                break;
+            }
+        }
+        if (!f) {
+            fprintf(stderr, "CSS: warmup failed: no VOB domain opened\n");
+            DVDClose(dvd);
+            return -1;
+        }
+    }
+
+    DVDClose(dvd);
+    t1 = av_gettime_relative();
+    fprintf(stderr, "CSS: warmup complete elapsed_ms=%d\n",
+            (int)((t1 - t0) / 1000));
+    return 0;
+}
+
 static const char *stage_names[] = {
     "startup", "dvdnav", "mpeg demux", "packet read",
     "decoder", "frame decode", "ddr framebuffer", "mraudio/swscale"
@@ -468,6 +582,8 @@ typedef struct {
     uint8_t *sector;
     int sector_len, sector_pos, stopped;
     unsigned long nav_packets, mpeg_sectors;
+    unsigned long get_next_block_n;
+    int nav_trace_left;
     Player *player;
     int hop_pending;
     int still_len;          /* 0 = none, 0xff = infinite, else seconds */
@@ -519,6 +635,10 @@ static void player_request_still_drain(Player *p);
 static void player_wait_still_drain(Player *p, DVDIO *d);
 static void prefill_release(Player *p, const char *reason);
 static int prefill_is_released(Player *p);
+static void player_prefill_release_if_held(Player *p, const char *why);
+static int dvdio_follow_nav_after_ps_eof(DVDIO *d);
+static const char *dvdnav_event_name(int32_t event);
+static const char *dvd_domain_name(DVDDomain_t domain);
 static void navq_post(Player *p, NavCmd cmd);
 static void controller_note_press(Player *p);
 static void pause_wake(Player *p);
@@ -541,6 +661,7 @@ static void nav_evt_note(Player *p, unsigned *ctr, const char *name);
 static int movie_sub_overlay(Player *p, uint8_t *dst, int stride,
                              int64_t pvpts_us, int64_t *blend_us_out);
 static int player_bench_done(const Player *p);
+static void player_abort(Player *p);
 static int copy_yuv420_to_slot(uint8_t *slot, const AVFrame *frame, int active_h);
 
 static int dvd_read_packet(void *opaque, uint8_t *buf, int buf_size)
@@ -623,10 +744,16 @@ static int dvd_read_packet(void *opaque, uint8_t *buf, int buf_size)
         int32_t event = 0, len = 0;
         dvdnav_status_t st =
             dvdnav_get_next_block(d->nav, d->sector, &event, &len);
+        d->get_next_block_n++;
         if (st != DVDNAV_STATUS_OK) {
             fprintf(stderr, "dvdnav error: %s\n",
                     dvdnav_err_to_string(d->nav));
             d->stopped = 1;
+            /* Input/audio/video threads do not watch d->stopped. They only
+             * leave on p->fail / g_interrupt / bench_complete. Without
+             * player_abort(), main deadlocks in pthread_join(ith). */
+            if (d->player)
+                player_abort(d->player);
             if (out > 0)
                 dvdio_note_mpeg_return(d, out);
             return out ? out : AVERROR_EOF;
@@ -3081,6 +3208,7 @@ struct Player {
     pthread_cond_t prefill_cv;
     int prefill_released;
     int prefill_req;
+    int prefill_short_pgc;
     int prefill_got;
     int64_t prefill_t0_us;
     int64_t prefill_t1_us;
@@ -3093,6 +3221,8 @@ struct Player {
     int pcm_hold_used;
     int64_t first_audio_pts_us;
     int buf_mraudio_started;
+    int clock_bootstrapped;   /* presented title frames before audio master */
+    int clock_ready_logged;   /* one CLOCK ready/transition line per gen */
     int64_t present_cpu_us;
     int64_t prod_last_end_us;
     unsigned long prod_dec_n;
@@ -3515,6 +3645,15 @@ static int player_pktq_push(Player *p, PktQ *q, AVPacket *src)
             pause_wait_control(p);
             pthread_mutex_lock(&q->mu);
             continue;
+        }
+        if (player_buffered(p) && !prefill_is_released(p)) {
+            pthread_mutex_unlock(&q->mu);
+            player_prefill_release_if_held(p, q == &p->aq
+                ? "demux audio-queue backpressure during prefill"
+                : "demux video-queue backpressure during prefill");
+            pthread_mutex_lock(&q->mu);
+            if (q->count < q->cap || q->quit || g_interrupt)
+                continue;
         }
         pktq_wait_timeout(&q->not_full, &q->mu);
     }
@@ -7094,6 +7233,8 @@ static void player_nav_discontinuity(Player *p, const char *why)
     p->soft_log_yuv = 0;
     clock_reset(&p->clock);
     p->buf_mraudio_started = 0;
+    p->clock_bootstrapped = 0;
+    p->clock_ready_logged = 0;
     p->pcm_hold_len = 0;
     p->first_audio_pts_us = AV_NOPTS_VALUE;
     p->last_audio_pts_us = AV_NOPTS_VALUE;
@@ -7108,6 +7249,7 @@ static void player_nav_discontinuity(Player *p, const char *why)
         p->prefill_got = 0;
         p->prefill_t0_us = av_gettime_relative();
         p->prefill_reason = NULL;
+        p->prefill_short_pgc = 0;
         pthread_cond_broadcast(&p->prefill_cv);
         pthread_mutex_unlock(&p->prefill_mu);
         pthread_mutex_lock(&p->aq.mu);
@@ -7121,6 +7263,11 @@ static void player_nav_discontinuity(Player *p, const char *why)
             "NAV RESET: HARD\n"
             "  reason=%s\n",
             why ? why : "domain/VTS/title change");
+    if (player_buffered(p))
+        fprintf(stderr,
+                "  prefill re-armed  target=%d  buffer=%d  "
+                "short_pgc cleared\n",
+                p->prefill_req, VIDEO_BUFFER_FRAMES);
     dbg("DVD MENU: navigation jump (%s)\n"
         "  nav_gen=%u  codec_gen=%u  flush qA=%d qV=%d yuv=%d  "
         "total_flushes=%u\n",
@@ -7329,7 +7476,8 @@ static void dvdio_activate_button(DVDIO *d)
     btni = &pci.hli.btnit[button - 1];
     dvd_vm_cmd_describe(&btni->cmd, cmdbuf, sizeof(cmdbuf));
 
-    fprintf(stderr, "DVD MENU: activate button %d\n", (int)button);
+    fprintf(stderr, "DVD MENU: activate button %d  VM: %s\n",
+            (int)button, cmdbuf);
     dbg("DVD MENU: ACTIVATE BEFORE\n"
         "  domain=%s  title=%d part=%d  cell=%d pg=%d pgcn=%d pgn=%d\n"
         "  highlight=%d  activate_button=%d  btn_ns=%d  hli_ss=%d\n"
@@ -8041,29 +8189,54 @@ static void dvdio_process_nav_cmds(DVDIO *d)
 static void dvdio_handle_wait(DVDIO *d)
 {
     int64_t t0 = av_gettime_relative();
+    int yuv = 0, vq = 0, waiting = 0;
 
-    dbg("DVDNAV WAIT\n");
+    if (d->player) {
+        vq = pktq_count(&d->player->vq);
+        if (d->player->buffered_yuv)
+            yuv = yuvring_count(&d->player->yuvring);
+        waiting = player_buffered(d->player) &&
+                  !prefill_is_released(d->player);
+    }
+    fprintf(stderr,
+            "DVDNAV_WAIT  domain=%s title=%d chapter=%d vts=%d cell=%d "
+            "yuv=%d vq=%d prefill_waiting=%d get_next_block_n=%lu\n",
+            dvd_domain_name(d->domain), (int)d->title, (int)d->part,
+            d->vtsN, d->cellN, yuv, vq, waiting, d->get_next_block_n);
+
+    /*
+     * Presenter holds YUV until prefill releases. Waiting for yuv==0 here
+     * deadlocks dvdnav: WAIT never skip, post-command never runs.
+     */
+    if (d->player && player_buffered(d->player) &&
+        !prefill_is_released(d->player)) {
+        player_prefill_release_if_held(d->player, "DVDNAV_WAIT");
+        dvdnav_wait_skip(d->nav);
+        fprintf(stderr, "DVDNAV_WAIT skipped (prefill not full)\n");
+        return;
+    }
+
     while (!g_interrupt && !d->stopped) {
-        int vq = 0, yuv = 0;
+        int vq_n = 0, yuv_n = 0;
 
         dvdio_process_nav_cmds(d);
         if (d->hop_pending)
             break;
         if (d->player) {
-            vq = pktq_count(&d->player->vq);
+            vq_n = pktq_count(&d->player->vq);
             if (d->player->buffered_yuv)
-                yuv = yuvring_count(&d->player->yuvring);
+                yuv_n = yuvring_count(&d->player->yuvring);
         } else {
             break;
         }
-        if (vq == 0 && yuv == 0)
+        if (vq_n == 0 && yuv_n == 0)
             break;
         if (av_gettime_relative() - t0 > NAV_WAIT_FIFO_US)
             break;
         av_usleep(5000);
     }
     dvdnav_wait_skip(d->nav);
-    dbg("DVDNAV WAIT completed\n");
+    fprintf(stderr, "DVDNAV_WAIT completed\n");
 }
 
 static void dvdio_handle_still(DVDIO *d, int length)
@@ -8071,56 +8244,83 @@ static void dvdio_handle_still(DVDIO *d, int length)
     int64_t t0 = av_gettime_relative();
     int64_t dur_us;
     int in_menu = d->player ? d->player->in_menu : 0;
+    int btn_ns = 0;
+    int yuv = 0, vq = 0, waiting = 0;
+    unsigned frames = 0;
 
     d->still_len = length;
     d->still_t0_us = t0;
+    if (d->pci_valid)
+        btn_ns = d->pci.hli.hl_gi.btn_ns & 0x3f;
+    if (d->player) {
+        vq = pktq_count(&d->player->vq);
+        if (d->player->buffered_yuv)
+            yuv = yuvring_count(&d->player->yuvring);
+        waiting = player_buffered(d->player) &&
+                  !prefill_is_released(d->player);
+        frames = __atomic_load_n(&d->player->frames_this_nav_gen,
+                                 __ATOMIC_SEQ_CST);
+    }
     /*
      * MPEG bytes for this VOBU were already returned to FFmpeg (still_armed
      * with out>0 returns first). Drain parser/decoder so a lone still
      * I-frame is emitted before this thread blocks in the still wait.
+     * Title stills (warnings/bridges) need the same drain as menus:
+     * otherwise the last I-frame stays in the codec and prefill never
+     * sees a YUV frame.
      */
-    if (d->player && in_menu && player_buffered(d->player) &&
+    if (d->player && player_buffered(d->player) &&
         !player_menu_has_frame(d->player)) {
         player_request_still_drain(d->player);
         player_wait_still_drain(d->player, d);
+        if (d->player->buffered_yuv)
+            yuv = yuvring_count(&d->player->yuvring);
+        frames = __atomic_load_n(&d->player->frames_this_nav_gen,
+                                 __ATOMIC_SEQ_CST);
     }
     if (!d->still_logged) {
         d->still_logged = 1;
-        dbg("DVD MENU: still length=%s (%d)  gen=%u  title=%d part=%d "
-            "domain=%s  buttons=%d  frames_this_gen=%u\n",
-            length == 0xff ? "infinite" : "finite",
-            length,
-            d->player ? player_nav_gen(d->player) : 0,
-            (int)d->title, (int)d->part,
-            dvd_domain_name(d->domain),
-            d->pci_valid ? (d->pci.hli.hl_gi.btn_ns & 0x3f) : 0,
-            d->player
-                ? __atomic_load_n(&d->player->frames_this_nav_gen,
-                                  __ATOMIC_SEQ_CST)
-                : 0);
+        fprintf(stderr,
+                "DVDNAV_STILL_FRAME length=%s (%d)  domain=%s "
+                "title=%d chapter=%d vts=%d cell=%d in_menu=%d "
+                "buttons=%d frames_this_gen=%u yuv=%d vq=%d "
+                "prefill_waiting=%d get_next_block_n=%lu\n",
+                length == 0xff ? "infinite" : "finite",
+                length,
+                dvd_domain_name(d->domain),
+                (int)d->title, (int)d->part, d->vtsN, d->cellN, in_menu,
+                btn_ns, frames, yuv, vq, waiting, d->get_next_block_n);
         if (d->soft_hop_active)
-            dbg("DVD MENU: STILL_FRAME after SOFT HOP\n"
-                "  bytes_preserved=%d  first_BLOCK_OK=%s  "
-                "first_mpeg_return=%s  still=%s\n",
-                d->post_soft_bytes,
-                d->post_soft_block_ok ? "yes" : "NO",
-                d->post_soft_mpeg_ret ? "yes" : "NO",
-                length == 0xff ? "infinite" : "finite");
+            fprintf(stderr,
+                    "DVDNAV_STILL_FRAME after SOFT HOP  "
+                    "bytes_preserved=%d  first_BLOCK_OK=%s  "
+                    "first_mpeg_return=%s\n",
+                    d->post_soft_bytes,
+                    d->post_soft_block_ok ? "yes" : "NO",
+                    d->post_soft_mpeg_ret ? "yes" : "NO");
     }
     if (d->player) {
         d->player->still_active = 1;
-        if (player_buffered(d->player) && !prefill_is_released(d->player)) {
-            int n = d->player->buffered_yuv
-                    ? yuvring_count(&d->player->yuvring) : 0;
-            /* Never release an empty YUV queue: the still VOBU must be
-             * decoded first. Producer also releases on the first menu frame. */
-            if (n >= 1)
-                prefill_release(d->player, "DVDNAV_STILL_FRAME");
-        }
+        player_prefill_release_if_held(d->player, "DVDNAV_STILL_FRAME");
         dvdio_apply_highlight(d, 0);
         pthread_mutex_lock(&d->player->clock.mu);
         pthread_cond_broadcast(&d->player->clock.ready_cv);
         pthread_mutex_unlock(&d->player->clock.mu);
+    }
+
+    /*
+     * Infinite still with no HLI buttons: the cell's PGC post-command is
+     * what jumps to the feature. Waiting forever strands dvdnav.
+     */
+    if (length == 0xff && btn_ns <= 0) {
+        fprintf(stderr,
+                "DVDNAV_STILL_FRAME infinite, 0 buttons — still_skip "
+                "(allow PGC post-command)\n");
+        dvdnav_still_skip(d->nav);
+        d->still_len = 0;
+        if (d->player)
+            d->player->still_active = 0;
+        return;
     }
 
     if (length == 0xff)
@@ -8132,15 +8332,12 @@ static void dvdio_handle_still(DVDIO *d, int length)
         dvdio_process_nav_cmds(d);
         if (d->hop_pending || d->still_len == 0)
             break;
-        if (d->player && player_buffered(d->player) &&
-            !prefill_is_released(d->player)) {
-            int n = d->player->buffered_yuv
-                    ? yuvring_count(&d->player->yuvring) : 0;
-            if (n >= 1)
-                prefill_release(d->player, "DVDNAV_STILL_FRAME");
-        }
+        if (d->player)
+            player_prefill_release_if_held(d->player, "DVDNAV_STILL_FRAME");
         if (length != 0xff &&
             av_gettime_relative() - t0 >= dur_us) {
+            fprintf(stderr, "DVDNAV_STILL_FRAME finite %ds elapsed — still_skip\n",
+                    length);
             dvdnav_still_skip(d->nav);
             d->still_len = 0;
             break;
@@ -8230,6 +8427,38 @@ static int dvdio_pump(DVDIO *d, int32_t event, int32_t len)
     }
     if (d->activate_trace)
         dvdio_activate_trace_event(d, event);
+
+    if (d->nav_trace_left > 0 &&
+        event != DVDNAV_BLOCK_OK && event != DVDNAV_NOP) {
+        int yuv = 0, vq = 0, waiting = 0;
+
+        d->nav_trace_left--;
+        if (d->player) {
+            vq = pktq_count(&d->player->vq);
+            if (d->player->buffered_yuv)
+                yuv = yuvring_count(&d->player->yuvring);
+            waiting = player_buffered(d->player) &&
+                      !prefill_is_released(d->player);
+        }
+        fprintf(stderr,
+                "dvdnav_get_next_block n=%lu event=%s len=%d "
+                "domain=%s title=%d chapter=%d vts=%d cell=%d "
+                "yuv=%d vq=%d prefill_req=%d prefill_waiting=%d\n",
+                d->get_next_block_n, dvdnav_event_name(event), (int)len,
+                dvd_domain_name(d->domain), (int)d->title, (int)d->part,
+                d->vtsN, d->cellN, yuv, vq,
+                d->player ? d->player->prefill_req : 0, waiting);
+    } else if (d->nav_trace_left > 0 && event == DVDNAV_BLOCK_OK) {
+        d->nav_trace_left--;
+        if (d->nav_trace_left >= 20 || (d->get_next_block_n % 32) == 1)
+            fprintf(stderr,
+                    "dvdnav_get_next_block n=%lu event=BLOCK_OK len=%d "
+                    "title=%d chapter=%d prefill_waiting=%d\n",
+                    d->get_next_block_n, (int)len,
+                    (int)d->title, (int)d->part,
+                    d->player && player_buffered(d->player) &&
+                    !prefill_is_released(d->player));
+    }
 
     switch (event) {
     case DVDNAV_NAV_PACKET:
@@ -8337,14 +8566,29 @@ static int dvdio_pump(DVDIO *d, int32_t event, int32_t len)
                 if (was && !in_menu)
                     dvdio_leave_menu(d);
             }
-            dbg("DVD MENU: VTS_CHANGE  %s -> %s  vts %d -> %d  "
-                "title=%d part=%d  in_menu=%d\n",
-                ev ? dvd_domain_name(ev->old_domain) : "?",
-                dvd_domain_name(d->domain),
-                ev ? ev->old_vtsN : -1,
-                ev ? ev->new_vtsN : -1,
-                (int)d->title, (int)d->part, in_menu);
             dvdio_menu_req_event(d, "VTS_CHANGE", in_menu);
+            {
+                uint64_t *times = NULL;
+                uint64_t duration = 0;
+                uint32_t nch = 0;
+
+                if (d->title > 0)
+                    nch = dvdnav_describe_title_chapters(d->nav, d->title,
+                                                         &times, &duration);
+                fprintf(stderr,
+                        "DVDNAV_VTS_CHANGE %s -> %s  vts %d -> %d  "
+                        "title=%d chapter=%d in_menu=%d  "
+                        "title_duration_ticks=%" PRIu64 " (%.3fs) "
+                        "chapters=%u\n",
+                        ev ? dvd_domain_name(ev->old_domain) : "?",
+                        dvd_domain_name(d->domain),
+                        ev ? ev->old_vtsN : -1,
+                        ev ? ev->new_vtsN : -1,
+                        (int)d->title, (int)d->part, in_menu,
+                        duration, duration / 90000.0, (unsigned)nch);
+                if (times)
+                    free(times);
+            }
         }
         if (ev)
             d->vtsN = ev->new_vtsN;
@@ -8353,6 +8597,7 @@ static int dvdio_pump(DVDIO *d, int32_t event, int32_t len)
         if (d->player && !d->hop_pending)
             player_nav_discontinuity(d->player, "VTS_CHANGE (stream/VTS)");
         d->hop_pending = 1;
+        d->nav_trace_left = 24;
         d->soft_hop_active = 0;
         d->still_len = 0;
         d->still_logged = 0;
@@ -8426,6 +8671,7 @@ static int dvdio_pump(DVDIO *d, int32_t event, int32_t len)
                     why = "HOP domain change";
                 player_nav_discontinuity(d->player, why);
                 d->hop_pending = 1;
+                d->nav_trace_left = 24;
                 d->soft_hop_active = 0;
             }
         } else if (d->hop_pending) {
@@ -8470,13 +8716,31 @@ static int dvdio_pump(DVDIO *d, int32_t event, int32_t len)
         d->last_part = d->part;
         if (old_pgcn != d->pgcn)
             dvdio_audio_reset_logical(d, "PGC_CHANGE");
-        dbg("DVD MENU: CELL_CHANGE  cell=%d pg=%d  title=%d part=%d  "
-            "domain=%s  in_menu=%d  still=%d\n",
-            ev ? ev->cellN : -1, ev ? ev->pgN : -1,
-            (int)d->title, (int)d->part,
-            dvd_domain_name(d->domain),
-            d->player ? d->player->in_menu : 0,
-            d->still_len);
+        {
+            int64_t pgc_ticks = ev ? ev->pgc_length : 0;
+            int64_t cell_ticks = ev ? ev->cell_length : 0;
+            int est_frames = 0;
+            int still_flag = d->nav ? (int)dvdnav_get_next_still_flag(d->nav)
+                                    : -1;
+
+            if (pgc_ticks > 0)
+                est_frames = (int)((pgc_ticks + 3599) / 3600);
+            if (d->player && player_buffered(d->player) && !now &&
+                est_frames > 0 && est_frames < d->player->prefill_req)
+                d->player->prefill_short_pgc = 1;
+            fprintf(stderr,
+                    "DVDNAV_CELL_CHANGE cell=%d pg=%d title=%d chapter=%d "
+                    "domain=%s vts=%d in_menu=%d still_len=%d still_flag=%d "
+                    "pgc_ticks=%" PRId64 " cell_ticks=%" PRId64
+                    " est_frames=%d short_pgc=%d\n",
+                    ev ? ev->cellN : -1, ev ? ev->pgN : -1,
+                    (int)d->title, (int)d->part,
+                    dvd_domain_name(d->domain), d->vtsN,
+                    d->player ? d->player->in_menu : 0,
+                    d->still_len, still_flag,
+                    pgc_ticks, cell_ticks, est_frames,
+                    d->player ? d->player->prefill_short_pgc : 0);
+        }
         return 0;
     }
     case DVDNAV_HIGHLIGHT:
@@ -8578,6 +8842,64 @@ static int dvdio_pump(DVDIO *d, int32_t event, int32_t len)
     default:
         return 0;
     }
+}
+
+/*
+ * MPEG-PS can EOF (program_end in a tiny VOB) while dvdnav still owes
+ * STILL / WAIT / HOP / post-command. Keep pumping get_next_block.
+ * Returns 1 if the demux loop should flush/reopen MPEG-PS.
+ */
+static int dvdio_follow_nav_after_ps_eof(DVDIO *d)
+{
+    int i;
+
+    if (!d || !d->nav)
+        return 0;
+    fprintf(stderr,
+            "NAV: MPEG-PS EOF with hop_pending=%d still_armed=%d "
+            "wait_armed=%d get_next_block_n=%lu — pumping leftover dvdnav\n",
+            d->hop_pending, d->still_armed, d->wait_armed,
+            d->get_next_block_n);
+    for (i = 0; i < 64 && !g_interrupt && !d->stopped; i++) {
+        int32_t event = 0, len = 0;
+        dvdnav_status_t st;
+
+        if (d->hop_pending)
+            return 1;
+        if (d->wait_armed) {
+            d->wait_armed = 0;
+            dvdio_handle_wait(d);
+            continue;
+        }
+        if (d->still_armed) {
+            int slen = d->still_len ? d->still_len : 0xff;
+
+            d->still_armed = 0;
+            dvdio_handle_still(d, slen);
+            continue;
+        }
+        st = dvdnav_get_next_block(d->nav, d->sector, &event, &len);
+        d->get_next_block_n++;
+        if (st != DVDNAV_STATUS_OK) {
+            fprintf(stderr, "dvdnav error after PS EOF: %s\n",
+                    dvdnav_err_to_string(d->nav));
+            return -1;
+        }
+        fprintf(stderr, "NAV after MPEG-PS EOF: %s len=%d\n",
+                dvdnav_event_name(event), (int)len);
+        if (dvdio_pump(d, event, len) < 0)
+            return -1;
+        if (d->hop_pending)
+            return 1;
+        if (event == DVDNAV_BLOCK_OK || event == DVDNAV_NAV_PACKET) {
+            d->hop_pending = 1;
+            fprintf(stderr,
+                    "NAV: more MPEG after PS EOF — reopening MPEG-PS "
+                    "(no HARD reset)\n");
+            return 1;
+        }
+    }
+    return d->hop_pending ? 1 : 0;
 }
 
 static int read_sched_cpu(void)
@@ -8890,13 +9212,67 @@ static int emit_pcm(Player *p, MrAudio *mr, uint8_t *chunk, int *used,
     return 0;
 }
 
+static void clock_log_master_ready(Player *p, int fill, int64_t first_pts_us)
+{
+    if (!p || p->clock_ready_logged)
+        return;
+    p->clock_ready_logged = 1;
+    if (p->clock_bootstrapped)
+        fprintf(stderr,
+                "CLOCK: transition to audio master  gen=%u fill=%d "
+                "first_pts=%.3f s\n",
+                player_nav_gen(p), fill,
+                first_pts_us == AV_NOPTS_VALUE ? 0.0 : first_pts_us / 1e6);
+    else
+        fprintf(stderr,
+                "CLOCK: audio master ready  gen=%u fill=%d first_pts=%.3f s\n",
+                player_nav_gen(p), fill,
+                first_pts_us == AV_NOPTS_VALUE ? 0.0 : first_pts_us / 1e6);
+}
+
+/*
+ * Title present must not wait forever for clock.ready. present_wait_pts and
+ * frame_is_stale already no-op when clock_us is NOPTS, which is the existing
+ * video-paced fallback. Returning here lets YUV drain so demux can reach
+ * audio packets; clock_publish then binds the audio master.
+ */
 static void clock_wait_ready(Player *p)
 {
+    int boot = 0;
+    int yuv = 0;
+
     pthread_mutex_lock(&p->clock.mu);
     while (!p->clock.ready && !p->fail && !g_interrupt &&
-           !p->in_menu && !p->still_active)
+           !p->in_menu && !p->still_active) {
+        pthread_mutex_unlock(&p->clock.mu);
+        yuv = player_buffered(p) ? buffered_queue_count(p) : 0;
+        if (player_buffered(p) && prefill_is_released(p) && yuv >= 1) {
+            pthread_mutex_lock(&p->clock.mu);
+            if (p->clock.ready || p->fail || g_interrupt ||
+                p->in_menu || p->still_active) {
+                break;
+            }
+            pthread_mutex_unlock(&p->clock.mu);
+            boot = 1;
+            goto done;
+        }
+        pthread_mutex_lock(&p->clock.mu);
+        if (p->clock.ready || p->fail || g_interrupt ||
+            p->in_menu || p->still_active)
+            break;
         pktq_wait_timeout(&p->clock.ready_cv, &p->clock.mu);
+    }
+    if (p->clock.ready && !p->fail && !g_interrupt)
+        clock_log_master_ready(p, p->clock.fill, p->clock.first_pts_us);
     pthread_mutex_unlock(&p->clock.mu);
+done:
+    if (!boot || p->fail || g_interrupt)
+        return;
+    p->clock_bootstrapped = 1;
+    fprintf(stderr,
+            "CLOCK: provisional video bootstrap  gen=%u yuv=%d aq=%d vq=%d "
+            "(audio master not ready)\n",
+            player_nav_gen(p), yuv, pktq_count(&p->aq), pktq_count(&p->vq));
 }
 
 static void prefill_release(Player *p, const char *reason)
@@ -8912,11 +9288,12 @@ static void prefill_release(Player *p, const char *reason)
         p->prefill_t1_us = av_gettime_relative();
         p->prefill_reason = reason ? reason : "released";
         pthread_cond_broadcast(&p->prefill_cv);
-        dbg("video prefill gate released: %d / %d frames in %.3f s (%s)\n",
-            p->prefill_got, p->prefill_req,
-            p->prefill_t0_us
-                ? (p->prefill_t1_us - p->prefill_t0_us) / 1e6 : 0.0,
-            p->prefill_reason);
+        fprintf(stderr,
+                "video prefill gate released: %d / %d frames in %.3f s (%s)\n",
+                p->prefill_got, p->prefill_req,
+                p->prefill_t0_us
+                    ? (p->prefill_t1_us - p->prefill_t0_us) / 1e6 : 0.0,
+                p->prefill_reason);
     }
     pthread_mutex_unlock(&p->prefill_mu);
 
@@ -8934,6 +9311,14 @@ static int prefill_is_released(Player *p)
     r = p->prefill_released;
     pthread_mutex_unlock(&p->prefill_mu);
     return r;
+}
+
+static void player_prefill_release_if_held(Player *p, const char *why)
+{
+    if (!p || !player_buffered(p) || prefill_is_released(p))
+        return;
+    if (buffered_queue_count(p) >= 1)
+        prefill_release(p, why);
 }
 
 static void prefill_wait(Player *p)
@@ -8990,6 +9375,10 @@ static int buffered_start_mraudio(Player *p, MrAudio *mr, uint8_t *chunk,
     int64_t written0;
 
     if (p->buf_mraudio_started)
+        return 0;
+    /* Usable audio master requires a PTS origin. Priming with NOPTS
+     * used to set started=1 and leave clock.ready=0 forever. */
+    if (p->first_audio_pts_us == AV_NOPTS_VALUE)
         return 0;
 
     hold_bytes = p->pcm_hold_len;
@@ -9078,7 +9467,8 @@ static int pktq_pop_or_prefill_gate(PktQ *q, AVPacket *dst, Player *p)
         }
         pthread_mutex_unlock(&q->mu);
         if (player_buffered(p) && !p->buf_mraudio_started &&
-            prefill_is_released(p) && !p->in_menu)
+            prefill_is_released(p) && !p->in_menu &&
+            p->first_audio_pts_us != AV_NOPTS_VALUE)
             return 2;
         pthread_mutex_lock(&q->mu);
         if (q->count > 0 || q->eof || q->quit || g_interrupt)
@@ -9117,7 +9507,7 @@ static int buffered_try_start_mraudio(Player *p, MrAudio *mr, uint8_t *chunk,
 
     if (!player_buffered(p) || p->buf_mraudio_started)
         return 0;
-    if (p->in_menu && first_pts_us == AV_NOPTS_VALUE)
+    if (first_pts_us == AV_NOPTS_VALUE)
         return 0;
     if (!prefill_is_released(p))
         return 0;
@@ -9130,8 +9520,7 @@ static int buffered_try_start_mraudio(Player *p, MrAudio *mr, uint8_t *chunk,
                   p->last_audio_pts_us, mr->fill, mr->hw_pace, ready,
                   clock_epoch);
     if (ready)
-        dbg("MrAudio clock ready  (fill=%d bytes, first_pts=%.3f s)\n",
-            mr->fill, first_pts_us / 1e6);
+        clock_log_master_ready(p, mr->fill, first_pts_us);
     return 0;
 }
 
@@ -9190,7 +9579,6 @@ static void *audio_thread(void *opaque)
             PCM_HOLD_START_BYTES * 1000.0 / (double)BYTES_PER_SEC);
     }
 
-    int clock_ready_logged = 0;
     int hold_full_logged = 0;
     clock_epoch = clock_epoch_now(&p->clock);
 
@@ -9214,7 +9602,6 @@ static void *audio_thread(void *opaque)
             mr.bytes_origin = mr.bytes_written - mr.prime_bytes;
             clock_epoch = clock_epoch_now(&p->clock);
             hold_full_logged = 0;
-            clock_ready_logged = 0;
             dbg("DVD MENU: audio decoder/clock reset  gen=%u  "
                 "origin_bytes=%" PRId64 "\n",
                 player_nav_gen(p), mr.bytes_origin);
@@ -9391,12 +9778,8 @@ static void *audio_thread(void *opaque)
                 clock_publish(&p->clock, first_pts_us, elapsed,
                               p->last_audio_pts_us, mr.fill, mr.hw_pace, ready,
                               clock_epoch);
-                if (player_buffered(p) && ready && !clock_ready_logged) {
-                    clock_ready_logged = 1;
-                    dbg("MrAudio clock ready  (fill=%d bytes, "
-                        "first_pts=%.3f s)\n",
-                        mr.fill, first_pts_us / 1e6);
-                }
+                if (player_buffered(p) && ready)
+                    clock_log_master_ready(p, mr.fill, first_pts_us);
             }
             av_frame_unref(frame);
         }
@@ -11290,9 +11673,16 @@ static int producer_enqueue_frame(Player *p, AVFrame *frame, AVCodecContext *vde
                            p->buf_playing);
     p->prod_last_end_us = av_gettime_relative();
 
-    if (!prefill_is_released(p) &&
-        vidring_count(&p->vring) >= p->prefill_req)
-        prefill_release(p, "prefill target reached");
+    if (!prefill_is_released(p)) {
+        int n = vidring_count(&p->vring);
+        if (n >= p->prefill_req)
+            prefill_release(p, "prefill target reached");
+        else if ((p->in_menu || p->still_active || p->prefill_short_pgc) &&
+                 n >= 1)
+            prefill_release(p, p->in_menu ? "menu/still picture"
+                           : (p->still_active ? "still picture"
+                              : "short title/PGC before prefill target"));
+    }
     return 0;
 }
 
@@ -11387,8 +11777,11 @@ static int producer_enqueue_yuv(Player *p, AVFrame *frame, AVCodecContext *vdec,
         int n = yuvring_count(&p->yuvring);
         if (n >= p->prefill_req)
             prefill_release(p, "prefill target reached");
-        else if (p->in_menu && n >= 1)
-            prefill_release(p, "menu/still picture");
+        else if ((p->in_menu || p->still_active || p->prefill_short_pgc) &&
+                 n >= 1)
+            prefill_release(p, p->in_menu ? "menu/still picture"
+                           : (p->still_active ? "still picture"
+                              : "short title/PGC before prefill target"));
     }
     return 0;
 }
@@ -12150,7 +12543,19 @@ static void *present_thread(void *opaque)
                 av_frame_unref(menu_hold);
                 menu_hold_gen = 0;
                 p->menu_still_drop = 0;
+                fprintf(stderr,
+                        "PRESENT: waiting prefill after HARD reset  "
+                        "gen=%u req=%d yuv=%d short_pgc=%d still=%d "
+                        "in_menu=%d\n",
+                        g, p->prefill_req,
+                        p->buffered_yuv ? yuvring_count(&p->yuvring) : -1,
+                        p->prefill_short_pgc, p->still_active, p->in_menu);
                 prefill_wait(p);
+                fprintf(stderr,
+                        "PRESENT: prefill released  gen=%u yuv=%d reason=%s\n",
+                        g,
+                        p->buffered_yuv ? yuvring_count(&p->yuvring) : -1,
+                        p->prefill_reason ? p->prefill_reason : "?");
                 if (p->fail || g_interrupt)
                     break;
                 clock_wait_ready(p);
@@ -13165,9 +13570,22 @@ int main(int argc, char **argv)
 
     stage = 1;
     fprintf(stderr, "DVD: %s\n", cli.device);
+    if (css_warmup_physical(cli.device) < 0) {
+        fprintf(stderr, "CSS: warmup failed — aborting before dvdnav\n");
+        free(d.sector);
+        unmap_double_fb(&fb);
+        return 10;
+    }
+    if (g_interrupt) {
+        free(d.sector);
+        unmap_double_fb(&fb);
+        return 130;
+    }
     if (dvdnav_open2(&d.nav, NULL, &g_dvdnav_logcb, cli.device) !=
         DVDNAV_STATUS_OK) {
         fprintf(stderr, "dvdnav_open failed\n");
+        free(d.sector);
+        unmap_double_fb(&fb);
         return 1;
     }
     fprintf(stderr, "libdvdnav %s\n", dvdnav_version());
@@ -13451,6 +13869,34 @@ int main(int argc, char **argv)
                     player_nav_gen(&p));
                 continue;
             }
+            if (!p.fail && !g_interrupt && !d.stopped) {
+                int follow = dvdio_follow_nav_after_ps_eof(&d);
+
+                if (follow < 0) {
+                    player_abort(&p);
+                    break;
+                }
+                if (follow > 0 || d.hop_pending || p.demux_reopen_req) {
+                    d.hop_pending = 0;
+                    p.demux_reopen_req = 0;
+                    if (fmt->pb) {
+                        fmt->pb->eof_reached = 0;
+                        fmt->pb->error = 0;
+                        fmt->pb->buf_ptr = fmt->pb->buf_end;
+                        fmt->pb->buf_ptr_max = fmt->pb->buf_end;
+                    }
+                    avformat_flush(fmt);
+                    avcodec_parameters_free(&p.vcp);
+                    avcodec_parameters_free(&p.acp);
+                    p.vi = -1;
+                    p.ai = -1;
+                    fprintf(stderr,
+                            "NAV: MPEG-PS reopened after leftover dvdnav "
+                            "gen=%u\n",
+                            player_nav_gen(&p));
+                    continue;
+                }
+            }
             break;
         }
         if (p.vi < 0 || p.ai < 0) {
@@ -13658,6 +14104,8 @@ int main(int argc, char **argv)
         }
     }
 
+    int keep_fail = p.fail;
+
     if (g_interrupt) {
         stop_reason = "Ctrl+C / SIGTERM";
         player_abort(&p);
@@ -13675,6 +14123,16 @@ int main(int argc, char **argv)
         stop_reason = "demux loop ended";
     }
 
+    /*
+     * Worker threads ignore d.stopped. A clean DVDNAV_STOP (or any other
+     * demux-loop end that did not already player_abort) would otherwise
+     * hang forever in pthread_join(ith). Abort to the existing p->fail
+     * stop, then restore keep_fail so title-end return codes are unchanged.
+     */
+    if (p.input_started || p.audio_started || p.video_started ||
+        p.present_started)
+        player_abort(&p);
+
     p.demux_cpu_us = av_gettime_relative() - demux_t0;
     pktq_eof(&p.aq);
     pktq_eof(&p.vq);
@@ -13690,6 +14148,7 @@ int main(int argc, char **argv)
         pthread_join(pth, NULL);
     if (p.input_started)
         pthread_join(ith, NULL);
+    p.fail = keep_fail;
 
     int64_t wall_us = av_gettime_relative() - program_start;
     double wall = wall_us / 1e6;
