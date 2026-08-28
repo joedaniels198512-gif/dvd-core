@@ -1,6 +1,11 @@
 Experimental known-good daemon-free DVD-Player integration
 =========================================================
 
+SUPERSEDED for the public beta candidate by RELEASE_CANDIDATE_0.1.md
+on exp/custom-main-dvd-player. The hashes below are the earlier
+daemon-free snapshot (player beac8ac9…, Main c9c68a29…) and must not
+be used as the public beta binaries.
+
 Hardware-confirmed 2026-08-28 on SS1 (CORENAME=DVD-Player, YUV picture,
 set_seq live, daemon absent). This is NOT the public/RC1 release and
 must not overwrite those artifacts.
