@@ -22,6 +22,7 @@
 main-dvd/.src/
 main-dvd/bin/
 main-dvd/build.log
+main-dvd/toolchains/
 
 # --- Player: build artifacts (regenerable via player/build_mac.sh) ---
 # The FFmpeg source tree + statically built VFPv3-safe libs live here.

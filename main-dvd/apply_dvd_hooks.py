@@ -85,6 +85,18 @@ def patch_user_io(text: str) -> str:
 
 def patch_makefile(text: str) -> str:
     if "neon-vfpv3" in text and "PRJ = MiSTer_DVD" in text:
+        text = text.replace(
+            "BASE    = arm-unknown-linux-gnueabihf",
+            "BASE    = arm-none-linux-gnueabihf",
+        )
+        text = text.replace(
+            "BASE = arm-unknown-linux-gnueabihf",
+            "BASE = arm-none-linux-gnueabihf",
+        )
+        if "arm-none-linux-gnueabihf" not in text:
+            raise SystemExit(
+                "Makefile already patched but BASE is not arm-none-linux-gnueabihf"
+            )
         return text
     text = text.replace(
         'MAKEFLAGS += "-j $(shell nproc)"',
@@ -92,11 +104,11 @@ def patch_makefile(text: str) -> str:
         'MAKEFLAGS += "-j $(NPROC)"',
         1,
     )
-    text = text.replace(
-        "BASE    = arm-none-linux-gnueabihf",
-        "BASE    = arm-unknown-linux-gnueabihf",
-        1,
-    )
+    # Keep BASE = arm-none-linux-gnueabihf (official Main_MiSTer / GCC 10.2.1).
+    # Never rewrite it to arm-unknown-linux-gnueabihf (Homebrew GCC 15 →
+    # GLIBCXX_3.4.32, which MiSTer libstdc++ 6.0.28 cannot load).
+    if "BASE    = arm-none-linux-gnueabihf" not in text and "BASE = arm-none-linux-gnueabihf" not in text:
+        raise SystemExit("Makefile BASE is not arm-none-linux-gnueabihf")
     text = text.replace("PRJ = MiSTer\n", "PRJ = MiSTer_DVD\n", 1)
     if "neon-vfpv3" not in text:
         text += (

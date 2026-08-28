@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -48,6 +49,7 @@
 #define RESPAWN_WINDOW_SEC  5
 #define RESPAWN_MAX         3
 #define POLL_INTERVAL_MS    500
+#define LAUNCH_SETTLE_MS    500
 
 static int     g_session;
 static int     g_owned;          /* 1 = waitpid-eligible child of this process */
@@ -55,6 +57,17 @@ static pid_t   g_launcher_pid = -1;
 static int     g_halt_respawn;
 static int     g_fail_count;
 static time_t  g_last_start_ts;
+static int     g_pending_launch;
+static int64_t g_launch_not_before; /* CLOCK_MONOTONIC ms deadline */
+
+static int64_t mono_ms(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+		return 0;
+	return (int64_t)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000L;
+}
 
 static int exe_is_mister_dvd(void)
 {
@@ -264,7 +277,10 @@ static int spawn_launcher(int rotate)
 				close(fd);
 		}
 
-		execl(DVD_LAUNCHER_PATH, "dvd_launcher", (char *)NULL);
+		/* argv[0] must be the full path: launcher derives the player
+		 * directory from a slash in argv[0]. Basename-only makes it
+		 * look in cwd (typically /) for dvd_av_threaded_test. */
+		execl(DVD_LAUNCHER_PATH, DVD_LAUNCHER_PATH, (char *)NULL);
 		_exit(127);
 	}
 
@@ -343,6 +359,8 @@ void dvd_main_stop_all(void)
 	g_halt_respawn = 0;
 	g_fail_count = 0;
 	g_last_start_ts = 0;
+	g_pending_launch = 0;
+	g_launch_not_before = 0;
 
 	pid = g_launcher_pid;
 	if (!pid_is_launcher(pid))
@@ -443,7 +461,30 @@ void dvd_main_on_core_ready(void)
 		g_last_start_ts = 0;
 		printf("DVD_MAIN: DVD-Player session begin\n");
 	}
-	start_or_adopt();
+
+	/*
+	 * Do NOT spawn here. This hook runs from user_io_init() before
+	 * parse_config(), video_init() and the core-reset/config pulses.
+	 * Launcher DDR activity inside that window stalls the core's DDRAM
+	 * mailbox engine (hardware-proven: DVD2 set_seq froze ~110 ms after
+	 * FPGA config; the same launcher started late under stock Main runs
+	 * indefinitely). Adopt an already-live launcher, otherwise arm a
+	 * deferred launch that dvd_main_poll() performs once Main is in its
+	 * normal polling loop and the settle delay has elapsed — matching
+	 * the old daemon's proven-working timing.
+	 */
+	{
+		pid_t live = find_live_launcher();
+		if (live > 0)
+		{
+			adopt_launcher(live, g_owned && (live == g_launcher_pid));
+			g_pending_launch = 0;
+			return;
+		}
+	}
+	g_pending_launch = 1;
+	g_launch_not_before = mono_ms() + LAUNCH_SETTLE_MS;
+	printf("DVD_MAIN: launcher start armed (settle %d ms)\n", LAUNCH_SETTLE_MS);
 }
 
 void dvd_main_poll(void)
@@ -464,6 +505,34 @@ void dvd_main_poll(void)
 	}
 
 	reap_owned();
+
+	/*
+	 * Deferred first launch (armed by dvd_main_on_core_ready). Runs only
+	 * once Main's init is done and normal polling is active, after the
+	 * settle deadline. Leaving DVD-Player or app_restart/reboot teardown
+	 * cancels it via dvd_main_stop_all() before we get here. Respawn
+	 * accounting starts only after this first real spawn (spawn_launcher
+	 * sets g_last_start_ts; log rotation also happens there).
+	 *
+	 * KNOWN BUG (fix later, hardware-observed 2026-08): spawn burst.
+	 * start_or_adopt()'s find_live_launcher() can miss a child that was
+	 * just forked but has not exec'd/registered yet, so several polls in
+	 * a row may each spawn a launcher until the first one becomes
+	 * visible in /proc. Multiple dvd_launcher instances then race for
+	 * the singleton pidfile. Not the cause of the DDR/mailbox freeze
+	 * (that was an FPGA reset-safety bug: the freeze happened before
+	 * any launcher spawned); fix separately, e.g. by treating a live
+	 * not-yet-reaped g_launcher_pid as already-started.
+	 */
+	if (g_pending_launch)
+	{
+		if (mono_ms() < g_launch_not_before)
+			return;
+		g_pending_launch = 0;
+		printf("DVD_MAIN: settle delay elapsed, starting launcher\n");
+		start_or_adopt();
+		return;
+	}
 
 	/*
 	 * user_io_poll runs every scheduler co_poll slice (~frame rate).

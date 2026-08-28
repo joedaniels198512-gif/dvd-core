@@ -1,0 +1,7 @@
+# Tiny image with `make`. The ARM GNU-A 10.2.1 toolchain is mounted at
+# /opt/gcc-arm from main-dvd/toolchains/ (not baked in).
+FROM ubuntu:22.04
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends make ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
