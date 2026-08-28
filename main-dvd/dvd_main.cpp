@@ -27,12 +27,15 @@
  * would compete with the launcher for singleton ownership.
  *
  * Identifying a live launcher:
- *   1. Read the pidfile, then confirm /proc/<pid> is alive and cmdline
- *      contains "dvd_launcher" but not "dvd_autostart_daemon".
- *   2. If the pidfile is stale (dead PID, recycled PID, missing file),
- *      scan /proc for a matching cmdline.
+ *   - A child this process fork()ed is STARTING/RUNNING immediately. Liveness
+ *     is waitpid(child, WNOHANG). Do not require /proc/cmdline to already
+ *     show dvd_launcher (that lags until execl completes).
+ *   - Adopted/orphaned launchers, stale pidfiles, and non-children: read
+ *     the pidfile, then confirm /proc/<pid> is alive and cmdline contains
+ *     "dvd_launcher" but not "dvd_autostart_daemon". If the pidfile is
+ *     stale, scan /proc for a matching cmdline.
  *
- * A launcher this process spawned can be reaped with waitpid(WNOHANG).
+ * A launcher this process spawned is reaped with waitpid(WNOHANG).
  * An inherited/orphaned launcher (survived a previous Main crash; PPID 1)
  * is not waitpid-eligible; poll uses kill(pid,0) + /proc instead.
  */
@@ -51,9 +54,16 @@
 #define POLL_INTERVAL_MS    500
 #define LAUNCH_SETTLE_MS    500
 
+enum {
+	LAUNCH_NONE = 0,
+	LAUNCH_STARTING, /* fork() succeeded; execl may not have completed */
+	LAUNCH_RUNNING
+};
+
 static int     g_session;
 static int     g_owned;          /* 1 = waitpid-eligible child of this process */
 static pid_t   g_launcher_pid = -1;
+static int     g_launch_state;
 static int     g_halt_respawn;
 static int     g_fail_count;
 static time_t  g_last_start_ts;
@@ -150,6 +160,53 @@ static int pid_is_launcher(pid_t pid)
 	return cmdline_is_launcher(cmd);
 }
 
+/*
+ * Authoritative liveness for a child this process fork()ed.
+ * Do not require /proc/cmdline to already show dvd_launcher: after fork
+ * the child still appears as MiSTer_DVD until execl completes.
+ */
+static int owned_child_live(void)
+{
+	int st;
+	pid_t r;
+
+	if (!g_owned || g_launcher_pid <= 0)
+		return 0;
+
+	r = waitpid(g_launcher_pid, &st, WNOHANG);
+	if (r == 0)
+	{
+		if (g_launch_state == LAUNCH_STARTING && pid_is_launcher(g_launcher_pid))
+		{
+			g_launch_state = LAUNCH_RUNNING;
+			printf("DVD_MAIN: launcher pid=%ld exec complete\n",
+			       (long)g_launcher_pid);
+		}
+		else if (g_launch_state == LAUNCH_NONE)
+			g_launch_state = LAUNCH_STARTING;
+		return 1;
+	}
+	if (r == g_launcher_pid)
+	{
+		printf("DVD_MAIN: launcher pid=%ld exited status=%d\n",
+		       (long)r, st);
+		g_owned = 0;
+		g_launcher_pid = -1;
+		g_launch_state = LAUNCH_NONE;
+		return 0;
+	}
+	if (r < 0)
+	{
+		printf("DVD_MAIN: waitpid pid=%ld: %s\n",
+		       (long)g_launcher_pid, strerror(errno));
+		g_owned = 0;
+		g_launcher_pid = -1;
+		g_launch_state = LAUNCH_NONE;
+		return 0;
+	}
+	return 0;
+}
+
 static pid_t read_pidfile(const char *path)
 {
 	char buf[64];
@@ -224,7 +281,12 @@ static void adopt_launcher(pid_t pid, int owned)
 {
 	g_launcher_pid = pid;
 	g_owned = owned;
-	printf("DVD_MAIN: using launcher pid=%ld owned=%d\n", (long)pid, owned);
+	if (!owned)
+		g_launch_state = LAUNCH_RUNNING;
+	else if (g_launch_state == LAUNCH_NONE)
+		g_launch_state = LAUNCH_RUNNING;
+	printf("DVD_MAIN: using launcher pid=%ld owned=%d state=%d\n",
+	       (long)pid, owned, g_launch_state);
 }
 
 static int spawn_launcher(int rotate)
@@ -232,6 +294,13 @@ static int spawn_launcher(int rotate)
 	pid_t pid;
 	const char *old;
 	char ld[512];
+
+	if (owned_child_live())
+	{
+		printf("DVD_MAIN: spawn skipped, owned pid=%ld still live\n",
+		       (long)g_launcher_pid);
+		return 0;
+	}
 
 	if (access(DVD_LAUNCHER_PATH, X_OK) != 0)
 	{
@@ -285,8 +354,9 @@ static int spawn_launcher(int rotate)
 	}
 
 	g_last_start_ts = time(NULL);
+	g_launch_state = LAUNCH_STARTING;
 	adopt_launcher(pid, 1);
-	printf("DVD_MAIN: launcher started pid=%ld\n", (long)pid);
+	printf("DVD_MAIN: launcher started pid=%ld (starting)\n", (long)pid);
 	return 0;
 }
 
@@ -296,8 +366,6 @@ static int wait_pid_gone(pid_t pid, int seconds)
 
 	for (i = 0; i < seconds * 10; i++)
 	{
-		if (!pid_is_launcher(pid))
-			return 1;
 		if (g_owned && pid == g_launcher_pid)
 		{
 			int st;
@@ -306,10 +374,31 @@ static int wait_pid_gone(pid_t pid, int seconds)
 			{
 				g_owned = 0;
 				g_launcher_pid = -1;
+				g_launch_state = LAUNCH_NONE;
+				return 1;
+			}
+			if (r < 0 && errno != EINTR)
+			{
+				g_owned = 0;
+				g_launcher_pid = -1;
+				g_launch_state = LAUNCH_NONE;
 				return 1;
 			}
 		}
+		else if (!pid_alive(pid))
+			return 1;
 		usleep(100000);
+	}
+	if (g_owned && pid == g_launcher_pid)
+	{
+		int st;
+		if (waitpid(pid, &st, WNOHANG) == pid)
+		{
+			g_owned = 0;
+			g_launcher_pid = -1;
+			g_launch_state = LAUNCH_NONE;
+			return 1;
+		}
 	}
 	return !pid_alive(pid);
 }
@@ -363,12 +452,9 @@ void dvd_main_stop_all(void)
 	g_launch_not_before = 0;
 
 	pid = g_launcher_pid;
-	if (!pid_is_launcher(pid))
-		pid = find_live_launcher();
-
-	if (pid_is_launcher(pid))
+	if (g_owned && pid > 0)
 	{
-		printf("DVD_MAIN: stopping launcher pid=%ld\n", (long)pid);
+		printf("DVD_MAIN: stopping owned launcher pid=%ld\n", (long)pid);
 		kill(pid, SIGTERM);
 		if (!wait_pid_gone(pid, TERM_WAIT_SEC))
 		{
@@ -376,23 +462,39 @@ void dvd_main_stop_all(void)
 			kill(pid, SIGKILL);
 			wait_pid_gone(pid, KILL_WAIT_SEC);
 		}
+		if (g_owned && g_launcher_pid > 0)
+		{
+			int st;
+			waitpid(g_launcher_pid, &st, WNOHANG);
+		}
 	}
-
-	if (g_owned && g_launcher_pid > 0)
+	else
 	{
-		int st;
-		waitpid(g_launcher_pid, &st, WNOHANG);
+		if (!pid_is_launcher(pid))
+			pid = find_live_launcher();
+		if (pid_is_launcher(pid))
+		{
+			printf("DVD_MAIN: stopping launcher pid=%ld\n", (long)pid);
+			kill(pid, SIGTERM);
+			if (!wait_pid_gone(pid, TERM_WAIT_SEC))
+			{
+				printf("DVD_MAIN: SIGKILL launcher pid=%ld\n", (long)pid);
+				kill(pid, SIGKILL);
+				wait_pid_gone(pid, KILL_WAIT_SEC);
+			}
+		}
 	}
 
 	g_owned = 0;
 	g_launcher_pid = -1;
+	g_launch_state = LAUNCH_NONE;
 	orphan_sweep();
 	printf("DVD_MAIN: DVD processes stopped\n");
 }
 
 static int launcher_running(void)
 {
-	if (pid_is_launcher(g_launcher_pid))
+	if (owned_child_live())
 		return 1;
 	{
 		pid_t live = find_live_launcher();
@@ -407,34 +509,26 @@ static int launcher_running(void)
 	}
 	g_launcher_pid = -1;
 	g_owned = 0;
+	g_launch_state = LAUNCH_NONE;
 	return 0;
 }
 
 static void reap_owned(void)
 {
-	int st;
-	pid_t r;
-
-	if (!g_owned || g_launcher_pid <= 0)
-		return;
-	r = waitpid(g_launcher_pid, &st, WNOHANG);
-	if (r == g_launcher_pid)
-	{
-		printf("DVD_MAIN: launcher pid=%ld exited status=%d\n",
-		       (long)r, st);
-		g_owned = 0;
-		g_launcher_pid = -1;
-	}
+	owned_child_live();
 }
 
 static void start_or_adopt(void)
 {
-	pid_t live = find_live_launcher();
-	if (live > 0)
-	{
-		int owned = g_owned && (live == g_launcher_pid);
-		adopt_launcher(live, owned);
+	if (owned_child_live())
 		return;
+	{
+		pid_t live = find_live_launcher();
+		if (live > 0)
+		{
+			adopt_launcher(live, 0);
+			return;
+		}
 	}
 	if (g_halt_respawn)
 		return;
@@ -448,7 +542,8 @@ void dvd_main_on_core_ready(void)
 
 	if (!core_is_dvd_player())
 	{
-		if (g_session || pid_is_launcher(g_launcher_pid) || find_live_launcher() > 0)
+		if (g_session || (g_owned && g_launcher_pid > 0) ||
+		    pid_is_launcher(g_launcher_pid) || find_live_launcher() > 0)
 			dvd_main_stop_all();
 		return;
 	}
@@ -473,11 +568,16 @@ void dvd_main_on_core_ready(void)
 	 * normal polling loop and the settle delay has elapsed — matching
 	 * the old daemon's proven-working timing.
 	 */
+	if (owned_child_live())
+	{
+		g_pending_launch = 0;
+		return;
+	}
 	{
 		pid_t live = find_live_launcher();
 		if (live > 0)
 		{
-			adopt_launcher(live, g_owned && (live == g_launcher_pid));
+			adopt_launcher(live, 0);
 			g_pending_launch = 0;
 			return;
 		}
@@ -514,15 +614,9 @@ void dvd_main_poll(void)
 	 * accounting starts only after this first real spawn (spawn_launcher
 	 * sets g_last_start_ts; log rotation also happens there).
 	 *
-	 * KNOWN BUG (fix later, hardware-observed 2026-08): spawn burst.
-	 * start_or_adopt()'s find_live_launcher() can miss a child that was
-	 * just forked but has not exec'd/registered yet, so several polls in
-	 * a row may each spawn a launcher until the first one becomes
-	 * visible in /proc. Multiple dvd_launcher instances then race for
-	 * the singleton pidfile. Not the cause of the DDR/mailbox freeze
-	 * (that was an FPGA reset-safety bug: the freeze happened before
-	 * any launcher spawned); fix separately, e.g. by treating a live
-	 * not-yet-reaped g_launcher_pid as already-started.
+	 * After fork(), treat the child as STARTING immediately. waitpid is
+	 * the liveness test; do not wait for /proc/cmdline to show
+	 * dvd_launcher (that lags until execl completes).
 	 */
 	if (g_pending_launch)
 	{
@@ -546,7 +640,7 @@ void dvd_main_poll(void)
 			dt_ms = (ts.tv_sec - last_check.tv_sec) * 1000L +
 				(ts.tv_nsec - last_check.tv_nsec) / 1000000L;
 			if (dt_ms >= 0 && dt_ms < POLL_INTERVAL_MS &&
-			    pid_is_launcher(g_launcher_pid))
+			    (owned_child_live() || pid_is_launcher(g_launcher_pid)))
 				return;
 		}
 		last_check = ts;
