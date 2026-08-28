@@ -216,16 +216,31 @@ always @(posedge clk) begin
 				end
 
 			ST_ISSUE: begin
-				// Present the read only when no stale pre-reset beats are
-				// still in flight (ddr_quiet), then hold it until the cycle
-				// it is accepted (Avalon: the command must persist while
-				// waitrequest is high; a one-cycle pulse during BUSY is
-				// lost and ST_WAIT would hang forever).
-				if (ddr_rd_r && !DDRAM_BUSY) begin
+				// Pre-reset YUV (commit 000ccd5) issued on !BUSY in the
+				// same cycle as ST_WAIT. Reset-safety then required
+				// ddr_quiet and delayed WAIT until ddr_rd_r && !BUSY.
+				// That extra cycle plus quiet-gating *every* burst is a
+				// YUV-only presentation bug: Y/U/V are three sequential
+				// reads with beats_got cleared and a new line_base each
+				// plane, so buf_ok is delayed past y_disp → pix_en=0
+				// (black) while RGB's single-plane 120-beat chunks still
+				// complete in time.
+				//
+				// Restore the proven idle-port issue (RD+WAIT same cycle
+				// when !BUSY). Hold RD only while waitrequest is high.
+				// ddr_quiet applies to a *new* fill from ST_IDLE
+				// (plane_r=0, beats_got=0) so leftover pre-reset beats
+				// cannot attach to the first command. Intra-line YUV
+				// U/V and RGB bursts 2/3 already consumed every beat of
+				// the previous burst in ST_WAIT.
+				if (!DDRAM_BUSY &&
+				    (ddr_rd_r || ddr_quiet ||
+				     (plane_r != 2'd0) || (beats_got != 9'd0))) begin
+					ddr_rd_r  <= 1'b1;
 					burst_got <= 8'd0;
 					st        <= ST_WAIT;
-				end
-				else if (ddr_rd_r || ddr_quiet)
+				end else if (ddr_rd_r || ddr_quiet ||
+				             (plane_r != 2'd0) || (beats_got != 9'd0))
 					ddr_rd_r <= 1'b1;
 			end
 

@@ -59,9 +59,22 @@ run_tb fb_yuv_reader_tb "$HERE/fb_yuv_reader_tb.v" \
   "$RTL/yuv601_rgb.v" "$RTL/yuv_chroma_row.v" "$RTL/yuv_plane_addr.v" \
   "$RTL/fb_line_reader.v"
 
+# Hold-until-accepted + ddr_quiet vs YUV 3-plane / RGB line fills.
+run_tb fb_yuv_quiet_tb "$HERE/fb_yuv_quiet_tb.v" \
+  "$RTL/yuv601_rgb.v" "$RTL/yuv_chroma_row.v" "$RTL/yuv_plane_addr.v" \
+  "$RTL/fb_line_reader.v"
+
 # Whole-core reset-safety regression: real emu + framework terminator model.
 # -I includes fpga/ for sys/emu_ports.vh and build_id.v.
 run_tb reset_safety_tb -DSTRICT_AVALON "-I$HERE/.." \
+  "$HERE/reset_safety_tb.sv" "$HERE/../DVD.sv" \
+  "$RTL/fb_line_reader.v" "$RTL/mycore.v" \
+  "$RTL/yuv601_rgb.v" "$RTL/yuv_plane_addr.v" "$RTL/yuv_chroma_row.v" \
+  "$HERE/f2sdram_safe_terminator_sim.v"
+
+# Same emu with ARM mailbox = YUV+intl+TFF. Confirms 3-plane presentation
+# still produces non-black pixels after the ST_ISSUE quiet/hold change.
+run_tb reset_safety_yuv_tb -DYUV_MB -DSHORT -DSTRICT_AVALON "-I$HERE/.." \
   "$HERE/reset_safety_tb.sv" "$HERE/../DVD.sv" \
   "$RTL/fb_line_reader.v" "$RTL/mycore.v" \
   "$RTL/yuv601_rgb.v" "$RTL/yuv_plane_addr.v" "$RTL/yuv_chroma_row.v" \

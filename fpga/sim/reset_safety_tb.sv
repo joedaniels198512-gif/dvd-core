@@ -182,7 +182,11 @@ function [63:0] rd_data;
 	input [28:0] a;
 	begin
 		if (a == MB_ADDR)
+`ifdef YUV_MB
+			rd_data = 64'hE;                       // buffer A, YUV+intl+TFF
+`else
 			rd_data = 64'd0;                       // ARM request word: buffer A, BGR
+`endif
 		else if (a == CTL_ADDR)
 			rd_data = {32'h4456_4433, 32'd0};      // DVD3 magic, src_std=0
 		else if (a == JOY_ADDR)
@@ -331,6 +335,47 @@ initial begin
 	wait_cycles(3000);
 	reset_req = 0;
 	check_alive(0);
+
+`ifdef YUV_MB
+	begin
+		integer pix_ok, pix_black, clocks, saw_yuv;
+		pix_ok = 0; pix_black = 0; saw_yuv = 0;
+		for (clocks = 0; clocks < 1200000; clocks = clocks + 1) begin
+			wait_cycles(1);
+			if (dut.fb_line_reader.display_yuv)
+				saw_yuv = 1;
+			if (!reset_req && dut.ce_pix == 1'b0 && dut.vc < 10'd288 &&
+			    dut.hc < 10'd720) begin
+				if (dut.pix_r != 8'd0 || dut.pix_g != 8'd0 || dut.pix_b != 8'd0)
+					pix_ok = pix_ok + 1;
+				else
+					pix_black = pix_black + 1;
+			end
+		end
+		$display("YUV_MB display_yuv=%0d pix_ok=%0d pix_black=%0d buf_ok=%0d%0d st=%0d pend=%0d plane=%0d",
+		         dut.fb_line_reader.display_yuv, pix_ok, pix_black,
+		         dut.fb_line_reader.buf_ok[0], dut.fb_line_reader.buf_ok[1],
+		         dut.fb_line_reader.st, dut.ddr_pend, dut.fb_line_reader.plane_r);
+		if (!saw_yuv) begin
+			$display("FAIL YUV_MB: display_yuv never latched");
+			fails = fails + 1;
+		end
+		if (pix_ok < 64) begin
+			$display("FAIL YUV_MB: visible pixels %0d black=%0d", pix_ok, pix_black);
+			fails = fails + 1;
+		end else
+			$display("OK   YUV_MB visible pixels %0d black=%0d", pix_ok, pix_black);
+	end
+`endif
+
+`ifdef SHORT
+	if (fails) begin
+		$display("reset_safety_tb FAIL (%0d)", fails);
+		$fatal(1);
+	end
+	$display("reset_safety_tb PASS (SHORT)");
+	$finish;
+`endif
 
 	// Core reset pulses mid-activity: models Main app_restart()
 	// fpga_core_reset(1) held across exec, then released by the next Main.
