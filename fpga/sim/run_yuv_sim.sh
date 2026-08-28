@@ -59,6 +59,14 @@ run_tb fb_yuv_reader_tb "$HERE/fb_yuv_reader_tb.v" \
   "$RTL/yuv601_rgb.v" "$RTL/yuv_chroma_row.v" "$RTL/yuv_plane_addr.v" \
   "$RTL/fb_line_reader.v"
 
+# Whole-core reset-safety regression: real emu + framework terminator model.
+# -I includes fpga/ for sys/emu_ports.vh and build_id.v.
+run_tb reset_safety_tb -DSTRICT_AVALON "-I$HERE/.." \
+  "$HERE/reset_safety_tb.sv" "$HERE/../DVD.sv" \
+  "$RTL/fb_line_reader.v" "$RTL/mycore.v" \
+  "$RTL/yuv601_rgb.v" "$RTL/yuv_plane_addr.v" "$RTL/yuv_chroma_row.v" \
+  "$HERE/f2sdram_safe_terminator_sim.v"
+
 echo "Simulation $PASS passed, $FAIL failed"
 if [ "$FAIL" -ne 0 ]; then
   exit 1

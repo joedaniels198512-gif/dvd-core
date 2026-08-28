@@ -35,6 +35,7 @@ module fb_line_reader
 	input         dup_even,
 
 	input         mb_idle,      // mailbox allows a new video burst to start
+	input         ddr_quiet,    // no accepted-but-undelivered DDR read beats
 	output        vid_req,
 	output        vid_active,
 	output        ddr_rd,
@@ -215,11 +216,17 @@ always @(posedge clk) begin
 				end
 
 			ST_ISSUE: begin
-				if (!DDRAM_BUSY) begin
-					ddr_rd_r  <= 1'b1;
+				// Present the read only when no stale pre-reset beats are
+				// still in flight (ddr_quiet), then hold it until the cycle
+				// it is accepted (Avalon: the command must persist while
+				// waitrequest is high; a one-cycle pulse during BUSY is
+				// lost and ST_WAIT would hang forever).
+				if (ddr_rd_r && !DDRAM_BUSY) begin
 					burst_got <= 8'd0;
 					st        <= ST_WAIT;
 				end
+				else if (ddr_rd_r || ddr_quiet)
+					ddr_rd_r <= 1'b1;
 			end
 
 			ST_WAIT: begin

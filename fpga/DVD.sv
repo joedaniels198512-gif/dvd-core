@@ -80,11 +80,6 @@ assign BUTTONS = 0;
 //
 //////////////////////////////////////////////////////////////////
 
-wire [1:0] ar = status[122:121];
-
-assign VIDEO_ARX = (!ar) ? 12'd4 : (ar - 1'd1);
-assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
-
 `include "build_id.v"
 // Status Bit Map:
 //             Upper                             Lower
@@ -152,6 +147,18 @@ localparam CONF_STR = {
 	"V,v",`BUILD_DATE 
 };
 
+///////////////////////   CLOCKS   ///////////////////////////////
+
+wire clk_sys;
+pll pll
+(
+	.refclk(CLK_50M),
+	.rst(0),
+	.outclk_0(clk_sys)
+);
+
+///////////////////////   HPS IO   ///////////////////////////////
+
 wire forced_scandoubler;
 wire   [1:0] buttons;
 wire [127:0] status;
@@ -175,15 +182,30 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 	.ps2_key(ps2_key)
 );
 
-///////////////////////   CLOCKS   ///////////////////////////////
+wire [1:0] ar = status[122:121];
 
-wire clk_sys;
-pll pll
-(
-	.refclk(CLK_50M),
-	.rst(0),
-	.outclk_0(clk_sys)
-);
+assign VIDEO_ARX = (!ar) ? 12'd4 : (ar - 1'd1);
+assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
+
+///////////////////////   RESET   ////////////////////////////////
+
+// RESET (sys_top reset_out) is generated in the HPS/ctrl domain and reaches
+// emu unsynchronized. The framework separately 2-FF-synchronizes the same
+// reset into DDRAM_CLK for f2sdram_safe_terminator (sysmem.sv), which
+// DISCONNECTS our DDRAM commands from the bridge while core reset is held:
+// a read issued during that window is silently dropped and its wait state
+// would hang forever (frozen set_seq / black screen after the second
+// app_restart core reset of the MiSTer main= lifecycle).
+// Synchronize here and hold our DDR users in reset for a short settle after
+// release so no command can be presented before the terminator has unlocked.
+reg [1:0] rst_sync   = 2'b11;
+reg [3:0] rst_settle = 4'hF;
+always @(posedge clk_sys) begin
+	rst_sync <= {rst_sync[0], RESET | status[0] | buttons[1]};
+	if (rst_sync[1])       rst_settle <= 4'hF;
+	else if (|rst_settle)  rst_settle <= rst_settle - 4'd1;
+end
+wire reset = rst_sync[1] | (|rst_settle);
 
 // Mailbox at physical 0x30400000. DDRAM_ADDR is byte_addr[31:3].
 // Poll 16384 cycles of 27 MHz (~0.61 ms).
@@ -289,84 +311,145 @@ assign DDRAM_BE       = 8'hFF;
 assign DDRAM_WE       = vid_active ? 1'b0 : mb_we;
 assign DDRAM_RD       = vid_active ? vid_rd : mb_rd;
 
+// Outstanding-read beat tracker. Survives core reset on purpose.
+// An accepted Avalon read burst cannot be aborted: if reset clears a DDR
+// user mid-burst, the remaining DDRAM_DOUT_READY beats still arrive later.
+// Track accepted-but-undelivered beats so no FSM presents a new command
+// until the port is quiet (ddr_quiet); a stale pre-reset beat can then
+// never be mistaken for the response to a new command.
+reg  [7:0]  ddr_pend      = 8'd0;
+reg  [11:0] ddr_drain_cnt = 12'd0;
+wire        ddr_rd_acc    = DDRAM_RD & ~DDRAM_BUSY;
+wire        ddr_quiet     = (ddr_pend == 8'd0);
+
+always @(posedge clk_sys) begin
+	case ({ddr_rd_acc, DDRAM_DOUT_READY})
+		2'b10:   ddr_pend <= ddr_pend + DDRAM_BURSTCNT;
+		2'b01:   ddr_pend <= ddr_pend - {7'd0, |ddr_pend};
+		2'b11:   ddr_pend <= ddr_pend + DDRAM_BURSTCNT - 8'd1;
+		default: ;
+	endcase
+
+	// Secondary robustness only (reset semantics above are the fix): if
+	// tracked beats never arrive (e.g. consumed by the framework-level
+	// f2sdram_safe_terminator), unblock DDR traffic after ~150 us.
+	if (ddr_quiet || DDRAM_DOUT_READY || ddr_rd_acc)
+		ddr_drain_cnt <= 12'd0;
+	else if (ddr_drain_cnt == 12'hFFF) begin
+		ddr_drain_cnt <= 12'd0;
+		ddr_pend      <= 8'd0;
+	end else
+		ddr_drain_cnt <= ddr_drain_cnt + 12'd1;
+end
+
+// Reset safety: only transaction/FSM state is cleared on core reset.
+// Latched ARM data (mb_bit/mb_yuv/mb_intl/mb_tff, src_std) and set_seq are
+// preserved, so the ARM-visible protocol is unchanged: polling and set_seq
+// pause while reset is held and resume right after. Issuing a command while
+// reset is held would be dropped by f2sdram_safe_terminator and hang the
+// wait state forever (the proven main= second-app_restart freeze).
+// Commands are presented only when ddr_quiet (no stale beats in flight)
+// and are held until observed accepted (Avalon: a command must persist
+// while waitrequest is high; a one-cycle pulse during BUSY is lost).
 always @(posedge clk_sys) begin
 	mb_rd <= 0;
 	mb_we <= 0;
-	poll_cnt <= poll_cnt + 1'd1;
 
-	if (poll_cnt == POLL_MAX)
-		poll_due <= 1'b1;
+	if (reset) begin
+		mb_st       <= ST_IDLE;
+		mb_rd       <= 0;
+		mb_we       <= 0;
+		poll_cnt    <= 14'd0;
+		poll_due    <= 1'b0;
+		ctl_due     <= 1'b0;
+		set_due     <= 1'b0;
+		joy_pending <= 1'b1;
+		joy_hb      <= 10'd0;
+		joy_sent    <= 32'hffff_ffff;
+		disp_sent   <= 1'b0;
+	end else begin
+		poll_cnt <= poll_cnt + 1'd1;
 
-	case (mb_st)
-		ST_IDLE: if (vid_active) begin
-				// In-flight video burst owns DDRAM until it completes.
-			end else if (poll_due) begin
-				poll_due <= 1'b0;
-				joy_hb <= joy_hb + 1'd1;
-				if (joy_hb == JOY_HB_MAX) begin
-					joy_hb <= 10'd0;
-					joy_pending <= 1'b1;
+		if (poll_cnt == POLL_MAX)
+			poll_due <= 1'b1;
+
+		case (mb_st)
+			ST_IDLE: if (vid_active) begin
+					// In-flight video burst owns DDRAM until it completes.
+				end else if (poll_due) begin
+					poll_due <= 1'b0;
+					joy_hb <= joy_hb + 1'd1;
+					if (joy_hb == JOY_HB_MAX) begin
+						joy_hb <= 10'd0;
+						joy_pending <= 1'b1;
+					end
+					mb_st <= ST_RD_MB;
+				end else if (ctl_due) begin
+					mb_st <= ST_RD_CTL;
+				end else if (set_due) begin
+					mb_st <= ST_WR_SET;
+				end else if (joy_pending) begin
+					mb_st <= ST_WR_JOY;
 				end
-				mb_st <= ST_RD_MB;
-			end else if (ctl_due) begin
-				mb_st <= ST_RD_CTL;
-			end else if (set_due) begin
-				mb_st <= ST_WR_SET;
-			end else if (joy_pending) begin
-				mb_st <= ST_WR_JOY;
-			end
-		ST_RD_MB: if (!DDRAM_BUSY) begin
-				mb_rd <= 1;
-				mb_st <= ST_RD_MB_W;
-			end
-		ST_RD_MB_W: if (DDRAM_DOUT_READY) begin
-				mb_bit  <= DDRAM_DOUT[0];
-				mb_yuv  <= DDRAM_DOUT[1];
-				mb_intl <= DDRAM_DOUT[2];
-				mb_tff  <= DDRAM_DOUT[3];
-				ctl_due <= 1'b1;
-				set_due <= 1'b1;
-				mb_st  <= ST_IDLE;
-			end
-		ST_WR_JOY: if (!DDRAM_BUSY) begin
-				mb_we <= 1;
-				mb_st <= ST_WR_JOY_H;
-			end
-		ST_WR_JOY_H: begin
-				joy_sent  <= joystick_0;
-				disp_sent <= display_buf;
-				joy_pending <= 1'b0;
-				mb_st <= ST_IDLE;
-			end
-		ST_WR_SET: if (!DDRAM_BUSY) begin
-				mb_we <= 1;
-				mb_st <= ST_WR_SET_H;
-			end
-		ST_WR_SET_H: begin
-				set_seq <= set_seq + 8'd1;
-				set_due <= 1'b0;
-				mb_st <= ST_IDLE;
-			end
-		ST_RD_CTL: if (!DDRAM_BUSY) begin
-				mb_rd <= 1;
-				mb_st <= ST_RD_CTL_W;
-			end
-		ST_RD_CTL_W: if (DDRAM_DOUT_READY) begin
-				if (DDRAM_DOUT[63:32] == CTL_MAGIC && DDRAM_DOUT[1:0] <= 2'd2)
-					src_std <= DDRAM_DOUT[1:0];
-				ctl_due <= 1'b0;
-				mb_st <= ST_IDLE;
-			end
-		default: mb_st <= ST_IDLE;
-	endcase
+			ST_RD_MB: begin
+					if (mb_rd && !DDRAM_BUSY)
+						mb_st <= ST_RD_MB_W;   // accepted; mb_rd falls via default
+					else if (mb_rd || ddr_quiet)
+						mb_rd <= 1;
+				end
+			ST_RD_MB_W: if (DDRAM_DOUT_READY) begin
+					mb_bit  <= DDRAM_DOUT[0];
+					mb_yuv  <= DDRAM_DOUT[1];
+					mb_intl <= DDRAM_DOUT[2];
+					mb_tff  <= DDRAM_DOUT[3];
+					ctl_due <= 1'b1;
+					set_due <= 1'b1;
+					mb_st  <= ST_IDLE;
+				end
+			ST_WR_JOY: begin
+					if (mb_we && !DDRAM_BUSY)
+						mb_st <= ST_WR_JOY_H;
+					else if (mb_we || ddr_quiet)
+						mb_we <= 1;
+				end
+			ST_WR_JOY_H: begin
+					joy_sent  <= joystick_0;
+					disp_sent <= display_buf;
+					joy_pending <= 1'b0;
+					mb_st <= ST_IDLE;
+				end
+			ST_WR_SET: begin
+					if (mb_we && !DDRAM_BUSY)
+						mb_st <= ST_WR_SET_H;
+					else if (mb_we || ddr_quiet)
+						mb_we <= 1;
+				end
+			ST_WR_SET_H: begin
+					set_seq <= set_seq + 8'd1;
+					set_due <= 1'b0;
+					mb_st <= ST_IDLE;
+				end
+			ST_RD_CTL: begin
+					if (mb_rd && !DDRAM_BUSY)
+						mb_st <= ST_RD_CTL_W;
+					else if (mb_rd || ddr_quiet)
+						mb_rd <= 1;
+				end
+			ST_RD_CTL_W: if (DDRAM_DOUT_READY) begin
+					if (DDRAM_DOUT[63:32] == CTL_MAGIC && DDRAM_DOUT[1:0] <= 2'd2)
+						src_std <= DDRAM_DOUT[1:0];
+					ctl_due <= 1'b0;
+					mb_st <= ST_IDLE;
+				end
+			default: mb_st <= ST_IDLE;
+		endcase
 
-	if (joystick_0 != joy_sent)
-		joy_pending <= 1'b1;
-	if (display_buf != disp_sent)
-		joy_pending <= 1'b1;
+		if (joystick_0 != joy_sent)
+			joy_pending <= 1'b1;
+		if (display_buf != disp_sent)
+			joy_pending <= 1'b1;
+	end
 end
-
-wire reset = RESET | status[0] | buttons[1];
 
 wire [1:0] col = status[4:3];
 
@@ -429,6 +512,7 @@ fb_line_reader fb_line_reader
 	.dup_even(crt_stab),
 
 	.mb_idle(mb_allow_vid),
+	.ddr_quiet(ddr_quiet),
 	.vid_req(vid_req),
 	.vid_active(vid_active),
 	.ddr_rd(vid_rd),

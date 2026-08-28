@@ -50,6 +50,7 @@ fb_line_reader dut(
 	.pal(pal),
 	.dup_even(dup_even),
 	.mb_idle(mb_idle),
+	.ddr_quiet(1'b1),
 	.vid_req(vid_req),
 	.vid_active(vid_active),
 	.ddr_rd(ddr_rd),
