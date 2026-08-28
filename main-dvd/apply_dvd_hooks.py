@@ -83,6 +83,112 @@ def patch_user_io(text: str) -> str:
     return text
 
 
+def patch_video(text: str) -> str:
+    if "DVD_MAIN_HOOK: TMDS follows Monitor Sense" in text:
+        return text
+    text = once(
+        text,
+        "static int hdmi_power = 1;\n"
+        "static int hdmi_need_init = 0;\n",
+        "static int hdmi_power = 1;\n"
+        "static int hdmi_need_init = 0;\n"
+        "static int s_tmds_val = -1; /* last ADV7513 0x41 written by tmds_power(); -1 = unknown */\n",
+    )
+    text = once(
+        text,
+        "void tmds_power(int on)\n"
+        "{\n"
+        "\t// ADV7513 power-down control. 0 = power on, 1 = power down.\n"
+        "\tif (hdmi_main_fd >= 0)\n"
+        "\t{\n"
+        "\t\tuint8_t val = on ? 0x10 : 0x50;\n"
+        "\t\tint res = i2c_smbus_write_byte_data(hdmi_main_fd, 0x41, val);\n"
+        "\t\tif (res < 0) printf(\"i2c: write error (41 %02X): %d\\n\", val, res);\n"
+        "\t}\n"
+        "}\n",
+        "void tmds_power(int on)\n"
+        "{\n"
+        "\t// ADV7513 power-down control. 0 = power on, 1 = power down.\n"
+        "\tif (hdmi_main_fd >= 0)\n"
+        "\t{\n"
+        "\t\tuint8_t val = on ? 0x10 : 0x50;\n"
+        "\t\tif (s_tmds_val == (int)val) return;\n"
+        "\t\tint res = i2c_smbus_write_byte_data(hdmi_main_fd, 0x41, val);\n"
+        "\t\tif (res < 0) printf(\"i2c: write error (41 %02X): %d\\n\", val, res);\n"
+        "\t\telse\n"
+        "\t\t{\n"
+        "\t\t\ts_tmds_val = val;\n"
+        "\t\t\tprintf(\"[HDMI] TMDS %s (0x41=0x%02X)\\n\", on ? \"on\" : \"off\", val);\n"
+        "\t\t}\n"
+        "\t}\n"
+        "}\n",
+    )
+    text = once(
+        text,
+        "\t\t\tbool hpd_high = (current_status & 0x40) != 0; // Bit 6: HPD pin level\n"
+        "\t\t\tbool MS_high = (current_status & 0x20) != 0; // Bit 5: Monitor Sense level\n"
+        "\n"
+        "\t\t\t// The safe window to read EDID is when BOTH 5V power (HPD)\n"
+        "\t\t\t// and internal display termination (Monitor Sense) are fully high and stable\n"
+        "\t\t\tif (hpd_high && MS_high)\n"
+        "\t\t\t{\n"
+        "\t\t\t\thdmi_need_init = 1;\n"
+        "\t\t\t\tif (hdmi_power)\n"
+        "\t\t\t\t{\n"
+        "\t\t\t\t\tprintf(\"[HDMI] HPD and Monitor Sense Stable. Power up, re-initializing...\\n\");\n"
+        "\t\t\t\t\tvideo_hdmi_power(1);\n"
+        "\t\t\t\t}\n"
+        "\t\t\t\telse\n"
+        "\t\t\t\t{\n"
+        "\t\t\t\t\tprintf(\"[HDMI] HPD and Monitor Sense Stable, but HDMI is powered down. Will re-init upon wakeup.\\n\");\n"
+        "\t\t\t\t}\n"
+        "\t\t\t}\n"
+        "\t\t\telse\n"
+        "\t\t\t{\n"
+        "\t\t\t\tprintf(\"[HDMI] Link lost or re-routing (HPD=%d, MS=%d)\\n\", hpd_high, MS_high);\n"
+        "\t\t\t\ttmds_power(0);\n"
+        "\t\t\t}\n",
+        "\t\t\tbool hpd_high = (current_status & 0x40) != 0; // Bit 6: HPD pin level\n"
+        "\t\t\tbool MS_high = (current_status & 0x20) != 0; // Bit 5: Monitor Sense level\n"
+        "\n"
+        "\t\t\t/* DVD_MAIN_HOOK: TMDS follows Monitor Sense.\n"
+        "\t\t\t   SS1 HPD (0x42 bit 6) can stay low while HDMI is visibly working\n"
+        "\t\t\t   and MS (bit 5) remains high. Stock treated HPD=0 as unplug and\n"
+        "\t\t\t   wrote 0x41=0x50; EDID re-init still requires both signals. */\n"
+        "\t\t\tif (MS_high)\n"
+        "\t\t\t{\n"
+        "\t\t\t\tif (hpd_high)\n"
+        "\t\t\t\t{\n"
+        "\t\t\t\t\thdmi_need_init = 1;\n"
+        "\t\t\t\t\tif (hdmi_power)\n"
+        "\t\t\t\t\t{\n"
+        "\t\t\t\t\t\tprintf(\"[HDMI] IRQ=0x%02X HPD=1 MS=1 — re-init\\n\", irq_status);\n"
+        "\t\t\t\t\t\tvideo_hdmi_power(1);\n"
+        "\t\t\t\t\t}\n"
+        "\t\t\t\t\telse\n"
+        "\t\t\t\t\t{\n"
+        "\t\t\t\t\t\tprintf(\"[HDMI] IRQ=0x%02X HPD=1 MS=1 — HDMI off, defer re-init\\n\", irq_status);\n"
+        "\t\t\t\t\t}\n"
+        "\t\t\t\t}\n"
+        "\t\t\t\telse if (hdmi_power)\n"
+        "\t\t\t\t{\n"
+        "\t\t\t\t\tint prev = s_tmds_val;\n"
+        "\t\t\t\t\ttmds_power(1);\n"
+        "\t\t\t\t\tif (prev != 0x10)\n"
+        "\t\t\t\t\t\tprintf(\"[HDMI] IRQ=0x%02X HPD=0 MS=1 — TMDS keep/restore\\n\", irq_status);\n"
+        "\t\t\t\t}\n"
+        "\t\t\t}\n"
+        "\t\t\telse\n"
+        "\t\t\t{\n"
+        "\t\t\t\tint prev = s_tmds_val;\n"
+        "\t\t\t\ttmds_power(0);\n"
+        "\t\t\t\tif (prev != 0x50)\n"
+        "\t\t\t\t\tprintf(\"[HDMI] IRQ=0x%02X HPD=%d MS=0 — TMDS off (sink lost)\\n\", irq_status, hpd_high);\n"
+        "\t\t\t}\n",
+    )
+    return text
+
+
 def patch_makefile(text: str) -> str:
     if "neon-vfpv3" in text and "PRJ = MiSTer_DVD" in text:
         text = text.replace(
@@ -124,6 +230,7 @@ def main() -> None:
     mapping = {
         SRC / "fpga_io.cpp": patch_fpga_io,
         SRC / "user_io.cpp": patch_user_io,
+        SRC / "video.cpp": patch_video,
         SRC / "Makefile": patch_makefile,
     }
     for path, fn in mapping.items():
