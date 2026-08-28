@@ -33,7 +33,7 @@ FFmpeg is not a separate binary; it is inside the player. Tarball
 `SOURCES/ffmpeg-6.0.1.tar.xz` SHA-256
 `9b16b8731d78e596b4be0d720428ca42df642bb2d78342881ff7f5bc29fc9623`.
 
-Also in the zip: installer/uninstaller, `LICENSES/`, `LICENSING.md`,
+Also in the zip: `LICENSES/`, `LICENSING.md`,
 `THIRD_PARTY_NOTICES.md`, this report, `SOURCES/` (Debian triples, FFmpeg
 tarball, our ARM/Main overlay sources), `MiSTer_DVD_Player_CHECKSUMS.txt`.
 

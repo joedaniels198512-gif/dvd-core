@@ -1,14 +1,17 @@
 # Install MiSTer DVD Player (public beta 0.1)
 
-These steps match the current public-beta zip and
-`Scripts/Install_MiSTer_DVD_Player.sh`. Do not move ARM binaries by hand
-after extract; the tested layout is `/media/fat/DVD/dev/`.
+No installer script is required. Extract the zip onto the SD card, then
+**add** one `MiSTer.ini` section. Do not move ARM binaries after extract;
+the tested layout is `/media/fat/DVD/dev/`.
 
 
-## 1. Extract the zip
+## Manual install (GitHub zip)
 
-Copy **`MiSTer_DVD_Player_0.1.0-public-beta.zip`** onto the MiSTer SD card
-and extract it at the **root** of the FAT partition so you have:
+### 1. Extract to the SD root
+
+Copy **`MiSTer_DVD_Player_0.1.0-public-beta.zip`** to the MiSTer SD card
+and extract its contents at the **root** of the FAT partition (`/media/fat`
+when the system is running). You should have:
 
 ```
 /media/fat/MiSTer_DVD_Player.rbf
@@ -16,55 +19,53 @@ and extract it at the **root** of the FAT partition so you have:
 /media/fat/DVD/dev/          launcher, player, ripping tools
 /media/fat/DVD/lib/          libdvdread, libdvdnav, rip helper libraries
 /media/fat/DVD/isos/         empty folder for your ISOs (optional)
-/media/fat/Scripts/Install_MiSTer_DVD_Player.sh
-/media/fat/Scripts/Uninstall_MiSTer_DVD_Player.sh
 ```
 
 Licence and corresponding-source files from the zip may sit beside those
 paths; they are not required to run the player.
 
+**Do not replace** stock `/media/fat/MiSTer` with `MiSTer_DVD`. Both files
+must remain on the SD root. `MiSTer_DVD` is used only for this core.
 
-## 2. Run the installer
-
-Boot MiSTer. Open **Scripts → Install MiSTer DVD Player**.
-
-The installer is safe to run more than once. It will:
-
-- Copy `MiSTer_DVD_Player.rbf` to `/media/fat/MiSTer_DVD_Player.rbf` if needed
-- Install **`/media/fat/MiSTer_DVD` beside** stock **`/media/fat/MiSTer`**
-  (stock Main is never replaced)
-- Add a marked block to `MiSTer.ini`:
-
-  ```
-  [DVD-Player]
-  main=MiSTer_DVD
-  ```
-
-- Create `/media/fat/games/DVD-Player` if missing
-- Remove any **old marked daemon block** from
-  `/media/fat/linux/user-startup.sh` and stop a leftover
-  `dvd_autostart_daemon` if it was running
-- Leave library cache, logs, and an existing `libdvdcss` file untouched
-
-It **refuses** if `[DVD-Player]` already has a `main=` value other than
-`MiSTer_DVD`. It **refuses** if `/media/fat/MiSTer` is identical to
-`MiSTer_DVD` (stock Main must stay a separate file).
-
-A daemon is **not** required. Custom Main starts the launcher when you
-load this core.
+If you already have a user-supplied `libdvdcss.so.2` under `DVD/lib`,
+leave that file in place. This zip does not include it and extracting
+should not be used as an excuse to delete the whole `DVD/lib` folder.
 
 
-## 3. Launch DVD-Player
+### 2. Edit MiSTer.ini (add, do not replace)
+
+Open `/media/fat/MiSTer.ini` in a text editor.
+
+**Add** this section. Do **not** overwrite or replace your existing
+`MiSTer.ini` with a new file. Keep your other settings.
+
+```
+[DVD-Player]
+main=MiSTer_DVD
+```
+
+Save the file. Reboot or return to the MiSTer menu so the new core
+setting is picked up.
+
+
+### 3. Launch DVD-Player
 
 From the MiSTer main menu, start **MiSTer DVD Player**
 (`MiSTer_DVD_Player.rbf`, core name `DVD-Player`).
 
-MiSTer switches to `MiSTer_DVD` for this core only. The launcher appears
-with three items:
+MiSTer switches to `MiSTer_DVD` for this core only. The launcher shows:
 
 - Play Physical DVD
 - DVD Library
 - Rip DVD to USB
+
+
+## MiSTer Companion / Update All
+
+Once this core is in a Companion / Update All database, those tools can
+**inject** the same `[DVD-Player] main=MiSTer_DVD` entry automatically.
+You still should not replace your whole `MiSTer.ini`. Until that database
+support is available, add the block by hand as above.
 
 
 ## Play Physical DVD
@@ -147,25 +148,24 @@ Without that library:
 - Unencrypted discs remain supported
 - ISO playback does not depend on this package distributing libdvdcss
 
-The installer does not fail if the file is missing. If it is already
-there, the installer leaves it unchanged.
+An existing `libdvdcss.so.2` in that folder should be left unchanged.
+Missing CSS is not an install failure.
 
 
-## Uninstall
+## Uninstall (manual)
 
-**Scripts → Uninstall MiSTer DVD Player**
+No uninstaller is shipped. To remove the core:
 
-That stops the player/launcher/rip tools, removes the marked
-`user-startup` and `[DVD-Player] main=` blocks, and deletes
-`/media/fat/MiSTer_DVD_Player.rbf` and `/media/fat/MiSTer_DVD`.
+1. Delete `/media/fat/MiSTer_DVD_Player.rbf` and `/media/fat/MiSTer_DVD`
+   (do **not** delete stock `/media/fat/MiSTer`).
+2. Remove only the `[DVD-Player]` / `main=MiSTer_DVD` block you added
+   from `MiSTer.ini`. Do not replace the whole ini file.
+3. Optionally delete `/media/fat/DVD/` if you also want to remove ISOs,
+   cache, logs, and a user-supplied `libdvdcss.so.2`.
 
-It does **not** delete:
-
-- Stock `/media/fat/MiSTer`
-- `/media/fat/DVD/` (ISOs, cache, logs, binaries, user-supplied
-  `libdvdcss.so.2`)
-
-To wipe those as well, delete the `DVD` folder on the SD card yourself.
+If you previously used a marked `dvd_autostart_daemon` block in
+`user-startup.sh`, delete that marked block. This beta does not need a
+daemon.
 
 
 ## After install: where files live
@@ -178,5 +178,4 @@ To wipe those as well, delete the `DVD` folder on the SD card yourself.
 | `/media/fat/DVD/dev/` | Launcher, player, rip tools |
 | `/media/fat/DVD/lib/` | libdvdread, libdvdnav; optional libdvdcss |
 | `/media/fat/DVD/isos/` | SD ISO library |
-| `/media/fat/games/DVD-Player` | MiSTer games/home dir for this core |
-| `/media/fat/MiSTer.ini` | `[DVD-Player] main=MiSTer_DVD` |
+| `/media/fat/MiSTer.ini` | add `[DVD-Player] main=MiSTer_DVD` |

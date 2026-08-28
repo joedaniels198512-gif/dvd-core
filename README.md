@@ -57,6 +57,20 @@ You need:
 
 See **[INSTALL.md](INSTALL.md)**.
 
+**Manual (this zip):** extract the zip contents to the **root** of the
+MiSTer SD card, then **add** (do not replace your existing `MiSTer.ini`):
+
+```
+[DVD-Player]
+main=MiSTer_DVD
+```
+
+Save, reboot or return to MiSTer, and launch **MiSTer DVD Player**.
+
+**MiSTer Companion / Update All:** once the core is in those databases,
+they can add the same `MiSTer.ini` entry automatically. No installer
+script is required either way.
+
 
 ## Basic controls
 
@@ -125,7 +139,7 @@ _Add screenshots here when available._
 
 ## Other documents
 
-- [INSTALL.md](INSTALL.md) — install, use, uninstall
+- [INSTALL.md](INSTALL.md) — extract to SD root and MiSTer.ini
 - [RELEASE_NOTES_0.1.md](RELEASE_NOTES_0.1.md) — 0.1 announcement
 - [CHANGELOG.md](CHANGELOG.md)
 - [PRIVACY.md](PRIVACY.md)

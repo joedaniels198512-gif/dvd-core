@@ -6,7 +6,7 @@ backend, advertising system, or cloud service.
 
 ## What the player software does
 
-The public-beta **player, launcher, ripping helper, and installer** are
+The public-beta **player, launcher, and ripping helper** are
 local programs on the SuperStation One / MiSTer. In the source used for
 this release there is **no** application-level telemetry, crash reporter,
 or analytics client.
@@ -20,8 +20,7 @@ Checked in this tree for this documentation:
 - Player, launcher, library, and rip helper C sources: no sockets,
   HTTP clients, or analytics calls
 - Custom Main overlay: no network client
-- Public installer: does not download packages and does not contact
-  VideoLAN or other sites
+- Packaging/install docs do not download packages or contact VideoLAN
 
 FFmpeg is built into the player with a minimal demux/decode set (MPEG-PS
 and related DVD codecs), not as a networked media client.

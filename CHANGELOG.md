@@ -28,7 +28,9 @@ First **public** beta of MiSTer DVD Player for SuperStation One / MiSTer.
 
 ### Package
 
-Conservative public zip: no libdvdcss binary. Licence texts and Debian /
+Conservative public zip: extract to SD root; no installer script.
+Add `[DVD-Player] main=MiSTer_DVD` to `MiSTer.ini` (Companion / Update All
+can inject that later). No libdvdcss binary. Licence texts and Debian /
 FFmpeg corresponding source included. Frozen binaries: see
 [COMPLIANCE_PUBLIC_BETA_0.1.md](COMPLIANCE_PUBLIC_BETA_0.1.md) and
 [RELEASE_CANDIDATE_0.1.md](RELEASE_CANDIDATE_0.1.md).

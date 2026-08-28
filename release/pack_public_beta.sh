@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
 # Stage / zip PUBLIC beta 0.1.
+# Extract to MiSTer SD root. No installer/uninstaller in this zip.
 # Does not deploy, does not run Quartus, does not rebuild the player.
 # Ships the working Rip DVD stack. Does NOT copy or fetch libdvdcss.
 #
@@ -45,7 +46,6 @@ mkdir -p \
     "$STAGE/DVD/logs" \
     "$STAGE/DVD/cache" \
     "$STAGE/DVD/isos" \
-    "$STAGE/Scripts" \
     "$STAGE/LICENSES" \
     "$STAGE/SOURCES/mister-dvd-player-arm/main-dvd" \
     "$STAGE/SOURCES/debian-libdvdread" \
@@ -94,10 +94,7 @@ chmod +x "$STAGE/DVD/dev/dvd_launcher" \
 : > "$STAGE/DVD/isos/.keep"
 echo "$VER" > "$STAGE/DVD/VERSION"
 
-cp -f "$ROOT/release/pkg_scripts/Install_MiSTer_DVD_Player.sh" "$STAGE/Scripts/"
-cp -f "$ROOT/release/pkg_scripts/Uninstall_MiSTer_DVD_Player.sh" "$STAGE/Scripts/"
-chmod +x "$STAGE/Scripts/"*.sh
-
+# Manual GitHub / Companion distribution: extract to SD root. No installer.
 cp -f "$ROOT/LICENSES/"* "$STAGE/LICENSES/"
 cp -f "$ROOT/LICENSING.md" "$STAGE/"
 cp -f "$ROOT/SOURCE_INFO.md" "$STAGE/SOURCES/"
@@ -225,8 +222,12 @@ do
     [ -f "$required" ] || { echo "ERROR: missing $required" >&2; exit 1; }
 done
 
-if grep -R "/Users/jarvis" "$STAGE/Scripts" >/dev/null 2>&1; then
-    echo "ERROR: host path leaked into package scripts" >&2
+if find "$STAGE" -name 'Install_MiSTer_DVD_Player.sh' -o -name 'Uninstall_MiSTer_DVD_Player.sh' | grep . >/dev/null; then
+    echo "ERROR: installer/uninstaller staged in public package" >&2
+    exit 1
+fi
+if grep -R "/Users/jarvis" "$STAGE" --include='*.sh' --include='*.md' >/dev/null 2>&1; then
+    echo "ERROR: host path leaked into package" >&2
     exit 1
 fi
 
@@ -244,6 +245,10 @@ if [ "${PACK_ZIP:-1}" = "1" ]; then
     # Zip names only: libdvdcss.so* / libdvdcss2 packages — not debian patch filenames.
     if unzip -Z1 "$ZIP" | grep -E '(^|/)libdvdcss(\.so|$)|(^|/)libdvdcss2'; then
         echo "ERROR: zip contains libdvdcss binary" >&2
+        exit 1
+    fi
+    if unzip -Z1 "$ZIP" | grep -E '(^|/)(Install|Uninstall)_MiSTer_DVD_Player\.sh'; then
+        echo "ERROR: zip contains installer/uninstaller" >&2
         exit 1
     fi
     sh256 "$ZIP" | awk -v z="$ZIP" '{print $1 "  " z}' > "$SHAFILE"
