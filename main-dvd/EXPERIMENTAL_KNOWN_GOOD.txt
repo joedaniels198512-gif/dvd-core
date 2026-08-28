@@ -1,0 +1,41 @@
+Experimental known-good daemon-free DVD-Player integration
+=========================================================
+
+Hardware-confirmed 2026-08-28 on SS1 (CORENAME=DVD-Player, YUV picture,
+set_seq live, daemon absent). This is NOT the public/RC1 release and
+must not overwrite those artifacts.
+
+Branch: exp/custom-main-dvd-player
+
+Git commits
+-----------
+FPGA (RBF source, ST_ISSUE idle-port restore):
+  1e716f156a53d60856e394ead43ad10de5877674
+  FPGA: restore idle-port YUV line issue; quiet-gate only new fills.
+
+Custom Main (MiSTer_DVD supervisor; spawn-burst still present in this build):
+  6f761150ba2d51ee738b27b9ce8210f04f5d5572
+  Main: defer launcher spawn past init; pin GCC 10.2.1 toolchain; record spawn-burst bug
+
+On-device SHA-256 (working hardware state)
+------------------------------------------
+/media/fat/DVD-Player_YUV_ResetFix_Test.rbf
+  3d841dc03aacfd58e21de8a7f0721d45bbfbf0c5d0b48bed760fa270c74c24f5
+  (GHA run 33175603689; do not overwrite RC1 / public / known-good public RBFs)
+
+/media/fat/MiSTer_DVD
+  c9c68a29e9fa1eddc4a22042c102a910fb816b3be3a3ee8fa6b0ba251ff87807
+
+/media/fat/DVD/dev/dvd_launcher
+  f4fea091a7fdb53200cb5ab9a65c21d051f127ea6fd6e0e6aa0c01f0ce39e58f
+
+/media/fat/DVD/dev/dvd_av_threaded_test
+  beac8ac9cf614aed2f8df5782f1c50378d3501f2974f1fb3b71805cf13d902a3
+
+Untouched public / RC1 references (do not overwrite)
+----------------------------------------------------
+/media/fat/MiSTer_DVD_Player.rbf
+  55e6b114bc34fe1d314ad7ec94e1944627968d44c42e947d13caba23470576ae
+
+/media/fat/_Console/DVD_FPGA_YUV420_Production_RC1.rbf
+  677c42b928eae9c935d6cd9595433100f1a6edcef99f8dd41bc55f17498d7f03
