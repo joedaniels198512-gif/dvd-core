@@ -152,6 +152,7 @@ enum {
 #define MB_YUV_BIT      1            /* mailbox 0x30400000: 1 = planar YUV420 */
 #define MB_INTL_BIT     2            /* mailbox bit2: frame interlaced (not DVD2) */
 #define MB_TFF_BIT      3            /* mailbox bit3: top_field_first reserved */
+#define MB_AR16_BIT     4            /* mailbox bit4: authored 16:9 (0=4:3) */
 #define YUV_Y_OFF       0x000000u
 #define YUV_U_OFF       0x080000u
 #define YUV_V_OFF       0x0A0000u
@@ -1599,7 +1600,8 @@ static int dvd_fpga_yuv_cap(const FBPair *fb)
     return (int)((w >> SET_YUV_CAP_BIT) & 1u);
 }
 
-static uint32_t mailbox_ab_word(int yuv_mode, int ab, int interlaced, int tff)
+static uint32_t mailbox_ab_word(int yuv_mode, int ab, int interlaced, int tff,
+                                int ar16)
 {
     uint32_t w = (uint32_t)(ab & 1);
     if (yuv_mode)
@@ -1608,6 +1610,8 @@ static uint32_t mailbox_ab_word(int yuv_mode, int ab, int interlaced, int tff)
         w |= (1u << MB_INTL_BIT);
     if (tff)
         w |= (1u << MB_TFF_BIT);
+    if (ar16)
+        w |= (1u << MB_AR16_BIT);
     return w;
 }
 
@@ -2668,6 +2672,23 @@ static void clock_reset(AudioClock *c)
     pthread_mutex_unlock(&c->mu);
 }
 
+/*
+ * Mid-title audio stream switch: drop the old origin so clock_us is NOPTS
+ * (video presents without hold) but keep ready=1 so the present thread does
+ * not block in clock_wait_ready.
+ */
+static void clock_rebase_keep_ready(AudioClock *c)
+{
+    pthread_mutex_lock(&c->mu);
+    c->epoch++;
+    c->first_pts_us = AV_NOPTS_VALUE;
+    c->elapsed_us = 0;
+    c->clock_us = AV_NOPTS_VALUE;
+    c->last_apts_us = AV_NOPTS_VALUE;
+    pthread_cond_broadcast(&c->ready_cv);
+    pthread_mutex_unlock(&c->mu);
+}
+
 static unsigned clock_epoch_now(AudioClock *c)
 {
     unsigned e;
@@ -3348,6 +3369,12 @@ struct Player {
     int video_reset_req;
     int audio_reset_req;
     int audio_switch_req;
+    int audio_swap_await_first;
+    int audio_swap_source; /* 0=none 1=authored-nav 2=manual-swap */
+    int dvd_aspect_wide;
+    int dvd_aspect_raw;
+    int dvd_aspect_logged_raw;
+    DVDDomain_t dvd_aspect_domain;
     int current_audio_logical;
     int audio_pending_logical;
     int audio_follow_logical;
@@ -4926,6 +4953,32 @@ static int dvdio_detect_menu(DVDIO *d)
     return 0;
 }
 
+static void dvdio_refresh_aspect(DVDIO *d)
+{
+    uint8_t raw;
+    int wide;
+    Player *p;
+    const char *authored;
+
+    if (!d || !d->nav)
+        return;
+    raw = dvdnav_get_video_aspect(d->nav);
+    wide = (raw == 2) ? 1 : 0;
+    authored = wide ? "16:9" : "4:3";
+    p = d->player;
+    if (p && p->dvd_aspect_logged_raw == (int)raw &&
+        p->dvd_aspect_domain == d->domain)
+        return;
+    fprintf(stderr, "DVD ASPECT: domain=%s authored=%s raw=%u\n",
+            dvd_domain_name(d->domain), authored, (unsigned)raw);
+    if (p) {
+        p->dvd_aspect_wide = wide;
+        p->dvd_aspect_raw = (int)raw;
+        p->dvd_aspect_logged_raw = (int)raw;
+        p->dvd_aspect_domain = d->domain;
+    }
+}
+
 static void dvdio_refresh_program(DVDIO *d)
 {
     int32_t title = 0, pgcn = 0, pgn = 0;
@@ -4937,6 +4990,7 @@ static void dvdio_refresh_program(DVDIO *d)
         d->pgcn = pgcn;
         d->pgn = pgn;
     }
+    dvdio_refresh_aspect(d);
 }
 
 static int dvdio_live_pci(DVDIO *d, pci_t *out)
@@ -8892,7 +8946,7 @@ static void dvd_vm_setstn_audio(vm_cmd_t *cmd, int logical)
 
 static void dvdio_audio_next(DVDIO *d)
 {
-    int cur, next, i, n, idx, valid[8];
+    int cur, next, i, n, idx, valid[8], phys_old, phys_new;
     char lang_from[4], lang_to[4];
     vm_cmd_t cmd;
     user_ops_t uops;
@@ -8942,6 +8996,12 @@ static void dvdio_audio_next(DVDIO *d)
         return;
     }
 
+    phys_old = (cur >= 0) ? (int)dvdnav_get_audio_logical_stream(d->nav, (uint8_t)cur) : -1;
+    phys_new = (int)dvdnav_get_audio_logical_stream(d->nav, (uint8_t)next);
+    fprintf(stderr,
+            "AUDIO SWAP: logical old=%d new=%d physical old=%d new=%d\n",
+            cur, next, phys_old, phys_new);
+
     dvd_audio_lang_code(d->nav, cur, lang_from, sizeof(lang_from));
     dvd_audio_lang_code(d->nav, next, lang_to, sizeof(lang_to));
     if (cur < 0)
@@ -8957,8 +9017,10 @@ static void dvdio_audio_next(DVDIO *d)
                 dvdnav_err_to_string(d->nav));
         return;
     }
-    if (d->player)
+    if (d->player) {
         d->player->audio_pending_logical = next;
+        d->player->audio_swap_source = 2;
+    }
 }
 
 static void dvdio_menu_req_result_if_needed(DVDIO *d, const char *reason)
@@ -10004,6 +10066,13 @@ static int dvdio_pump(DVDIO *d, int32_t event, int32_t len)
                         "AUDIO FOLLOW: ignoring invalid DVD logical stream %d\n",
                         logical);
             } else {
+                if (d->player->audio_swap_source != 2)
+                    d->player->audio_swap_source = 1;
+                fprintf(stderr,
+                        "AUDIO_STREAM_CHANGE: source=%s logical=%d physical=%d\n",
+                        d->player->audio_swap_source == 2
+                            ? "manual-swap" : "authored-nav",
+                        logical, physical);
                 d->player->current_audio_logical = logical;
                 d->player->audio_pending_logical = -1;
                 d->player->audio_follow_logical = logical;
@@ -10293,8 +10362,9 @@ static int dvd_audio_ffmpeg_matches(const AVStream *st, int physical, int dvd_fm
 
 /*
  * After DVDNAV_AUDIO_STREAM_CHANGE, bind FFmpeg to the VM's physical
- * stream. Flush audio packets only; do not touch video, nav_gen, or the
- * MrAudio clock origin.
+ * stream. Flush stale aq packets. The audio thread drops MrAudio fill,
+ * reopens the decoder/SWR, and rebases first_audio_pts from the new
+ * stream. Video, nav_gen, and the DVD are left alone.
  */
 static void player_apply_audio_follow(Player *p)
 {
@@ -10321,8 +10391,10 @@ static void player_apply_audio_follow(Player *p)
     }
     if (found < 0)
         return;
-    fprintf(stderr, "AUDIO FOLLOW: logical=%d physical=%d ffmpeg_stream=#%d "
-            "id=0x%x%s\n",
+    fprintf(stderr, "AUDIO FOLLOW: source=%s logical=%d physical=%d "
+            "ffmpeg_stream=#%d id=0x%x%s\n",
+            p->audio_swap_source == 2 ? "manual-swap" :
+            p->audio_swap_source == 1 ? "authored-nav" : "unknown",
             logical, physical, found,
             fmt->streams[found]->id & 0xffff,
             found == p->ai ? " (already bound)" : "");
@@ -10964,9 +11036,45 @@ static void *audio_thread(void *opaque)
 
         if (p->audio_switch_req) {
             AVCodecContext *nctx;
+            int old_fill = 0;
+            int aq_n;
+
+            if (mr.hw_pace)
+                mraudio_poll(&mr);
+            old_fill = mr.fill > 0 ? mr.fill : 0;
+            aq_n = pktq_count(&p->aq);
+            fprintf(stderr,
+                    "AUDIO SWAP RESET: aq=%d pcm_hold=%d hw_fill=%d "
+                    "first_audio_pts=%" PRId64 " source=%s\n",
+                    aq_n, p->pcm_hold_len, old_fill, p->first_audio_pts_us,
+                    p->audio_swap_source == 2 ? "manual-swap" :
+                    p->audio_swap_source == 1 ? "authored-nav" : "unknown");
 
             p->audio_switch_req = 0;
             p->pcm_hold_len = 0;
+            p->audio_swap_await_first = 1;
+
+            /* Drop queued old-stream PCM immediately. Drain would play it. */
+            mraudio_close(&mr);
+            if (mraudio_open(&mr) < 0) {
+                fprintf(stderr, "AUDIO SWAP: MrAudio reopen failed\n");
+                player_abort(p);
+                goto done;
+            }
+            if (mraudio_prime(&mr) < 0) {
+                fprintf(stderr, "AUDIO SWAP: MrAudio prime failed\n");
+                player_abort(p);
+                goto done;
+            }
+            mr.bytes_origin = mr.bytes_written - mr.prime_bytes;
+            p->buf_mraudio_started = 1;
+
+            clock_rebase_keep_ready(&p->clock);
+            clock_epoch = clock_epoch_now(&p->clock);
+            first_pts_us = AV_NOPTS_VALUE;
+            p->first_audio_pts_us = AV_NOPTS_VALUE;
+            p->last_audio_pts_us = AV_NOPTS_VALUE;
+
             if (adec)
                 avcodec_free_context(&adec);
             if (swr)
@@ -10978,7 +11086,7 @@ static void *audio_thread(void *opaque)
                 goto done;
             }
             adec = nctx;
-            dbg("AUDIO: decoder reopened for stream change (clock kept)\n");
+            dbg("AUDIO: decoder reopened for stream change (clock rebased)\n");
         }
 
         if (pause_should_hold_audio(p)) {
@@ -11089,6 +11197,18 @@ static void *audio_thread(void *opaque)
                 if (first_pts_us == AV_NOPTS_VALUE && pus != AV_NOPTS_VALUE) {
                     first_pts_us = pus;
                     p->first_audio_pts_us = pus;
+                    if (p->audio_swap_await_first) {
+                        int64_t vnow = p->last_video_pts_us;
+                        int64_t dms = 0;
+
+                        if (vnow != AV_NOPTS_VALUE)
+                            dms = (pus - vnow) / 1000;
+                        fprintf(stderr,
+                                "AUDIO SWAP FIRST NEW: pts=%" PRId64
+                                " current_video=%" PRId64 " delta_ms=%" PRId64
+                                "\n",
+                                pus, vnow, dms);
+                    }
                     dbg("First decoded audio PTS: %.6f s\n", pus / 1e6);
                 }
                 if (p->last_audio_pts_us != AV_NOPTS_VALUE &&
@@ -11183,6 +11303,22 @@ static void *audio_thread(void *opaque)
                 clock_publish(&p->clock, first_pts_us, elapsed,
                               p->last_audio_pts_us, mr.fill, mr.hw_pace, ready,
                               clock_epoch);
+                if (p->audio_swap_await_first &&
+                    first_pts_us != AV_NOPTS_VALUE) {
+                    int64_t vnow = p->last_video_pts_us;
+                    int64_t av_ms = 0;
+
+                    if (vnow != AV_NOPTS_VALUE)
+                        av_ms = (first_pts_us + elapsed - vnow) / 1000;
+                    fprintf(stderr,
+                            "AUDIO SWAP RESUME: audio_origin=%" PRId64
+                            " video=%" PRId64 " av_ms=%" PRId64 " source=%s\n",
+                            first_pts_us, vnow, av_ms,
+                            p->audio_swap_source == 2 ? "manual-swap" :
+                            p->audio_swap_source == 1 ? "authored-nav" :
+                            "unknown");
+                    p->audio_swap_await_first = 0;
+                }
                 if (player_buffered(p) && ready)
                     clock_log_master_ready(p, mr.fill, first_pts_us);
             }
@@ -12082,7 +12218,8 @@ static void mailbox_write_request(Player *p, int ab, int interlaced, int tff)
 
     if (!p || !p->fb || !p->fb->mbox)
         return;
-    w = mailbox_ab_word(p->fpga_yuv420, ab, interlaced ? 1 : 0, tff ? 1 : 0);
+    w = mailbox_ab_word(p->fpga_yuv420, ab, interlaced ? 1 : 0, tff ? 1 : 0,
+                        p->dvd_aspect_wide ? 1 : 0);
     p->fb->mbox[0] = w;
     p->last_mbox_word = w;
 }
@@ -15344,6 +15481,7 @@ int main(int argc, char **argv)
     p.audio_follow_logical = -1;
     p.audio_follow_physical = -1;
     p.audio_follow_fmt = -1;
+    p.dvd_aspect_logged_raw = -1;
     p.avf = fmt;
     p.last_audio_pts_us = AV_NOPTS_VALUE;
     p.uncapped_bench = cli.uncapped_video_benchmark ||

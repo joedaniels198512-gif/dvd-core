@@ -6,8 +6,9 @@
  * A2: OSD Play ISO via PLAY_ISO <path> on /tmp/dvd_appliance.cmd.
  * A2.1: Play ISO replaces the current player (SIGTERM, wait for that pid).
  *       ISO files live in the stock SETNAME HomeDir
- *       (games/DVD-Player-Appliance on USB, then SD). This process does
- *       not create USB0 shortcuts or override SelectFile.
+ *       (games/DVD-Player on USB, then SD). This process does
+ *       not create USB core folders or override SelectFile.
+ *       SD fallback /media/fat/games/DVD-Player is created here.
  *
  * States:
  *   NO_DISC / IDLE
@@ -534,6 +535,8 @@ int main(void)
 	mkdir(APPLIANCE_BIN, 0755);
 	mkdir(APPLIANCE_LOG, 0755);
 	mkdir(APPLIANCE_ROOT "/config", 0755);
+	mkdir("/media/fat/games", 0755);
+	mkdir("/media/fat/games/DVD-Player", 0755);
 
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = on_signal;

@@ -6,8 +6,9 @@
  * Isolated Appliance supervisor for the MiSTer_DVD_Appliance Main binary.
  *
  * Activate only when the running executable is MiSTer_DVD_Appliance and the
- * loaded core name (CONF_STR current or original) is DVD-Player-Appliance.
- * The launcher core "DVD-Player" and generic "DVD" must not match.
+ * loaded core name (CONF_STR current or original) is DVD-Player (canonical)
+ * or DVD-Player-Appliance (A2.2 rollback RBF).
+ * The old launcher Main (MiSTer_DVD) and generic "DVD" must not match.
  *
  * This binary must never start /media/fat/DVD/dev/dvd_launcher.
  * It starts /media/fat/DVD_Appliance/bin/dvd_appliance only.

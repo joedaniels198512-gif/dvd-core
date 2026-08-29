@@ -83,15 +83,17 @@ static int exe_is_mister_dvd_appliance(void)
 	return strcasecmp(base, "MiSTer_DVD_Appliance") == 0;
 }
 
-static int name_is_appliance(const char *n)
+static int name_is_dvd_player(const char *n)
 {
-	return n && n[0] && strcasecmp(n, "DVD-Player-Appliance") == 0;
+	return n && n[0] &&
+	       (strcasecmp(n, "DVD-Player") == 0 ||
+	        strcasecmp(n, "DVD-Player-Appliance") == 0);
 }
 
 static int core_is_appliance(void)
 {
-	return name_is_appliance(user_io_get_core_name(0)) ||
-	       name_is_appliance(user_io_get_core_name(1));
+	return name_is_dvd_player(user_io_get_core_name(0)) ||
+	       name_is_dvd_player(user_io_get_core_name(1));
 }
 
 static int pid_alive(pid_t pid)
@@ -257,6 +259,8 @@ static void rotate_appliance_log(void)
 
 	mkdir("/media/fat/DVD_Appliance", 0755);
 	mkdir(DVD_APPLIANCE_LOG_DIR, 0755);
+	mkdir("/media/fat/games", 0755);
+	mkdir("/media/fat/games/DVD-Player", 0755);
 	if (stat(DVD_APPLIANCE_LOG, &st) == 0)
 		rename(DVD_APPLIANCE_LOG, DVD_APPLIANCE_PREV);
 }
@@ -295,6 +299,8 @@ static int spawn_appliance(int rotate)
 
 	mkdir("/media/fat/DVD_Appliance", 0755);
 	mkdir(DVD_APPLIANCE_LOG_DIR, 0755);
+	mkdir("/media/fat/games", 0755);
+	mkdir("/media/fat/games/DVD-Player", 0755);
 	if (rotate)
 		rotate_appliance_log();
 
@@ -535,7 +541,7 @@ void dvd_main_on_core_ready(void)
 		g_halt_respawn = 0;
 		g_fail_count = 0;
 		g_last_start_ts = 0;
-		printf("APPLIANCE_MAIN: DVD-Player-Appliance session begin\n");
+		printf("APPLIANCE_MAIN: DVD-Player session begin\n");
 	}
 
 	if (owned_child_live())

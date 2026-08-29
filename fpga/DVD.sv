@@ -64,6 +64,7 @@ assign BUTTONS = 0;
 //   bit1 = pixel format (0=legacy BGR0, 1=planar YUV420)
 //   bit2 = frame interlaced_frame (chroma row map; latched with A/B)
 //   bit3 = top_field_first RESERVED (latched, unused for field order)
+//   bit4 = authored 16:9 (0=4:3). Used when OSD Aspect=Auto.
 // The core polls that 64-bit word every 16384 cycles of 27 MHz clk_sys
 // (~0.61 ms). mb_* always hold the latest observed request.
 // display_buf/yuv/intl/tff latch that word together at the native
@@ -105,14 +106,14 @@ assign BUTTONS = 0;
 //   OSD 0 ms keeps the hardware-approved baseline (--video-advance-ms 20).
 //   +N presents video N ms earlier vs audio; -N presents it later.
 // Canonical core identity. Field 0 becomes orig_name and default core_name
-// (/tmp/CORENAME, /tmp/RBFNAME, MiSTer.ini [DVD-Player-Appliance],
-// games/DVD-Player-Appliance). Separate from the launcher core "DVD-Player".
-// Must not be generic "DVD" — that name is already used by another core.
+// SETNAME DVD-Player: MiSTer.ini [DVD-Player], HomeDir games/DVD-Player.
+// RBF filename is DVD_Player.rbf. Isolated from the old launcher Main
+// (MiSTer_DVD) by shipping MiSTer_DVD_Appliance as this core's Main.
 localparam CONF_STR = {
-	"DVD-Player-Appliance;;",
+	"DVD-Player;;",
 	"F0,ISO,Play ISO...;",
 	"-;",
-	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
+	"O[122:121],Aspect,Auto,4:3,16:9,Auto;",
 	"O[2:1],TV Mode,Auto,NTSC,PAL;",
 	"O[9],CRT,Native,Stabilized;",
 	"O[17:12],A/V Sync,0 ms,+5 ms,+10 ms,+15 ms,+20 ms,+25 ms,+30 ms,+35 ms,+40 ms,+45 ms,+50 ms,+55 ms,+60 ms,+65 ms,+70 ms,+75 ms,+80 ms,+85 ms,+90 ms,+95 ms,+100 ms,-100 ms,-95 ms,-90 ms,-85 ms,-80 ms,-75 ms,-70 ms,-65 ms,-60 ms,-55 ms,-50 ms,-45 ms,-40 ms,-35 ms,-30 ms,-25 ms,-20 ms,-15 ms,-10 ms,-5 ms;",
@@ -146,7 +147,7 @@ localparam CONF_STR = {
 	// falls back to Select. No L2/R2 token exists in the framework.
 	"jn,A,B,Start,X,L,R,Y,Select;",
 	"jp,A,B,Start,X,L,R,Y,Select;",
-	"v,3;", // bumped: CRT Native/Stabilized naming + 5 ms A/V Sync wheel
+	"v,4;", // bumped: SETNAME DVD-Player + Aspect Auto/4:3/16:9
 	"V,v",`BUILD_DATE 
 };
 
@@ -185,10 +186,14 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 	.ps2_key(ps2_key)
 );
 
+reg        mb_ar16 = 0; /* mailbox bit4: authored 16:9; latched in ST_RD_MB_W */
 wire [1:0] ar = status[122:121];
+wire       ar_auto     = (ar == 2'd0) || (ar == 2'd3);
+wire       ar_force169 = (ar == 2'd2);
+wire       ar_wide     = ar_force169 || (ar_auto && mb_ar16);
 
-assign VIDEO_ARX = (!ar) ? 12'd4 : (ar - 1'd1);
-assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
+assign VIDEO_ARX = ar_wide ? 12'd16 : 12'd4;
+assign VIDEO_ARY = ar_wide ? 12'd9  : 12'd3;
 
 ///////////////////////   RESET   ////////////////////////////////
 
@@ -216,6 +221,7 @@ wire reset = rst_sync[1] | (|rst_settle);
 // 0x30400000 bit1 = ARM→FPGA pixel format (0=legacy BGR0, 1=planar YUV420).
 // 0x30400000 bit2 = ARM→FPGA frame interlaced_frame (latched with bit0).
 // 0x30400000 bit3 = ARM→FPGA top_field_first RESERVED (latched, unused).
+// 0x30400000 bit4 = ARM→FPGA authored 16:9 (0=4:3) for OSD Aspect=Auto.
 // 0x30400008       = FPGA→ARM {JOY_MAGIC, display_buf, joystick_0[30:0]}.
 // 0x30400010       = FPGA→ARM settings/capability (DVD2). Never written by ARM.
 // 0x30400018       = ARM→FPGA source-standard control (DVD3). FPGA reads only.
@@ -405,6 +411,7 @@ always @(posedge clk_sys) begin
 					mb_yuv  <= DDRAM_DOUT[1];
 					mb_intl <= DDRAM_DOUT[2];
 					mb_tff  <= DDRAM_DOUT[3];
+					mb_ar16 <= DDRAM_DOUT[4];
 					ctl_due <= 1'b1;
 					set_due <= 1'b1;
 					mb_st  <= ST_IDLE;
