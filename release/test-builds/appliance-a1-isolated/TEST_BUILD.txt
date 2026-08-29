@@ -1,0 +1,5 @@
+Name: Appliance A1 isolated (true parallel core)
+Source: feature/appliance-mode 81dcfef (CONF_STR) from 162f894 checkpoint
+FPGA: GitHub Actions run 33249638079 (raetro/quartus:17.0) PASS
+CONF_STR: DVD-Player-Appliance
+Player: known-good Test 9.3.1 binary, not rebuilt
