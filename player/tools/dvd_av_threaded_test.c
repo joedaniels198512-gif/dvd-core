@@ -243,6 +243,7 @@ typedef struct {
 #define NAV_WAIT_FIFO_US    400000
 #define STILL_DRAIN_WAIT_US 750000
 #define VQ_MARK_STILL_BOUNDARY ((void *)(uintptr_t)0x53544c42u) /* STLB */
+#define VQ_MARK_FIRSTPIC       ((void *)(uintptr_t)0x46504943u) /* FPIC */
 #define ACK_TIMEOUT_US       200000   /* warning; keep waiting for ownership */
 #define ACK_HARD_TIMEOUT_US  2000000  /* stuck FPGA / forced Buffer B / etc */
 #define ACK_REISSUE_MIN_US   25000
@@ -693,6 +694,8 @@ typedef struct {
     int menu_req_saw_cell;
     int menu_req_entered;
     int menu_req_notrans_logged;
+    unsigned menu_req_nav_gen;
+    unsigned menu_req_cell_nav_gen;
     int64_t menu_req_t0_us;
     int64_t menu_req_prev_t0_us;
 } DVDIO;
@@ -703,8 +706,13 @@ static void dvdio_handle_still(DVDIO *d, int length);
 static void dvdio_handle_wait(DVDIO *d);
 static void dvdio_note_mpeg_return(DVDIO *d, int n);
 static int player_menu_has_frame(Player *p);
+static int player_presentable_count(Player *p);
+static int player_oneframe_still(const Player *p);
+static int dvdio_buttons_active(DVDIO *d);
 static void player_request_still_drain(Player *p);
 static void player_wait_still_drain(Player *p, DVDIO *d);
+static void player_request_firstpic_drain(Player *p);
+static void dvdio_menu_req_try_resolve(DVDIO *d);
 static void prefill_release(Player *p, const char *reason);
 static int prefill_is_released(Player *p);
 static int player_first_video_ready(const Player *p);
@@ -767,12 +775,12 @@ static int dvdio_soft_media_boundary_return(DVDIO *d, int out)
     if (out > 0) {
         crash_where(CRASH_AVIO_READ);
         fprintf(stderr,
-                "AVIO MEDIA BOUNDARY: returning old-cell bytes before "
-                "SOFT hop out=%d\n",
+                "SOFT MEDIA BOUNDARY: AVIO old-only bytes=%d\n",
                 out);
         dvdio_note_mpeg_return(d, out);
         return out;
     }
+    fprintf(stderr, "SOFT MEDIA BOUNDARY: AVIO EOF\n");
     return AVERROR_EOF;
 }
 
@@ -2357,6 +2365,22 @@ static int yuvring_count(YuvRing *r)
     return n;
 }
 
+static int yuvring_count_gen(YuvRing *r, unsigned gen)
+{
+    int n = 0, i, idx;
+
+    if (!r || !r->inited)
+        return 0;
+    pthread_mutex_lock(&r->mu);
+    for (i = 0; i < r->count; i++) {
+        idx = (r->head + i) % r->cap;
+        if (r->slots[idx].nav_gen == gen)
+            n++;
+    }
+    pthread_mutex_unlock(&r->mu);
+    return n;
+}
+
 static int yuvring_begin_produce(YuvRing *r, int *idx_out, unsigned *epoch_out,
                                  Player *p)
 {
@@ -3103,6 +3127,7 @@ struct Player {
         int redraw;
         int in_menu;
         int still;
+        int interactive;
         int inited;
     } hl;
     struct {
@@ -3281,6 +3306,17 @@ struct Player {
         int64_t vframe_us;
     } rawpts;
     int mraudio_gate_logged;
+    int bootstrap_hol_relief;
+    unsigned bootstrap_hol_wait_gen;
+    unsigned bootstrap_hol_relief_gen;
+    unsigned firstpic_vpkt_gen;
+    unsigned firstpic_log_gen;
+    unsigned firstpic_drain_req_gen;
+    unsigned firstpic_drained_gen;
+    int firstpic_parser_out;
+    int firstpic_sent;
+    int firstpic_last_send;
+    int firstpic_last_recv;
     int video_fmt_logged;
     unsigned video_fmt_codec_gen;
     unsigned video_init_n;
@@ -3300,6 +3336,14 @@ struct Player {
     unsigned flush_n;
     int in_menu;
     int still_active;
+    int interactive_still;
+    int hli_still_logged;
+    unsigned initial_skip_bypass_log_gen;
+    unsigned initial_skip_drop_log_gen;
+    int soft_audio_reset;
+    int soft_video_reset;
+    unsigned soft_stale_drop_audio_gen;
+    unsigned soft_stale_drop_video_gen;
     int menu_still_drop;
     int video_reset_req;
     int audio_reset_req;
@@ -3442,6 +3486,7 @@ struct Player {
     int pcm_hold_len;
     int pcm_hold_cap;
     int64_t pcm_hold_discarded;
+    int64_t pcm_hold_discarded_this_gen;
     int pcm_hold_at_release;
     int pcm_hold_used;
     int64_t first_audio_pts_us;
@@ -3538,6 +3583,25 @@ static unsigned player_nav_gen(const Player *p)
 static unsigned player_codec_gen(const Player *p)
 {
     return __atomic_load_n(&p->codec_gen, __ATOMIC_SEQ_CST);
+}
+
+static int player_oneframe_still(const Player *p)
+{
+    return p && (p->still_active || p->interactive_still);
+}
+
+static int player_presentable_count(Player *p)
+{
+    unsigned gen;
+
+    if (!p)
+        return 0;
+    gen = player_nav_gen(p);
+    if (p->buffered_yuv)
+        return yuvring_count_gen(&p->yuvring, gen);
+    if (p->buffered_video)
+        return vidring_count(&p->vring);
+    return 0;
 }
 
 static void rawpts_sync_gen(Player *p)
@@ -3955,6 +4019,12 @@ static void player_note_first_video_presented(Player *p, unsigned frame_gen,
             "wall_us=%" PRId64 " vpts=%" PRId64 "\n",
             g, player_codec_gen(p), av_gettime_relative(),
             vpts_us == AV_NOPTS_VALUE ? (int64_t)-1 : vpts_us);
+    if (p->bootstrap_hol_relief)
+        fprintf(stderr,
+                "VIDEO BOOTSTRAP HOL: first VFRAME acquired nav_gen=%u "
+                "hold=%d discarded_this_gen=%" PRId64 " discarded=%" PRId64 "\n",
+                g, p->pcm_hold_len, p->pcm_hold_discarded_this_gen,
+                p->pcm_hold_discarded);
     player_wake_mraudio_gate(p);
 }
 
@@ -3967,11 +4037,17 @@ static inline void crash_enter(int w, const Player *p)
     __atomic_store_n(&g_crash_codec_gen, player_codec_gen(p), __ATOMIC_RELAXED);
 }
 
+static int pkt_is_vq_marker(const AVPacket *pkt)
+{
+    return pkt && (pkt->opaque == VQ_MARK_STILL_BOUNDARY ||
+                   pkt->opaque == VQ_MARK_FIRSTPIC);
+}
+
 static int pkt_is_stale_codec_gen(const AVPacket *pkt, unsigned now)
 {
     uintptr_t op;
 
-    if (!pkt || pkt->opaque == VQ_MARK_STILL_BOUNDARY)
+    if (pkt_is_vq_marker(pkt))
         return 0;
     op = (uintptr_t)pkt->opaque;
     if (op == 0)
@@ -3982,7 +4058,7 @@ static int pkt_is_stale_codec_gen(const AVPacket *pkt, unsigned now)
 static int pkt_is_stale_nav_gen(const AVPacket *pkt, uint32_t pkt_nav_gen,
                                 unsigned now)
 {
-    if (!pkt || pkt->opaque == VQ_MARK_STILL_BOUNDARY)
+    if (pkt_is_vq_marker(pkt))
         return 0;
     if (pkt_nav_gen == 0)
         return 0;
@@ -4333,6 +4409,32 @@ static int vq_apply_hol_escape(Player *p, int vq_n, int aq_n)
     return escape ? VIDEO_Q_HARD_CAP : VIDEO_Q_SOFT_CAP;
 }
 
+/* Test 9.3: wake the video thread to flush a parser-held / decoder-delayed
+ * first MPEG-2 picture. Do not request until this generation has consumed
+ * a real VPKT and vq is empty — otherwise a movie GOP may still be arriving. */
+static void player_request_firstpic_drain(Player *p)
+{
+    unsigned gen;
+
+    if (!p || !player_buffered(p) || p->fail || g_interrupt)
+        return;
+    if (player_first_video_ready(p))
+        return;
+    gen = player_nav_gen(p);
+    if (p->firstpic_drain_req_gen == gen || p->firstpic_drained_gen == gen)
+        return;
+    if (__atomic_load_n(&p->frames_this_nav_gen, __ATOMIC_SEQ_CST) > 0)
+        return;
+    if (__atomic_load_n(&p->firstpic_vpkt_gen, __ATOMIC_SEQ_CST) != gen)
+        return;
+    if (!(p->in_menu || p->still_active || p->interactive_still))
+        return;
+    if (pktq_count(&p->vq) > 0)
+        return;
+    p->firstpic_drain_req_gen = gen;
+    pktq_push_marker(&p->vq, VQ_MARK_FIRSTPIC, gen);
+}
+
 static int player_pktq_push(Player *p, PktQ *q, AVPacket *src)
 {
     int64_t t0 = 0;
@@ -4369,6 +4471,23 @@ static int player_pktq_push(Player *p, PktQ *q, AVPacket *src)
             pause_thr_set(&p->pause.st_demux, THR_QFULL);
             __atomic_store_n(&p->demux_wait_full,
                              q == &p->aq ? 2 : 1, __ATOMIC_RELAXED);
+            if (q == &p->aq && !player_first_video_ready(p)) {
+                unsigned gen = player_nav_gen(p);
+
+                if (p->bootstrap_hol_wait_gen != gen) {
+                    p->bootstrap_hol_wait_gen = gen;
+                    fprintf(stderr,
+                            "VIDEO BOOTSTRAP HOL: waiting first VFRAME "
+                            "aq=%d/%d vq=%d yuv=%d discarded_this_gen=%" PRId64 "\n",
+                            q->count, AUDIO_Q_CAP,
+                            pktq_count(&p->vq),
+                            p->buffered_yuv ? yuvring_count(&p->yuvring) : 0,
+                            p->pcm_hold_discarded_this_gen);
+                }
+                pthread_mutex_unlock(&q->mu);
+                player_request_firstpic_drain(p);
+                pthread_mutex_lock(&q->mu);
+            }
             if (q == &p->vq && q->count >= VIDEO_Q_HARD_CAP &&
                 !p->vq_hol_hard_logged) {
                 p->vq_hol_hard_logged = 1;
@@ -5459,7 +5578,7 @@ static void menu_overlay_rebuild_tile(Player *p, int vis, int sx, int sy,
 static void menu_overlay_composite(Player *p, uint8_t *dst, int stride,
                                    int frame_menu)
 {
-    int vis, in_menu, sx, sy, ex, ey, activated, i, n;
+    int vis, in_menu, interactive, sx, sy, ex, ey, activated, i, n;
     unsigned hl_gen;
     uint32_t pal, pal_act;
     unsigned bbox;
@@ -5472,6 +5591,7 @@ static void menu_overlay_composite(Player *p, uint8_t *dst, int stride,
     pthread_mutex_lock(&p->hl.mu);
     vis = p->hl.visible;
     in_menu = p->hl.in_menu;
+    interactive = p->hl.interactive;
     hl_gen = p->hl.gen;
     sx = p->hl.sx;
     sy = p->hl.sy;
@@ -5482,7 +5602,8 @@ static void menu_overlay_composite(Player *p, uint8_t *dst, int stride,
     activated = p->hl.activated;
     pthread_mutex_unlock(&p->hl.mu);
 
-    if (!in_menu || !frame_menu || hl_gen != player_nav_gen(p))
+    if ((!in_menu && !interactive) || !frame_menu ||
+        hl_gen != player_nav_gen(p))
         return;
 
     if (activated && pal_act)
@@ -7639,7 +7760,7 @@ static int movie_sub_overlay_yuv(Player *p, AVFrame *dst, int64_t pvpts_us,
 static int menu_overlay_composite_yuv(Player *p, AVFrame *dst, int frame_menu,
                                       int64_t *blend_us_out)
 {
-    int vis, in_menu, sx, sy, ex, ey, activated, i, n;
+    int vis, in_menu, interactive, sx, sy, ex, ey, activated, i, n;
     unsigned hl_gen;
     uint32_t pal, pal_act;
     unsigned bbox;
@@ -7661,6 +7782,7 @@ static int menu_overlay_composite_yuv(Player *p, AVFrame *dst, int frame_menu,
     pthread_mutex_lock(&p->hl.mu);
     vis = p->hl.visible;
     in_menu = p->hl.in_menu;
+    interactive = p->hl.interactive;
     hl_gen = p->hl.gen;
     sx = p->hl.sx;
     sy = p->hl.sy;
@@ -7671,7 +7793,8 @@ static int menu_overlay_composite_yuv(Player *p, AVFrame *dst, int frame_menu,
     activated = p->hl.activated;
     pthread_mutex_unlock(&p->hl.mu);
 
-    if (!in_menu || !frame_menu || hl_gen != player_nav_gen(p))
+    if ((!in_menu && !interactive) || !frame_menu ||
+        hl_gen != player_nav_gen(p))
         return 0;
 
     if (activated && pal_act)
@@ -7772,7 +7895,8 @@ static int fpga_yuv_present_planes(Player *p, AVFrame *frame, uint8_t *slot,
      * Hardware (PAL 25 movie SPU): scratch copy ~1.65 ms mean.
      * Do not add line-overlay or FPGA composition.
      */
-    if ((frame_menu || p->in_menu) && !g_debug_yellow_highlight) {
+    if ((frame_menu || p->in_menu || p->interactive_still) &&
+        !g_debug_yellow_highlight) {
         t0 = av_gettime_relative();
         if (yuv_sub_ensure_scratch(p, frame) < 0)
             return -1;
@@ -7790,6 +7914,14 @@ static int fpga_yuv_present_planes(Player *p, AVFrame *frame, uint8_t *slot,
         src = p->yuv_sub_scratch;
         if (blended > 0 && sub_active)
             *sub_active = 1;
+        if (blended > 0 && !p->in_menu && p->interactive_still &&
+            !p->hli_still_logged) {
+            p->hli_still_logged = 1;
+            fprintf(stderr,
+                    "HLI: compose allowed on VTS interactive still  "
+                    "in_menu=0 frame_menu=%d buttons=%d\n",
+                    frame_menu, p->hl.btn_ns);
+        }
         if (blended > 0 && t_comp >= 0 && p->spu_perf.menu_frames == 0)
             fprintf(stderr,
                     "FPGA YUV HLI: compose_us=%" PRId64
@@ -7797,7 +7929,7 @@ static int fpga_yuv_present_planes(Player *p, AVFrame *frame, uint8_t *slot,
                     t_comp, t_copy1 - t0);
     } else if (p->fpga_yuv420_subtitles &&
         __atomic_load_n(&p->subtitle_enabled, __ATOMIC_RELAXED) &&
-        !frame_menu && !p->in_menu &&
+        !frame_menu && !p->in_menu && !p->interactive_still &&
         movie_sub_would_be_visible(p, vpts_us)) {
         t0 = av_gettime_relative();
         if (yuv_sub_ensure_scratch(p, frame) < 0)
@@ -7841,9 +7973,12 @@ static void menu_hl_clear(Player *p)
     p->hl.activated = 0;
     p->hl.palette = 0;
     p->hl.palette_act = 0;
+    p->hl.interactive = 0;
     pthread_mutex_unlock(&p->hl.mu);
     p->in_menu = 0;
     p->still_active = 0;
+    p->interactive_still = 0;
+    p->hli_still_logged = 0;
     p->menu_still_drop = 1;
     menu_spu_invalidate(p, "menu exit");
 }
@@ -7878,6 +8013,8 @@ static void dvdio_apply_highlight(DVDIO *d, int log_event)
     dvdnav_highlight_area_t area_act;
     int btn_ns = 0;
     int in_menu;
+    int interactive = 0;
+    int hli_ok;
 
     if (!d->nav)
         return;
@@ -7886,6 +8023,9 @@ static void dvdio_apply_highlight(DVDIO *d, int log_event)
         in_menu = 0;
     if (d->pci_valid)
         btn_ns = d->pci.hli.hl_gi.btn_ns & 0x3f;
+    interactive = !in_menu && p && p->interactive_still &&
+                  dvdio_buttons_active(d);
+    hli_ok = in_menu || interactive;
     if (dvdnav_get_current_highlight(d->nav, &button) != DVDNAV_STATUS_OK)
         button = 0;
     memset(&area, 0, sizeof(area));
@@ -7908,8 +8048,9 @@ static void dvdio_apply_highlight(DVDIO *d, int log_event)
                   (p->hl.sx != (int)area.sx) || (p->hl.sy != (int)area.sy) ||
                   (p->hl.ex != (int)area.ex) || (p->hl.ey != (int)area.ey) ||
                   (p->hl.palette != area.palette) ||
-                  (p->hl.in_menu != in_menu);
-        p->hl.visible = in_menu && button > 0 &&
+                  (p->hl.in_menu != in_menu) ||
+                  (p->hl.interactive != interactive);
+        p->hl.visible = hli_ok && button > 0 &&
                         (area.ex > area.sx) && (area.ey > area.sy);
         p->hl.button = (int)button;
         p->hl.btn_ns = btn_ns;
@@ -7924,11 +8065,12 @@ static void dvdio_apply_highlight(DVDIO *d, int log_event)
         p->hl.activated = 0;
         p->hl.gen = player_nav_gen(p);
         p->hl.in_menu = in_menu;
+        p->hl.interactive = interactive;
         p->hl.still = d->still_len != 0;
         pthread_mutex_unlock(&p->hl.mu);
         p->in_menu = in_menu;
         p->still_active = d->still_len != 0;
-        if (in_menu && changed) {
+        if (hli_ok && changed) {
             menu_tile_mark_dirty(p);
             menu_hl_request_redraw(p);
             spu_dbg("HLI: buttons=%d selected=%d\n"
@@ -7966,6 +8108,8 @@ static void player_mpegps_hard_boundary(Player *p, DVDIO *d, AVFormatContext *fm
         d->hop_pending = 0;
     if (p)
         p->demux_reopen_req = 0;
+    if (d)
+        dvdio_menu_req_try_resolve(d);
     if (fmt && fmt->pb) {
         fmt->pb->eof_reached = 0;
         fmt->pb->error = 0;
@@ -7993,6 +8137,8 @@ static void player_mpegps_soft_boundary(Player *p, DVDIO *d, AVFormatContext *fm
     crash_enter(CRASH_AV_READ_FRAME, p);
     if (d)
         d->soft_media_boundary_pending = 0;
+    if (d)
+        dvdio_menu_req_try_resolve(d);
     if (fmt && fmt->pb) {
         fmt->pb->eof_reached = 0;
         fmt->pb->error = 0;
@@ -8002,6 +8148,9 @@ static void player_mpegps_soft_boundary(Player *p, DVDIO *d, AVFormatContext *fm
     if (fmt)
         avformat_flush(fmt);
     if (p) {
+        fprintf(stderr,
+                "SOFT MEDIA BOUNDARY: avformat_flush complete nav_gen=%u\n",
+                player_nav_gen(p));
         fprintf(stderr,
                 "NAV: MPEG-PS SOFT media flush (%s) nav_gen=%u codec_gen=%u "
                 "(same AVIO/VTS, codecpar kept)\n",
@@ -8042,6 +8191,17 @@ static void player_nav_discontinuity(Player *p, const char *why)
     clock_reset(&p->clock);
     p->buf_mraudio_started = 0;
     p->mraudio_gate_logged = 0;
+    p->bootstrap_hol_relief = 0;
+    p->bootstrap_hol_wait_gen = 0;
+    p->bootstrap_hol_relief_gen = 0;
+    p->firstpic_parser_out = 0;
+    p->firstpic_sent = 0;
+    p->firstpic_last_send = 0;
+    p->firstpic_last_recv = 0;
+    p->firstpic_log_gen = 0;
+    p->firstpic_drain_req_gen = 0;
+    p->firstpic_drained_gen = 0;
+    __atomic_store_n(&p->firstpic_vpkt_gen, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&p->first_video_presented_gen, 0, __ATOMIC_SEQ_CST);
     p->first_mbox_nav_gen = 0;
     p->clock_bootstrapped = 0;
@@ -8052,6 +8212,9 @@ static void player_nav_discontinuity(Player *p, const char *why)
     __atomic_store_n(&p->vq_hol_escape, 0, __ATOMIC_RELAXED);
     p->vq_hol_hard_logged = 0;
     p->pcm_hold_len = 0;
+    p->pcm_hold_discarded_this_gen = 0;
+    p->interactive_still = 0;
+    p->hli_still_logged = 0;
     p->first_audio_pts_us = AV_NOPTS_VALUE;
     p->last_audio_pts_us = AV_NOPTS_VALUE;
     p->last_video_pts_us = AV_NOPTS_VALUE;
@@ -8095,13 +8258,22 @@ static void player_nav_soft_reset(Player *p, const char *reason,
                                   const char *old_pos, const char *new_pos,
                                   int pending_avio)
 {
+    unsigned old_nav;
     int n_a = 0, n_v = 0, n_y = 0;
     unsigned gen;
 
     if (!p)
         return;
     pause_cancel(p);
+    old_nav = player_nav_gen(p);
+    n_a = pktq_count(&p->aq);
+    n_v = pktq_count(&p->vq);
+    n_y = p->buffered_yuv ? yuvring_count(&p->yuvring) : 0;
     gen = __atomic_add_fetch(&p->nav_gen, 1, __ATOMIC_SEQ_CST);
+    fprintf(stderr,
+            "SOFT MEDIA BOUNDARY: begin old_nav=%u new_nav=%u "
+            "aq=%d vq=%d yuv=%d\n",
+            old_nav, gen, n_a, n_v, n_y);
     __atomic_store_n(&p->frames_this_nav_gen, 0, __ATOMIC_SEQ_CST);
     p->still_drain_req = 0;
     p->still_drain_done = 0;
@@ -8123,9 +8295,22 @@ static void player_nav_soft_reset(Player *p, const char *reason,
     p->soft_log_yuv = 1;
     p->video_reset_req = 1;
     p->audio_reset_req = 1;
+    p->soft_audio_reset = 1;
+    p->soft_video_reset = 1;
     clock_reset(&p->clock);
     p->buf_mraudio_started = 0;
     p->mraudio_gate_logged = 0;
+    p->bootstrap_hol_relief = 0;
+    p->bootstrap_hol_wait_gen = 0;
+    p->bootstrap_hol_relief_gen = 0;
+    p->firstpic_parser_out = 0;
+    p->firstpic_sent = 0;
+    p->firstpic_last_send = 0;
+    p->firstpic_last_recv = 0;
+    p->firstpic_log_gen = 0;
+    p->firstpic_drain_req_gen = 0;
+    p->firstpic_drained_gen = 0;
+    __atomic_store_n(&p->firstpic_vpkt_gen, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&p->first_video_presented_gen, 0, __ATOMIC_SEQ_CST);
     p->first_mbox_nav_gen = 0;
     p->clock_bootstrapped = 0;
@@ -8136,6 +8321,9 @@ static void player_nav_soft_reset(Player *p, const char *reason,
     __atomic_store_n(&p->vq_hol_escape, 0, __ATOMIC_RELAXED);
     p->vq_hol_hard_logged = 0;
     p->pcm_hold_len = 0;
+    p->pcm_hold_discarded_this_gen = 0;
+    p->interactive_still = 0;
+    p->hli_still_logged = 0;
     p->first_audio_pts_us = AV_NOPTS_VALUE;
     p->last_audio_pts_us = AV_NOPTS_VALUE;
     p->last_video_pts_us = AV_NOPTS_VALUE;
@@ -8189,6 +8377,21 @@ static void dvdio_snapshot_pci(DVDIO *d)
     d->pci_gen = d->player ? player_nav_gen(d->player) : 0;
 }
 
+static int dvdio_buttons_active(DVDIO *d)
+{
+    int btn_ns, hli_ss;
+
+    if (!d || !d->nav)
+        return 0;
+    if (!d->pci_valid)
+        dvdio_snapshot_pci(d);
+    if (!d->pci_valid)
+        return 0;
+    btn_ns = d->pci.hli.hl_gi.btn_ns & 0x3f;
+    hli_ss = d->pci.hli.hl_gi.hli_ss & 0x03;
+    return btn_ns > 0 && hli_ss != 0;
+}
+
 static int dvdio_nav_status(dvdnav_t *nav, dvdnav_status_t st, const char *what)
 {
     if (st == DVDNAV_STATUS_OK)
@@ -8239,6 +8442,27 @@ static void dvdio_menu_resume(DVDIO *d)
         dvdio_end_local_still(d);
         /* Domain change / HOP performs leave_menu + discontinuity. */
     }
+}
+
+static int dvdio_activation_unresolved(DVDIO *d)
+{
+    Player *p;
+
+    if (!d)
+        return 1;
+    dvdio_menu_req_try_resolve(d);
+    if (d->hop_pending || d->soft_media_boundary_pending)
+        return 1;
+    p = d->player;
+    if (p && (p->demux_reopen_req || p->audio_reset_req || p->video_reset_req))
+        return 1;
+    /* menu_call returned OK but HOP/VTS/CELL has not reached the player.
+     * libdvdnav VM may already have moved; activating a PCI button here
+     * can assert in process_command. */
+    if (d->menu_req_id && d->menu_req_call_ok && !d->menu_req_entered &&
+        !d->menu_req_notrans_logged)
+        return 1;
+    return 0;
 }
 
 static void dvdio_activate_button(DVDIO *d)
@@ -8770,6 +8994,39 @@ static void dvdio_menu_req_timeout_check(DVDIO *d)
     dvdio_menu_req_result_if_needed(d, "no_nav_event_after_2000ms");
 }
 
+static void dvdio_menu_req_try_resolve(DVDIO *d)
+{
+    Player *p;
+    unsigned gen;
+
+    if (!d || !d->menu_req_id || d->menu_req_entered)
+        return;
+    if (!d->menu_req_call_ok)
+        return;
+    /* call_ok alone is not enough — the original crash was VM already
+     * moved with no player-side HOP/VTS/CELL yet. */
+    if (!d->menu_req_saw_cell)
+        return;
+    if (d->hop_pending || d->soft_media_boundary_pending)
+        return;
+    p = d->player;
+    if (p && (p->demux_reopen_req || p->audio_reset_req || p->video_reset_req))
+        return;
+    gen = p ? player_nav_gen(p) : 0;
+    if (d->menu_req_cell_nav_gen && d->menu_req_nav_gen &&
+        d->menu_req_cell_nav_gen < d->menu_req_nav_gen)
+        return;
+    d->menu_req_entered = 1;
+    fprintf(stderr,
+            "MENU REQUEST id=%u resolved nav_gen=%u domain=%s "
+            "saw_hop=%d saw_vts=%d saw_cell=%d\n",
+            d->menu_req_id, gen, dvd_domain_name(d->domain),
+            d->menu_req_saw_hop, d->menu_req_saw_vts, d->menu_req_saw_cell);
+    fprintf(stderr,
+            "CONTROLLER: activation guard released menu_req=%u nav_gen=%u\n",
+            d->menu_req_id, gen);
+}
+
 static void dvdio_menu_req_event(DVDIO *d, const char *ev, int in_menu_now)
 {
     if (!d || !d->menu_req_id || !ev)
@@ -8782,9 +9039,12 @@ static void dvdio_menu_req_event(DVDIO *d, const char *ev, int in_menu_now)
         if (!d->menu_req_saw_hop && !in_menu_now)
             return;
         d->menu_req_saw_cell = 1;
+        if (d->player)
+            d->menu_req_cell_nav_gen = player_nav_gen(d->player);
     }
     fprintf(stderr, "MENU REQUEST id=%u event=%s in_menu=%d\n",
             d->menu_req_id, ev, in_menu_now);
+    dvdio_menu_req_try_resolve(d);
 }
 
 static dvdnav_status_t dvdio_menu_call_traced(DVDIO *d, DVDMenuID_t menu)
@@ -8875,8 +9135,11 @@ static void dvdio_exec_nav_cmd(DVDIO *d, NavCmd cmd)
     in_menu = dvdio_detect_menu(d);
     if (d->player)
         d->player->ctrl_exec_n++;
-    fprintf(stderr, "CONTROLLER ACTION cmd=%d in_menu=%d nav_gen=%u exec=%u\n",
+    fprintf(stderr, "CONTROLLER ACTION cmd=%d in_menu=%d interactive=%d "
+            "buttons=%d nav_gen=%u exec=%u\n",
             (int)cmd, in_menu,
+            d->player ? d->player->interactive_still : 0,
+            dvdio_buttons_active(d),
             d->player ? player_nav_gen(d->player) : 0,
             d->player ? d->player->ctrl_exec_n : 0);
 
@@ -8915,6 +9178,8 @@ static void dvdio_exec_nav_cmd(DVDIO *d, NavCmd cmd)
         d->menu_req_saw_cell = 0;
         d->menu_req_entered = 0;
         d->menu_req_notrans_logged = 0;
+        d->menu_req_nav_gen = d->player ? player_nav_gen(d->player) : 0;
+        d->menu_req_cell_nav_gen = 0;
         d->menu_req_t0_us = now;
         dvdio_refresh_program(d);
         dvdio_log_menu_request(d, in_menu);
@@ -8972,8 +9237,13 @@ static void dvdio_exec_nav_cmd(DVDIO *d, NavCmd cmd)
     case NAVCMD_DOWN:
     case NAVCMD_LEFT:
     case NAVCMD_RIGHT:
-        if (!in_menu)
+        if (!dvdio_buttons_active(d))
             break;
+        if (!in_menu && d->player && d->player->interactive_still)
+            fprintf(stderr,
+                    "CONTROLLER: accepted on VTS interactive still  cmd=%d "
+                    "buttons=%d\n",
+                    (int)cmd, d->pci.hli.hl_gi.btn_ns & 0x3f);
         if (!d->pci_valid) {
             dvdio_snapshot_pci(d);
             if (!d->pci_valid) {
@@ -8997,10 +9267,26 @@ static void dvdio_exec_nav_cmd(DVDIO *d, NavCmd cmd)
         dvdio_log_button(d);
         break;
     case NAVCMD_ACTIVATE:
-        if (!in_menu) {
-            dbg("DVD MENU: activate ignored (not in menu)\n");
+        if (!dvdio_buttons_active(d)) {
+            dbg("DVD MENU: activate ignored (no interactive PCI buttons)\n");
             break;
         }
+        if (dvdio_activation_unresolved(d)) {
+            fprintf(stderr,
+                    "CONTROLLER: activation suppressed stale/unresolved VM state "
+                    "hop_pending=%d soft_boundary=%d menu_req=%u call_ok=%d "
+                    "entered=%d saw_hop=%d saw_vts=%d saw_cell=%d\n",
+                    d->hop_pending, d->soft_media_boundary_pending,
+                    d->menu_req_id, d->menu_req_call_ok, d->menu_req_entered,
+                    d->menu_req_saw_hop, d->menu_req_saw_vts,
+                    d->menu_req_saw_cell);
+            break;
+        }
+        if (!in_menu && d->player && d->player->interactive_still)
+            fprintf(stderr,
+                    "CONTROLLER: accepted on VTS interactive still  cmd=%d "
+                    "ACTIVATE buttons=%d\n",
+                    (int)cmd, d->pci.hli.hl_gi.btn_ns & 0x3f);
         dvdio_activate_button(d);
         break;
     case NAVCMD_PREVIOUS_CHAPTER:
@@ -9087,51 +9373,79 @@ static void dvdio_handle_still(DVDIO *d, int length)
     int64_t dur_us;
     int in_menu = d->player ? d->player->in_menu : 0;
     int btn_ns = 0;
-    int yuv = 0, vq = 0, waiting = 0;
+    int yuv = 0, yuv_gen = 0, vq = 0, waiting = 0;
+    int buttons = 0, drained = 0;
     unsigned frames = 0;
 
     d->still_len = length;
     d->still_t0_us = t0;
     if (d->pci_valid)
         btn_ns = d->pci.hli.hl_gi.btn_ns & 0x3f;
+    buttons = dvdio_buttons_active(d);
+    if (buttons)
+        btn_ns = d->pci.hli.hl_gi.btn_ns & 0x3f;
     if (d->player) {
         vq = pktq_count(&d->player->vq);
+        yuv_gen = player_presentable_count(d->player);
         if (d->player->buffered_yuv)
             yuv = yuvring_count(&d->player->yuvring);
         waiting = player_buffered(d->player) &&
                   !prefill_is_released(d->player);
         frames = __atomic_load_n(&d->player->frames_this_nav_gen,
                                  __ATOMIC_SEQ_CST);
+        if (length == 0xff && !in_menu) {
+            d->player->interactive_still = 1;
+            fprintf(stderr,
+                    "STILL: interactive_still=1 in_menu=%d buttons=%d "
+                    "btn_ns=%d hli_ss=%d yuv_gen=%d yuv=%d "
+                    "frames_this_gen=%u vq=%d\n",
+                    in_menu, buttons, btn_ns,
+                    d->pci_valid ? (int)(d->pci.hli.hl_gi.hli_ss & 0x03) : -1,
+                    yuv_gen, yuv, frames, vq);
+        }
     }
     /*
      * MPEG bytes for this VOBU were already returned to FFmpeg (still_armed
      * with out>0 returns first). Drain parser/decoder so a lone still
      * I-frame is emitted before this thread blocks in the still wait.
-     * Title stills (warnings/bridges) need the same drain as menus:
-     * otherwise the last I-frame stays in the codec and prefill never
-     * sees a YUV frame.
+     * Use presentable YUV, not decode-count: a skipped/parser-held frame
+     * must not suppress drain.
      */
     if (d->player && player_buffered(d->player) &&
         !player_menu_has_frame(d->player)) {
+        fprintf(stderr,
+                "STILL: drain requested  yuv_gen=%d frames_this_gen=%u "
+                "vq=%d gen=%u\n",
+                player_presentable_count(d->player),
+                (unsigned)__atomic_load_n(&d->player->frames_this_nav_gen,
+                                          __ATOMIC_SEQ_CST),
+                pktq_count(&d->player->vq), player_nav_gen(d->player));
         player_request_still_drain(d->player);
         player_wait_still_drain(d->player, d);
+        drained = 1;
+        yuv_gen = player_presentable_count(d->player);
         if (d->player->buffered_yuv)
             yuv = yuvring_count(&d->player->yuvring);
         frames = __atomic_load_n(&d->player->frames_this_nav_gen,
                                  __ATOMIC_SEQ_CST);
+        fprintf(stderr,
+                "STILL: drain completed  yuv_gen=%d yuv=%d "
+                "frames_this_gen=%u\n",
+                yuv_gen, yuv, frames);
     }
     if (!d->still_logged) {
         d->still_logged = 1;
         fprintf(stderr,
                 "DVDNAV_STILL_FRAME length=%s (%d)  domain=%s "
                 "title=%d chapter=%d vts=%d cell=%d in_menu=%d "
-                "buttons=%d frames_this_gen=%u yuv=%d vq=%d "
-                "prefill_waiting=%d get_next_block_n=%lu\n",
+                "buttons=%d frames_this_gen=%u yuv=%d yuv_gen=%d vq=%d "
+                "prefill_waiting=%d drain=%d get_next_block_n=%lu\n",
                 length == 0xff ? "infinite" : "finite",
                 length,
                 dvd_domain_name(d->domain),
                 (int)d->title, (int)d->part, d->vtsN, d->cellN, in_menu,
-                btn_ns, frames, yuv, vq, waiting, d->get_next_block_n);
+                btn_ns, frames, yuv, yuv_gen, vq, waiting, drained,
+                d->get_next_block_n);
         if (d->soft_hop_active)
             fprintf(stderr,
                     "DVDNAV_STILL_FRAME after SOFT HOP  "
@@ -9143,7 +9457,14 @@ static void dvdio_handle_still(DVDIO *d, int length)
     }
     if (d->player) {
         d->player->still_active = 1;
-        player_prefill_release_if_held(d->player, "DVDNAV_STILL_FRAME");
+        if (player_menu_has_frame(d->player) &&
+            (length == 0xff || in_menu || d->player->interactive_still))
+            prefill_release(d->player,
+                            d->player->interactive_still && !in_menu
+                                ? "interactive still"
+                                : "DVDNAV_STILL_FRAME");
+        else
+            player_prefill_release_if_held(d->player, "DVDNAV_STILL_FRAME");
         dvdio_apply_highlight(d, 0);
         pthread_mutex_lock(&d->player->clock.mu);
         pthread_cond_broadcast(&d->player->clock.ready_cv);
@@ -9160,8 +9481,10 @@ static void dvdio_handle_still(DVDIO *d, int length)
                 "(allow PGC post-command)\n");
         dvdnav_still_skip(d->nav);
         d->still_len = 0;
-        if (d->player)
+        if (d->player) {
             d->player->still_active = 0;
+            d->player->interactive_still = 0;
+        }
         return;
     }
 
@@ -9192,17 +9515,9 @@ static void dvdio_handle_still(DVDIO *d, int length)
 
 static int player_menu_has_frame(Player *p)
 {
-    int n = 0;
-    unsigned frames;
-
     if (!p)
         return 0;
-    frames = __atomic_load_n(&p->frames_this_nav_gen, __ATOMIC_SEQ_CST);
-    if (frames > 0)
-        return 1;
-    if (p->buffered_yuv)
-        n = yuvring_count(&p->yuvring);
-    return n >= 1;
+    return player_presentable_count(p) >= 1;
 }
 
 static void player_request_still_drain(Player *p)
@@ -9329,6 +9644,11 @@ static int dvdio_pump(DVDIO *d, int32_t event, int32_t len)
                         d->menu_req_id, kind, dvd_domain_name(d->domain),
                         (int)d->title, (int)d->part);
                 d->menu_req_entered = 1;
+                if (d->menu_req_id)
+                    fprintf(stderr,
+                            "CONTROLLER: activation guard released menu_req=%u "
+                            "nav_gen=%u\n",
+                            d->menu_req_id, player_nav_gen(d->player));
                 d->hl_leave_logged = 0;
                 d->menu_exiting = 0;
                 dbg("DVD MENU: entered menu domain\n"
@@ -9358,6 +9678,7 @@ static int dvdio_pump(DVDIO *d, int32_t event, int32_t len)
                     menu_spu_set_stream(d->player, -1, active & 0x1f, -1);
                 dvdio_apply_highlight(d, 0);
             }
+            dvdio_menu_req_try_resolve(d);
         }
         return 0;
     case DVDNAV_BLOCK_OK:
@@ -9524,6 +9845,11 @@ static int dvdio_pump(DVDIO *d, int32_t event, int32_t len)
         d->still_armed = 0;
         d->wait_armed = 0;
         d->pci_valid = 0;
+        if (d->player) {
+            d->player->still_active = 0;
+            d->player->interactive_still = 0;
+            d->player->hli_still_logged = 0;
+        }
         return 0;
     }
     case DVDNAV_CELL_CHANGE: {
@@ -9570,6 +9896,15 @@ static int dvdio_pump(DVDIO *d, int32_t event, int32_t len)
             if (d->player && player_buffered(d->player) && !now &&
                 est_frames > 0 && est_frames < d->player->prefill_req)
                 d->player->prefill_short_pgc = 1;
+            if (d->player && !now && still_flag == 0xff) {
+                d->player->interactive_still = 1;
+                fprintf(stderr,
+                        "STILL: interactive_still=1 from CELL still_flag=255 "
+                        "title=%d yuv_gen=%d\n",
+                        (int)d->title, player_presentable_count(d->player));
+            } else if (d->player && !now && still_flag != 0xff) {
+                d->player->interactive_still = 0;
+            }
             fprintf(stderr,
                     "DVDNAV_CELL_CHANGE cell=%d pg=%d title=%d chapter=%d "
                     "domain=%s vts=%d in_menu=%d still_len=%d still_flag=%d "
@@ -10180,14 +10515,14 @@ static void clock_wait_ready(Player *p)
 
     pthread_mutex_lock(&p->clock.mu);
     while (!p->clock.ready && !p->fail && !g_interrupt &&
-           !p->in_menu && !p->still_active) {
+           !p->in_menu && !p->still_active && !p->interactive_still) {
         pthread_mutex_unlock(&p->clock.mu);
         player_log_startup_buffer(p);
         yuv = player_buffered(p) ? buffered_queue_count(p) : 0;
         if (player_buffered(p) && prefill_is_released(p) && yuv >= 1) {
             pthread_mutex_lock(&p->clock.mu);
             if (p->clock.ready || p->fail || g_interrupt ||
-                p->in_menu || p->still_active) {
+                p->in_menu || p->still_active || p->interactive_still) {
                 break;
             }
             pthread_mutex_unlock(&p->clock.mu);
@@ -10196,7 +10531,7 @@ static void clock_wait_ready(Player *p)
         }
         pthread_mutex_lock(&p->clock.mu);
         if (p->clock.ready || p->fail || g_interrupt ||
-            p->in_menu || p->still_active)
+            p->in_menu || p->still_active || p->interactive_still)
             break;
         pktq_wait_timeout(&p->clock.ready_cv, &p->clock.mu);
     }
@@ -10270,6 +10605,11 @@ static void player_prefill_release_if_held(Player *p, const char *why)
 {
     if (!p || !player_buffered(p) || prefill_is_released(p))
         return;
+    if (p->in_menu || player_oneframe_still(p)) {
+        if (player_presentable_count(p) >= 1)
+            prefill_release(p, why);
+        return;
+    }
     if (buffered_queue_count(p) >= 1)
         prefill_release(p, why);
 }
@@ -10298,12 +10638,14 @@ static int pcm_hold_append(Player *p, const uint8_t *src, int n)
         return 0;
     if (p->pcm_hold_len >= PCM_HOLD_START_BYTES) {
         p->pcm_hold_discarded += n;
+        p->pcm_hold_discarded_this_gen += n;
         return 0;
     }
     take = n;
     if (p->pcm_hold_len + take > PCM_HOLD_START_BYTES) {
         take = PCM_HOLD_START_BYTES - p->pcm_hold_len;
         p->pcm_hold_discarded += (n - take);
+        p->pcm_hold_discarded_this_gen += (n - take);
     }
     if (p->pcm_hold_len + take > PCM_HOLD_MAX) {
         fprintf(stderr,
@@ -10384,6 +10726,7 @@ static int buffered_start_mraudio(Player *p, MrAudio *mr, uint8_t *chunk,
 
         if (flush_n > PCM_HOLD_START_BYTES) {
             p->pcm_hold_discarded += (flush_n - PCM_HOLD_START_BYTES);
+            p->pcm_hold_discarded_this_gen += (flush_n - PCM_HOLD_START_BYTES);
             flush_n = PCM_HOLD_START_BYTES;
         }
         p->pcm_hold_used = flush_n;
@@ -10406,6 +10749,14 @@ static int buffered_start_mraudio(Player *p, MrAudio *mr, uint8_t *chunk,
         dbg("MrAudio fill after prime/flush: %d bytes\n", mr->fill);
 
     p->buf_mraudio_started = 1;
+    if (p->bootstrap_hol_relief) {
+        fprintf(stderr,
+                "VIDEO BOOTSTRAP HOL: relief end nav_gen=%u "
+                "hold_used=%d discarded_this_gen=%" PRId64 " discarded=%" PRId64 "\n",
+                player_nav_gen(p), p->pcm_hold_used,
+                p->pcm_hold_discarded_this_gen, p->pcm_hold_discarded);
+        p->bootstrap_hol_relief = 0;
+    }
     fprintf(stderr,
             "A/V START: MrAudio start nav_gen=%u codec_gen=%u "
             "wall_us=%" PRId64 " hold_ms=%.1f first_pts=%s%.6f\n",
@@ -10566,7 +10917,6 @@ static void *audio_thread(void *opaque)
             PCM_HOLD_START_BYTES * 1000.0 / (double)BYTES_PER_SEC);
     }
 
-    int hold_full_logged = 0;
     clock_epoch = clock_epoch_now(&p->clock);
 
     adec = open_audio_decoder(p);
@@ -10582,8 +10932,11 @@ static void *audio_thread(void *opaque)
         player_log_startup_buffer(p);
 
         if (p->audio_reset_req) {
+            int soft = p->soft_audio_reset;
+
             crash_enter(CRASH_NAV_HARD_RESET, p);
             p->audio_reset_req = 0;
+            p->soft_audio_reset = 0;
             mraudio_hw_stop_flush(&mr, player_nav_gen(p));
             if (adec)
                 avcodec_free_context(&adec);
@@ -10595,11 +10948,15 @@ static void *audio_thread(void *opaque)
             p->buf_mraudio_started = 0;
             p->mraudio_gate_logged = 0;
             clock_epoch = clock_epoch_now(&p->clock);
-            hold_full_logged = 0;
             adec = open_audio_decoder(p);
+            if (soft)
+                fprintf(stderr,
+                        "SOFT MEDIA RESET: audio complete nav_gen=%u\n",
+                        player_nav_gen(p));
             fprintf(stderr,
-                    "AUDIO: HARD reset decoder %s swr freed  gen=%u "
+                    "AUDIO: %s reset decoder %s swr freed  gen=%u "
                     "codec_gen=%u origin_bytes=%" PRId64 "\n",
+                    soft ? "SOFT" : "HARD",
                     adec ? "reopened" : "pending codecpar",
                     player_nav_gen(p), player_codec_gen(p),
                     mr.bytes_origin);
@@ -10639,16 +10996,26 @@ static void *audio_thread(void *opaque)
             }
             if (!p->buf_mraudio_started &&
                 p->pcm_hold_len >= PCM_HOLD_START_BYTES &&
-                !prefill_is_released(p)) {
-                if (!hold_full_logged) {
-                    hold_full_logged = 1;
-                    dbg("audio PCM hold at cap (%.1f ms); waiting for "
-                        "video prefill, not decoding more\n",
-                        p->pcm_hold_len * 1000.0 / (double)BYTES_PER_SEC);
+                !player_first_video_ready(p)) {
+                /*
+                 * Test 9.3: keep the 150 ms PCM hold. Do not pop/discard
+                 * the rest of the PGC. Ask video to expose the delayed
+                 * first MPEG-2 picture, then wait until it is presented.
+                 */
+                player_request_firstpic_drain(p);
+                pthread_mutex_lock(&p->prefill_mu);
+                while (!p->fail && !g_interrupt && !p->audio_reset_req &&
+                       !player_first_video_ready(p)) {
+                    pthread_mutex_unlock(&p->prefill_mu);
+                    player_log_startup_buffer(p);
+                    player_request_firstpic_drain(p);
+                    pthread_mutex_lock(&p->prefill_mu);
+                    if (p->fail || g_interrupt || p->audio_reset_req ||
+                        player_first_video_ready(p))
+                        break;
+                    pktq_wait_timeout(&p->prefill_cv, &p->prefill_mu);
                 }
-                prefill_wait(p);
-                if (p->fail || g_interrupt)
-                    break;
+                pthread_mutex_unlock(&p->prefill_mu);
                 continue;
             }
             got_pkt = pktq_pop_or_prefill_gate(&p->aq, pkt, p, &pkt_nav_gen);
@@ -10680,6 +11047,14 @@ static void *audio_thread(void *opaque)
             continue;
         }
         if (pkt_is_stale_nav_gen(pkt, pkt_nav_gen, player_nav_gen(p))) {
+            unsigned now = player_nav_gen(p);
+
+            if (p->soft_stale_drop_audio_gen != now) {
+                p->soft_stale_drop_audio_gen = now;
+                fprintf(stderr,
+                        "SOFT STALE DROP: audio pkt_nav=%u current=%u\n",
+                        (unsigned)pkt_nav_gen, now);
+            }
             av_packet_unref(pkt);
             continue;
         }
@@ -12717,13 +13092,21 @@ static int producer_enqueue_frame(Player *p, AVFrame *frame, AVCodecContext *vde
 
     if (!prefill_is_released(p)) {
         int n = vidring_count(&p->vring);
-        if (n >= p->prefill_req)
+        if (!(p->in_menu || player_oneframe_still(p)) &&
+            n >= p->prefill_req)
             prefill_release(p, "prefill target reached");
-        else if ((p->in_menu || p->still_active || p->prefill_short_pgc) &&
-                 n >= 1)
-            prefill_release(p, p->in_menu ? "menu/still picture"
-                           : (p->still_active ? "still picture"
-                              : "short title/PGC before prefill target"));
+        else if ((p->in_menu || player_oneframe_still(p) ||
+                  p->prefill_short_pgc) && n >= 1) {
+            const char *why = "short title/PGC before prefill target";
+
+            if (p->interactive_still && !p->in_menu)
+                why = "interactive still";
+            else if (p->in_menu)
+                why = "menu/still picture";
+            else if (p->still_active)
+                why = "still picture";
+            prefill_release(p, why);
+        }
     }
     return 0;
 }
@@ -12805,7 +13188,8 @@ static int producer_enqueue_yuv(Player *p, AVFrame *frame, AVCodecContext *vdec,
                            (p->assigned_pts != AV_NOPTS_VALUE)
                                ? tb_to_us(p->vtb, p->assigned_pts)
                                : AV_NOPTS_VALUE,
-                           p->buf_playing, epoch, nav_gen, p->in_menu);
+                           p->buf_playing, epoch, nav_gen,
+                           p->in_menu || p->interactive_still);
     p->prod_last_end_us = av_gettime_relative();
 
     if (p->soft_log_yuv && nav_gen == p->soft_nav_gen) {
@@ -12816,14 +13200,22 @@ static int producer_enqueue_yuv(Player *p, AVFrame *frame, AVCodecContext *vdec,
     }
 
     if (!prefill_is_released(p)) {
-        int n = yuvring_count(&p->yuvring);
-        if (n >= p->prefill_req)
+        int n = yuvring_count_gen(&p->yuvring, nav_gen);
+        if (!(p->in_menu || player_oneframe_still(p)) &&
+            n >= p->prefill_req)
             prefill_release(p, "prefill target reached");
-        else if ((p->in_menu || p->still_active || p->prefill_short_pgc) &&
-                 n >= 1)
-            prefill_release(p, p->in_menu ? "menu/still picture"
-                           : (p->still_active ? "still picture"
-                              : "short title/PGC before prefill target"));
+        else if ((p->in_menu || player_oneframe_still(p) ||
+                  p->prefill_short_pgc) && n >= 1) {
+            const char *why = "short title/PGC before prefill target";
+
+            if (p->interactive_still && !p->in_menu)
+                why = "interactive still";
+            else if (p->in_menu)
+                why = "menu/still picture";
+            else if (p->still_active)
+                why = "still picture";
+            prefill_release(p, why);
+        }
     }
     return 0;
 }
@@ -13088,7 +13480,7 @@ static void draw_highlight_border(uint8_t *bgr0, int stride,
 static void present_draw_highlight(Player *p, uint8_t *dst, int stride,
                                    int frame_menu)
 {
-    int vis, sx, sy, ex, ey, in_menu;
+    int vis, sx, sy, ex, ey, in_menu, interactive;
     unsigned gen;
 
     if (!p->hl.inited)
@@ -13096,6 +13488,7 @@ static void present_draw_highlight(Player *p, uint8_t *dst, int stride,
     pthread_mutex_lock(&p->hl.mu);
     vis = p->hl.visible;
     in_menu = p->hl.in_menu;
+    interactive = p->hl.interactive;
     gen = p->hl.gen;
     sx = p->hl.sx;
     sy = p->hl.sy;
@@ -13103,7 +13496,8 @@ static void present_draw_highlight(Player *p, uint8_t *dst, int stride,
     ey = p->hl.ey;
     pthread_mutex_unlock(&p->hl.mu);
     if (g_debug_yellow_highlight) {
-        if (vis && in_menu && frame_menu && gen == player_nav_gen(p))
+        if (vis && (in_menu || interactive) && frame_menu &&
+            gen == player_nav_gen(p))
             draw_highlight_border(dst, stride, sx, sy, ex, ey,
                                   player_active_h(p));
         return;
@@ -13115,7 +13509,7 @@ static int present_menu_skip_clock(Player *p, int ui_redraw, int frame_menu)
 {
     if (ui_redraw)
         return 1;
-    if (frame_menu || p->in_menu || p->still_active)
+    if (frame_menu || p->in_menu || p->still_active || p->interactive_still)
         return 1;
     return 0;
 }
@@ -13288,7 +13682,7 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
         p->convert_us += sws_wall;
         yuv_copy_note(p, sws_wall);
         phase_sws_leave(p);
-        if (frame_menu || p->in_menu) {
+        if (frame_menu || p->in_menu || p->interactive_still) {
             int64_t ov_us = sub_scratch_us + sub_compose_us;
 
             p->spu_perf.menu_frames++;
@@ -13312,7 +13706,8 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
             int64_t ov0 = av_gettime_relative();
             int64_t ov_us;
 
-            if (frame_menu || p->in_menu || g_debug_yellow_highlight)
+            if (frame_menu || p->in_menu || p->interactive_still ||
+                g_debug_yellow_highlight)
                 present_draw_highlight(p, dst_data[0], dst_linesize[0],
                                        frame_menu);
             else
@@ -13320,7 +13715,7 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
                                                dst_linesize[0], vpts_us,
                                                &sub_blend_us);
             ov_us = av_gettime_relative() - ov0;
-            if (frame_menu || p->in_menu) {
+            if (frame_menu || p->in_menu || p->interactive_still) {
                 p->spu_perf.menu_frames++;
                 p->spu_perf.sws_sum += sws_wall;
                 p->spu_perf.ov_sum += ov_us;
@@ -13583,7 +13978,13 @@ static void *present_thread(void *opaque)
 
         if (g != seen_gen) {
             seen_gen = g;
-            if (p->in_menu) {
+            if (p->in_menu || player_oneframe_still(p)) {
+                if (player_oneframe_still(p) && !p->in_menu)
+                    fprintf(stderr,
+                            "PRESENT: interactive still follows gen=%u "
+                            "yuv_gen=%d still=%d in_menu=%d\n",
+                            g, player_presentable_count(p),
+                            p->still_active, p->in_menu);
                 dbg("DVD MENU: presentation follows menu gen=%u\n", g);
             } else {
                 av_frame_unref(menu_hold);
@@ -13628,7 +14029,8 @@ static void *present_thread(void *opaque)
             pthread_mutex_unlock(&p->hl.mu);
         }
         if (redraw && menu_hold && menu_hold->data[0] &&
-            p->in_menu && menu_hold_gen == player_nav_gen(p)) {
+            (p->in_menu || p->interactive_still) &&
+            menu_hold_gen == player_nav_gen(p)) {
             p->cur_decode_us = 0;
             pr = present_yuv_frame(p, menu_hold, AV_NOPTS_VALUE, &sws, 1, 1,
                                    menu_hold->interlaced_frame,
@@ -13713,6 +14115,41 @@ static int video_trace_active(const Player *p)
     return p->soft_decode_trace || p->still_drain_req;
 }
 
+/* Test 10.1: interactive VTS stills keep their sole decoded frame.
+ * Does not consume initial_skip_left (ordinary title skip stays Test 7). */
+static int video_bypass_initial_skip_for_still(Player *p)
+{
+    unsigned gen;
+
+    if (!p || !p->interactive_still)
+        return 0;
+    gen = player_nav_gen(p);
+    if (p->initial_skip_bypass_log_gen != gen) {
+        p->initial_skip_bypass_log_gen = gen;
+        fprintf(stderr,
+                "VIDEO INITIAL SKIP: bypass for interactive still gen=%u\n",
+                gen);
+    }
+    return 1;
+}
+
+static void video_log_initial_skip_drop(Player *p)
+{
+    unsigned gen;
+    unsigned n;
+
+    if (!p)
+        return;
+    gen = player_nav_gen(p);
+    if (p->initial_skip_drop_log_gen == gen)
+        return;
+    p->initial_skip_drop_log_gen = gen;
+    n = __atomic_load_n(&p->frames_this_nav_gen, __ATOMIC_SEQ_CST);
+    fprintf(stderr,
+            "VIDEO INITIAL SKIP: dropped gen=%u frame=%u interactive=0\n",
+            gen, n);
+}
+
 static int video_emit_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
                             struct SwsContext **sws, unsigned pkt_gen,
                             int timed)
@@ -13732,7 +14169,9 @@ static int video_emit_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
         return 0;
     }
     if (p->buffered_yuv) {
-        if (p->initial_skip_left > 0 && !p->in_menu) {
+        if (p->initial_skip_left > 0 && !p->in_menu &&
+            !video_bypass_initial_skip_for_still(p)) {
+            video_log_initial_skip_drop(p);
             dbg("DVD MENU: decoded frame skipped (initial-video-skip) "
                 "gen=%u left=%d\n",
                 pkt_gen, p->initial_skip_left);
@@ -13751,7 +14190,9 @@ static int video_emit_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
         return 0;
     }
     if (p->buffered_video) {
-        if (p->initial_skip_left > 0) {
+        if (p->initial_skip_left > 0 &&
+            !video_bypass_initial_skip_for_still(p)) {
+            video_log_initial_skip_drop(p);
             p->initial_skip_left--;
             p->initial_video_skipped++;
             return 0;
@@ -13770,7 +14211,9 @@ static int video_emit_frame(Player *p, AVFrame *frame, AVCodecContext *vdec,
         p->preroll_decoded++;
         return 0;
     }
-    if (p->initial_skip_left > 0) {
+    if (p->initial_skip_left > 0 &&
+        !video_bypass_initial_skip_for_still(p)) {
+        video_log_initial_skip_drop(p);
         p->initial_skip_left--;
         p->initial_video_skipped++;
         return 0;
@@ -13816,6 +14259,10 @@ static int video_send_and_receive(Player *p, AVCodecContext *vdec,
 
     phase_decode_begin(p);
     sr = avcodec_send_packet(vdec, ppkt);
+    if (ppkt) {
+        p->firstpic_sent = 1;
+        p->firstpic_last_send = sr;
+    }
     if (trace) {
         if (sr < 0)
             fferr(sr, errbuf, sizeof(errbuf));
@@ -13850,6 +14297,8 @@ static int video_send_and_receive(Player *p, AVCodecContext *vdec,
         av_frame_unref(frame);
         phase_decode_begin(p);
     }
+    if (ppkt)
+        p->firstpic_last_recv = rr;
     phase_decode_end(p);
     if (trace) {
         if (rr == AVERROR(EAGAIN))
@@ -13929,6 +14378,139 @@ static int video_drain_still_boundary(Player *p, AVCodecParserContext *parser,
         "yuv=%d\n",
         __atomic_load_n(&p->frames_this_nav_gen, __ATOMIC_SEQ_CST),
         p->buffered_yuv ? yuvring_count(&p->yuvring) : -1);
+    return 0;
+}
+
+static const char *firstpic_ret_name(int have, int ret)
+{
+    if (!have)
+        return "none";
+    if (ret == 0)
+        return "ok";
+    if (ret == AVERROR(EAGAIN))
+        return "EAGAIN";
+    if (ret == AVERROR_EOF)
+        return "EOF";
+    return "err";
+}
+
+static int video_firstpic_menu_path(const Player *p)
+{
+    return p && (p->in_menu || p->still_active || p->interactive_still);
+}
+
+static int video_firstpic_should_drain(Player *p, unsigned pkt_gen)
+{
+    int aq;
+
+    if (!p || !player_buffered(p) || p->fail)
+        return 0;
+    if (p->firstpic_drained_gen == pkt_gen)
+        return 0;
+    if (player_first_video_ready(p))
+        return 0;
+    if (pkt_gen != player_nav_gen(p))
+        return 0;
+    if (__atomic_load_n(&p->frames_this_nav_gen, __ATOMIC_SEQ_CST) > 0)
+        return 0;
+    if (__atomic_load_n(&p->firstpic_vpkt_gen, __ATOMIC_SEQ_CST) != pkt_gen)
+        return 0;
+    if (pktq_count(&p->vq) > 0)
+        return 0;
+    if (!video_firstpic_menu_path(p))
+        return 0;
+    aq = pktq_count(&p->aq);
+    return aq >= VIDEO_HOL_ENTER_AQ ||
+           p->pcm_hold_len >= PCM_HOLD_START_BYTES ||
+           __atomic_load_n(&p->demux_wait_full, __ATOMIC_RELAXED) == 2;
+}
+
+/*
+ * Test 9.3: one-picture DVD menus leave a complete AU in the MPEG-2 parser
+ * (next picture start never arrives) and/or a decoded I-frame delayed in
+ * mpeg2video (delay=1). Flush parser, then drain+reset decoder if needed.
+ * Restricted to menu/still bootstrap so movie B-frame GOPs are unchanged.
+ */
+static int video_drain_first_picture(Player *p, AVCodecParserContext *parser,
+                                     AVCodecContext *vdec, AVPacket *ppkt,
+                                     AVFrame *frame, struct SwsContext **sws,
+                                     unsigned pkt_gen, int timed)
+{
+    int i, used, out_size, parser_bytes = 0, sent_from_parser = 0;
+    uint8_t *out_data = NULL;
+    unsigned frames0 =
+        __atomic_load_n(&p->frames_this_nav_gen, __ATOMIC_SEQ_CST);
+    unsigned after;
+
+    if (!p || p->firstpic_drained_gen == pkt_gen)
+        return 0;
+    if (__atomic_load_n(&p->frames_this_nav_gen, __ATOMIC_SEQ_CST) > 0)
+        return 0;
+    p->firstpic_drained_gen = pkt_gen;
+    p->bootstrap_hol_relief = 1;
+    if (p->bootstrap_hol_relief_gen != pkt_gen)
+        p->bootstrap_hol_relief_gen = pkt_gen;
+
+    fprintf(stderr,
+            "VIDEO BOOTSTRAP HOL: relief begin nav_gen=%u "
+            "method=parser_decoder_drain hold=%d/%d discarded_this_gen=%" PRId64
+            " aq=%d/%d vq=%d yuv=%d\n",
+            pkt_gen, p->pcm_hold_len, PCM_HOLD_START_BYTES,
+            p->pcm_hold_discarded_this_gen,
+            pktq_count(&p->aq), AUDIO_Q_CAP, pktq_count(&p->vq),
+            p->buffered_yuv ? yuvring_count(&p->yuvring) : 0);
+    fprintf(stderr,
+            "VIDEO FIRSTPIC: receive before drain result=%s\n",
+            firstpic_ret_name(p->firstpic_sent, p->firstpic_last_recv));
+
+    for (i = 0; i < 8 && parser; i++) {
+        out_data = NULL;
+        out_size = 0;
+        used = av_parser_parse2(parser, vdec, &out_data, &out_size,
+                                NULL, 0, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+        if (used < 0)
+            break;
+        if (out_size > 0) {
+            parser_bytes += out_size;
+            fprintf(stderr, "VIDEO FIRSTPIC: parser drain bytes=%d\n",
+                    out_size);
+            ppkt->data = out_data;
+            ppkt->size = out_size;
+            ppkt->pts = parser->pts;
+            ppkt->dts = parser->dts;
+            sent_from_parser = 1;
+            if (video_send_and_receive(p, vdec, ppkt, frame, sws, pkt_gen,
+                                       timed, 1, "firstpic-parser-drain") < 0)
+                return -1;
+        }
+        if (used <= 0 && out_size <= 0)
+            break;
+    }
+
+    after = __atomic_load_n(&p->frames_this_nav_gen, __ATOMIC_SEQ_CST);
+    if (after > frames0)
+        return 0;
+
+    if (!video_firstpic_menu_path(p))
+        return 0;
+    if (!p->firstpic_sent && !sent_from_parser)
+        return 0;
+
+    fprintf(stderr, "VIDEO FIRSTPIC: decoder drain begin gen=%u\n", pkt_gen);
+    frames0 = after;
+    if (video_send_and_receive(p, vdec, NULL, frame, sws, pkt_gen,
+                               timed, 1, "firstpic-codec-drain") < 0)
+        return -1;
+    after = __atomic_load_n(&p->frames_this_nav_gen, __ATOMIC_SEQ_CST);
+    if (after > frames0)
+        fprintf(stderr,
+                "VIDEO FIRSTPIC: decoder drain produced frame pts=%" PRId64 "\n",
+                p->last_video_pts_us == AV_NOPTS_VALUE
+                    ? (int64_t)-1 : p->last_video_pts_us);
+    avcodec_flush_buffers(vdec);
+    fprintf(stderr,
+            "VIDEO FIRSTPIC: decoder resumed after bootstrap drain gen=%u\n",
+            pkt_gen);
     return 0;
 }
 
@@ -14023,12 +14605,27 @@ static void *video_thread(void *opaque)
                 break;
             continue;
         }
+        if (pkt->opaque == VQ_MARK_FIRSTPIC) {
+            av_packet_unref(pkt);
+            if (video_drain_first_picture(p, parser, vdec, ppkt, frame, &sws,
+                                          pkt_gen, timed) < 0)
+                break;
+            continue;
+        }
 
         if (pkt_is_stale_codec_gen(pkt, pkt_codec)) {
             av_packet_unref(pkt);
             continue;
         }
         if (pkt_is_stale_nav_gen(pkt, pkt_nav_gen, player_nav_gen(p))) {
+            unsigned now = player_nav_gen(p);
+
+            if (p->soft_stale_drop_video_gen != now) {
+                p->soft_stale_drop_video_gen = now;
+                fprintf(stderr,
+                        "SOFT STALE DROP: video pkt_nav=%u current=%u\n",
+                        (unsigned)pkt_nav_gen, now);
+            }
             av_packet_unref(pkt);
             continue;
         }
@@ -14049,11 +14646,18 @@ static void *video_thread(void *opaque)
             p->first_genuine_pts = AV_NOPTS_VALUE;
             p->timeline_pts = AV_NOPTS_VALUE;
             p->assigned_pts = AV_NOPTS_VALUE;
+            p->firstpic_parser_out = 0;
+            p->firstpic_sent = 0;
+            p->firstpic_last_send = 0;
+            p->firstpic_last_recv = 0;
             dbg("DVD MENU: video decoder/parser HARD reset  "
                 "codec_gen=%u nav_gen=%u\n",
                 pkt_codec, pkt_gen);
         } else if (p->video_reset_req || pkt_gen != dec_nav_gen) {
+            int soft = p->soft_video_reset;
+
             p->video_reset_req = 0;
+            p->soft_video_reset = 0;
             dec_nav_gen = pkt_gen;
             avcodec_flush_buffers(vdec);
             av_parser_close(parser);
@@ -14067,6 +14671,14 @@ static void *video_thread(void *opaque)
             p->first_genuine_pts = AV_NOPTS_VALUE;
             p->timeline_pts = AV_NOPTS_VALUE;
             p->assigned_pts = AV_NOPTS_VALUE;
+            p->firstpic_parser_out = 0;
+            p->firstpic_sent = 0;
+            p->firstpic_last_send = 0;
+            p->firstpic_last_recv = 0;
+            if (soft)
+                fprintf(stderr,
+                        "SOFT MEDIA RESET: video complete nav_gen=%u\n",
+                        pkt_gen);
             dbg("DVD MENU: video parser/decoder MEDIA flush  "
                 "nav_gen=%u codec_gen=%u (codec unchanged)\n",
                 pkt_gen, pkt_codec);
@@ -14117,6 +14729,7 @@ static void *video_thread(void *opaque)
             in_pos = -1;
             if (out_size <= 0)
                 continue;
+            p->firstpic_parser_out += out_size;
             ppkt->data = out_data;
             ppkt->size = out_size;
             ppkt->pts = parser->pts;
@@ -14127,7 +14740,21 @@ static void *video_thread(void *opaque)
                 goto done;
             }
         }
+        __atomic_store_n(&p->firstpic_vpkt_gen, pkt_gen, __ATOMIC_SEQ_CST);
+        if (p->firstpic_log_gen != pkt_gen) {
+            p->firstpic_log_gen = pkt_gen;
+            fprintf(stderr,
+                    "VIDEO FIRSTPIC: VPKT accepted gen=%u parser_out=%d "
+                    "decoder_send=%s\n",
+                    pkt_gen, p->firstpic_parser_out,
+                    firstpic_ret_name(p->firstpic_sent, p->firstpic_last_send));
+        }
         av_packet_unref(pkt);
+        if (video_firstpic_should_drain(p, pkt_gen)) {
+            if (video_drain_first_picture(p, parser, vdec, ppkt, frame, &sws,
+                                          pkt_gen, timed) < 0)
+                break;
+        }
     }
 
 done:
@@ -15019,7 +15646,7 @@ int main(int argc, char **argv)
         rawpts_log_format_and_select(&p, fmt);
         player_log_startup_buffer(&p);
 
-        if (p.in_menu)
+        if (p.in_menu || p.interactive_still)
             menu_spu_log_streams(&p, fmt);
 
         if (p.ai >= 0 && p.acp && !p.audio_started && !p.uncapped_bench) {
@@ -15071,7 +15698,8 @@ int main(int argc, char **argv)
             }
             rawpts_log_first_packet(&p, fmt, pkt, 0);
             player_pktq_push(&p, &p.vq, pkt);
-        } else if (p.in_menu && pkt->data && pkt->size > 0) {
+        } else if ((p.in_menu || p.interactive_still) &&
+                   pkt->data && pkt->size > 0) {
             menu_spu_note_decoder(&p);
             menu_spu_log_streams(&p, fmt);
             if (menu_spu_packet_wanted(&p, fmt, pkt)) {
@@ -15080,7 +15708,8 @@ int main(int argc, char **argv)
                 menu_spu_feed_packet(&p, pkt->data, pkt->size,
                                      player_nav_gen(&p));
             }
-        } else if (!p.in_menu && pkt->data && pkt->size > 0) {
+        } else if (!p.in_menu && !p.interactive_still &&
+                   pkt->data && pkt->size > 0) {
             if (p.msub.pes_id < 0 && d.nav) {
                 int8_t active = dvdnav_get_active_spu_stream(d.nav);
 
