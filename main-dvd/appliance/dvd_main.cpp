@@ -18,6 +18,7 @@
 #include "dvd_main.h"
 #include "fpga_io.h"
 #include "user_io.h"
+#include "file_io.h"
 
 /*
  * Appliance supervisor for MiSTer_DVD_Appliance.
@@ -35,6 +36,8 @@
 #define DVD_APPLIANCE_LOG     DVD_APPLIANCE_LOG_DIR "/appliance.log"
 #define DVD_APPLIANCE_PREV    DVD_APPLIANCE_LOG_DIR "/appliance.previous.log"
 #define DVD_APPLIANCE_PIDFILE "/tmp/dvd_appliance.pid"
+#define DVD_APPLIANCE_CMD_FIFO "/tmp/dvd_appliance.cmd"
+#define DVD_APPLIANCE_ISO_INDEX 0
 
 #define TERM_WAIT_SEC       8
 #define KILL_WAIT_SEC       2
@@ -619,4 +622,90 @@ void dvd_main_poll(void)
 
 	printf("APPLIANCE_MAIN: restart %d/%d\n", g_fail_count, RESPAWN_MAX);
 	spawn_appliance(0);
+}
+
+static int path_is_iso(const char *p)
+{
+	const char *dot;
+
+	if (!p || !p[0])
+		return 0;
+	dot = strrchr(p, '.');
+	return dot && strcasecmp(dot, ".iso") == 0;
+}
+
+int dvd_appliance_handle_iso_select(const char *sel_path, int ioctl_index)
+{
+	const char *full;
+	struct stat st;
+	char line[PATH_MAX + 32];
+	int fd, n, wr;
+
+	if (!exe_is_mister_dvd_appliance())
+		return 0;
+	if (!core_is_appliance())
+		return 0;
+
+	/*
+	 * Never let this core fall through to user_io_file_tx. A DVD ISO
+	 * must stay a Linux file; FPGA upload is not acceptable.
+	 */
+	if (ioctl_index != DVD_APPLIANCE_ISO_INDEX)
+	{
+		printf("APPLIANCE OSD: ignore selector index=%d (Play ISO is F0)\n",
+		       ioctl_index);
+		return 1;
+	}
+	if (!sel_path || !sel_path[0])
+	{
+		printf("APPLIANCE OSD: empty ISO selection\n");
+		return 1;
+	}
+
+	full = getFullPath(sel_path);
+	if (!full || !full[0])
+		full = sel_path;
+
+	printf("APPLIANCE OSD: ISO selected path=%s\n", full);
+
+	if (!path_is_iso(full))
+	{
+		printf("APPLIANCE OSD: reject (not .iso) path=%s\n", full);
+		return 1;
+	}
+	if (stat(full, &st) != 0 || !S_ISREG(st.st_mode) || access(full, R_OK) != 0)
+	{
+		printf("APPLIANCE OSD: reject (not a readable file) path=%s (%s)\n",
+		       full, strerror(errno));
+		return 1;
+	}
+
+	if (mkfifo(DVD_APPLIANCE_CMD_FIFO, 0666) < 0 && errno != EEXIST)
+		printf("APPLIANCE OSD: mkfifo %s: %s\n",
+		       DVD_APPLIANCE_CMD_FIFO, strerror(errno));
+
+	n = snprintf(line, sizeof(line), "PLAY_ISO %s\n", full);
+	if (n < 0 || n >= (int)sizeof(line))
+	{
+		printf("APPLIANCE OSD: path too long, not sent path=%s\n", full);
+		return 1;
+	}
+
+	fd = open(DVD_APPLIANCE_CMD_FIFO, O_WRONLY | O_NONBLOCK);
+	if (fd < 0)
+	{
+		printf("APPLIANCE OSD: cannot send to supervisor (%s). "
+		       "ISO was NOT transferred to FPGA.\n",
+		       strerror(errno));
+		return 1;
+	}
+	wr = (int)write(fd, line, (size_t)n);
+	close(fd);
+	if (wr != n)
+		printf("APPLIANCE OSD: short FIFO write %d/%d (%s)\n",
+		       wr, n, strerror(errno));
+	else
+		printf("APPLIANCE OSD: ISO path sent (no FPGA transfer) path=%s\n",
+		       full);
+	return 1;
 }

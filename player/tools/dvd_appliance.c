@@ -1,13 +1,15 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * dvd_appliance.c — physical-DVD autoplay supervisor for
- * DVD Player - Appliance. No launcher UI, no ISO library, no ripper.
+ * dvd_appliance.c — Appliance supervisor.
  *
- * State machine:
- *   NO_DISC → DISC_DETECTED → PLAYING → WAIT_EJECT → NO_DISC
+ * A1: physical DVD autoplay with WAIT_EJECT after exit.
+ * A2: OSD Play ISO via PLAY_ISO <path> on /tmp/dvd_appliance.cmd.
  *
- * Hold CANCEL/B in the player still exits playback. This supervisor
- * will not relaunch the same inserted disc.
+ * States:
+ *   NO_DISC / IDLE
+ *   PLAYING_PHYSICAL
+ *   WAIT_EJECT
+ *   PLAYING_ISO
  */
 
 #ifndef _FILE_OFFSET_BITS
@@ -70,20 +72,25 @@
 #define APPLIANCE_LOG   APPLIANCE_ROOT "/logs"
 #define PLAYER_NAME     "dvd_av_threaded_test"
 #define PID_FILE        "/tmp/dvd_appliance.pid"
+#define CMD_FIFO        "/tmp/dvd_appliance.cmd"
 #define POLL_US         1000000
 #define PLAYER_TERM_SEC 8
 
 enum {
 	ST_NO_DISC = 0,
-	ST_PLAYING,
-	ST_WAIT_EJECT
+	ST_PLAYING_PHYSICAL,
+	ST_WAIT_EJECT,
+	ST_PLAYING_ISO
 };
 
 static volatile sig_atomic_t g_stop;
 static pid_t g_child = -1;
 static int g_pid_fd = -1;
+static int g_cmd_fd = -1;
 static int g_state = ST_NO_DISC;
-static int g_last_kind = -1; /* last disc classify: -1 none, 0 empty, 1 dvd, 2 other */
+static int g_last_kind = -1;
+static char g_pending_iso[PATH_MAX];
+static int g_have_pending;
 
 static void on_signal(int sig)
 {
@@ -129,6 +136,18 @@ static void clear_pidfile(void)
 		g_pid_fd = -1;
 	}
 	unlink(PID_FILE);
+}
+
+static void open_cmd_fifo(void)
+{
+	if (mkfifo(CMD_FIFO, 0666) < 0 && errno != EEXIST)
+		fprintf(stderr, "APPLIANCE: mkfifo %s: %s\n",
+		        CMD_FIFO, strerror(errno));
+	/* RDWR so a reader-only open does not see EOF when Main is idle. */
+	g_cmd_fd = open(CMD_FIFO, O_RDWR | O_NONBLOCK);
+	if (g_cmd_fd < 0)
+		fprintf(stderr, "APPLIANCE: open %s: %s\n",
+		        CMD_FIFO, strerror(errno));
 }
 
 static void dvdread_quiet(void *p, dvd_logger_level_t level, const char *fmt,
@@ -206,7 +225,17 @@ static void player_path(char *out, size_t cap)
 	snprintf(out, cap, "%s/%s", APPLIANCE_BIN, PLAYER_NAME);
 }
 
-static int launch_player(void)
+static int path_is_iso(const char *p)
+{
+	const char *dot;
+
+	if (!p || !p[0])
+		return 0;
+	dot = strrchr(p, '.');
+	return dot && strcasecmp(dot, ".iso") == 0;
+}
+
+static int launch_player(const char *source, int is_iso)
 {
 	char player[512];
 	pid_t pid;
@@ -223,7 +252,10 @@ static int launch_player(void)
 	mkdir(APPLIANCE_LOG, 0755);
 	snprintf(logpath, sizeof(logpath), "%s/player.log", APPLIANCE_LOG);
 
-	fprintf(stderr, "APPLIANCE: launching player %s\n", SR0_PATH);
+	if (is_iso)
+		fprintf(stderr, "APPLIANCE: launching ISO path=%s\n", source);
+	else
+		fprintf(stderr, "APPLIANCE: launching player %s\n", source);
 	fflush(stderr);
 	pid = fork();
 	if (pid < 0) {
@@ -238,7 +270,7 @@ static int launch_player(void)
 			if (fd != STDOUT_FILENO && fd != STDERR_FILENO)
 				close(fd);
 		}
-		execl(player, PLAYER_NAME, SR0_PATH,
+		execl(player, PLAYER_NAME, source,
 		      "--buffered-yuv-video",
 		      "--fpga-yuv420",
 		      "--fpga-yuv420-subtitles",
@@ -305,6 +337,121 @@ static void log_classify(int kind)
 	fflush(stderr);
 }
 
+static int start_iso(const char *path)
+{
+	struct stat st;
+
+	if (!path_is_iso(path) || stat(path, &st) != 0 ||
+	    !S_ISREG(st.st_mode) || access(path, R_OK) != 0) {
+		fprintf(stderr, "APPLIANCE: ISO reject path=%s\n", path);
+		fflush(stderr);
+		return -1;
+	}
+	if (launch_player(path, 1) != 0)
+		return -1;
+	g_state = ST_PLAYING_ISO;
+	return 0;
+}
+
+static void queue_or_start_iso(const char *path)
+{
+	fprintf(stderr, "APPLIANCE: ISO request path=%s\n", path);
+	fflush(stderr);
+
+	if (g_state == ST_PLAYING_PHYSICAL || g_state == ST_PLAYING_ISO) {
+		snprintf(g_pending_iso, sizeof(g_pending_iso), "%s", path);
+		g_have_pending = 1;
+		fprintf(stderr,
+		        "APPLIANCE: ISO queued until current player exits path=%s\n",
+		        path);
+		fflush(stderr);
+		return;
+	}
+
+	(void)start_iso(path);
+}
+
+static void consume_pending_iso(void)
+{
+	char path[PATH_MAX];
+
+	if (!g_have_pending)
+		return;
+	snprintf(path, sizeof(path), "%s", g_pending_iso);
+	g_have_pending = 0;
+	g_pending_iso[0] = 0;
+	(void)start_iso(path);
+}
+
+static void after_player_exit(int was_iso, int st)
+{
+	if (was_iso)
+		fprintf(stderr, "APPLIANCE: ISO player exited status=%d\n", st);
+	else
+		fprintf(stderr, "APPLIANCE: player exited status=%d\n", st);
+	fflush(stderr);
+
+	if (g_have_pending) {
+		consume_pending_iso();
+		if (g_state == ST_PLAYING_ISO)
+			return;
+		/* pending ISO rejected; fall through to idle/WAIT_EJECT */
+	}
+
+	if (was_iso) {
+		/*
+		 * ISO must not use WAIT_EJECT for another ISO, but a still-
+		 * inserted physical disc must not autoplay until eject.
+		 */
+		if (classify_media() == 0) {
+			g_state = ST_NO_DISC;
+			g_last_kind = -1;
+			log_line("APPLIANCE: ISO idle (no physical disc)");
+		} else {
+			g_state = ST_WAIT_EJECT;
+			log_line("APPLIANCE: ISO idle; physical disc still inserted - autoplay suppressed until eject");
+		}
+		return;
+	}
+
+	if (classify_media() == 0) {
+		g_state = ST_NO_DISC;
+		g_last_kind = -1;
+		log_line("APPLIANCE: disc removed - autoplay rearmed");
+	} else {
+		g_state = ST_WAIT_EJECT;
+		log_line("APPLIANCE: suppress relaunch until eject");
+	}
+}
+
+static void poll_iso_cmd(void)
+{
+	char buf[PATH_MAX + 64];
+	ssize_t n;
+	char *nl, *path;
+
+	if (g_cmd_fd < 0)
+		return;
+	n = read(g_cmd_fd, buf, sizeof(buf) - 1);
+	if (n <= 0)
+		return;
+	buf[n] = 0;
+	nl = strchr(buf, '\n');
+	if (nl)
+		*nl = 0;
+	if (strncmp(buf, "PLAY_ISO ", 9) != 0) {
+		fprintf(stderr, "APPLIANCE: ignore cmd %s\n", buf);
+		fflush(stderr);
+		return;
+	}
+	path = buf + 9;
+	while (*path == ' ' || *path == '\t')
+		path++;
+	if (!path[0])
+		return;
+	queue_or_start_iso(path);
+}
+
 int main(void)
 {
 	struct sigaction sa;
@@ -321,26 +468,17 @@ int main(void)
 	signal(SIGPIPE, SIG_IGN);
 
 	write_pidfile();
+	open_cmd_fifo();
 	log_line("APPLIANCE: supervisor start");
 
 	while (!g_stop) {
 		int kind, st;
 
-		if (g_state == ST_PLAYING) {
-			if (reap_player(&st)) {
-				fprintf(stderr,
-				        "APPLIANCE: player exited status=%d\n",
-				        st);
-				fflush(stderr);
-				if (classify_media() == 0) {
-					g_state = ST_NO_DISC;
-					g_last_kind = -1;
-					log_line("APPLIANCE: disc removed - autoplay rearmed");
-				} else {
-					g_state = ST_WAIT_EJECT;
-					log_line("APPLIANCE: suppress relaunch until eject");
-				}
-			}
+		poll_iso_cmd();
+
+		if (g_state == ST_PLAYING_PHYSICAL || g_state == ST_PLAYING_ISO) {
+			if (reap_player(&st))
+				after_player_exit(g_state == ST_PLAYING_ISO, st);
 			usleep(200000);
 			continue;
 		}
@@ -350,8 +488,8 @@ int main(void)
 
 		if (g_state == ST_NO_DISC) {
 			if (kind == 1) {
-				if (launch_player() == 0)
-					g_state = ST_PLAYING;
+				if (launch_player(SR0_PATH, 0) == 0)
+					g_state = ST_PLAYING_PHYSICAL;
 				else
 					usleep(POLL_US);
 				continue;
@@ -367,6 +505,10 @@ int main(void)
 	}
 
 	stop_player();
+	if (g_cmd_fd >= 0) {
+		close(g_cmd_fd);
+		g_cmd_fd = -1;
+	}
 	log_line("APPLIANCE: supervisor stop");
 	clear_pidfile();
 	return 0;

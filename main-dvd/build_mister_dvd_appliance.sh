@@ -134,7 +134,7 @@ elif [ -d "$SRC/.git" ]; then
 fi
 
 if [ -d "$SRC/.git" ]; then
-    git -C "$SRC" checkout -- fpga_io.cpp user_io.cpp Makefile
+    git -C "$SRC" checkout -- fpga_io.cpp user_io.cpp Makefile menu.cpp
     git -C "$SRC" clean -f -- dvd_main.cpp dvd_main.h
 fi
 
@@ -143,6 +143,7 @@ python3 "$HERE/apply_dvd_hooks.py"
 # The original apply_dvd_hooks.py still copies checkpoint dvd_main.* first.
 cp -f "$HERE/appliance/dvd_main.cpp" "$SRC/dvd_main.cpp"
 cp -f "$HERE/appliance/dvd_main.h" "$SRC/dvd_main.h"
+python3 "$HERE/appliance/apply_iso_hooks.py"
 perl -i -pe 's/^PRJ = MiSTer_DVD$/PRJ = MiSTer_DVD_Appliance/' "$SRC/Makefile"
 grep -q '^PRJ = MiSTer_DVD_Appliance$' "$SRC/Makefile" \
     || die "Makefile PRJ was not set to MiSTer_DVD_Appliance"

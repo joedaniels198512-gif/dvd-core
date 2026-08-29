@@ -1,0 +1,6 @@
+Name: Appliance A2 OSD Play ISO
+Branch: feature/appliance-osd-iso
+A1 checkpoint: c0d9107 / dvd-player-appliance-a1-known-good
+FPGA: GitHub Actions 33252703487 PASS
+CONF_STR: DVD-Player-Appliance + F0,ISO,Play ISO...
+Player: Test 9.3.1 known-good, not rebuilt
