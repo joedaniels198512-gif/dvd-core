@@ -21,64 +21,7 @@ The MiSTer / SuperStation One requires a **32-bit ARM hard-float Linux (`armhf`)
 
 ### Where to get libdvdcss
 
-libdvdcss is maintained by VideoLAN:
-
-https://www.videolan.org/developers/libdvdcss.html
-
-Official source releases:
-
-https://download.videolan.org/libdvdcss/
-
-At the time of writing, the current release is:
-
-`libdvdcss-1.6.0.tar.xz`
-
-VideoLAN supplies the source code rather than a MiSTer-specific binary, so you will normally need to build it for `arm-linux-gnueabihf`.
-
-### Building libdvdcss for MiSTer
-
-The easiest way is from a Debian or Ubuntu Linux machine or VM.
-
-Install the ARM hard-float compiler and build tools:
-
-```bash
-sudo apt update
-sudo apt install -y \
-  gcc-arm-linux-gnueabihf \
-  g++-arm-linux-gnueabihf \
-  meson \
-  ninja-build \
-  pkg-config \
-  xz-utils \
-  wget
-```
-
-Download the official source:
-
-```bash
-wget https://download.videolan.org/libdvdcss/1.6.0/libdvdcss-1.6.0.tar.xz
-tar -xf libdvdcss-1.6.0.tar.xz
-cd libdvdcss-1.6.0
-```
-
-Build it for 32-bit ARM hard-float Linux:
-
-```bash
-meson setup build \
-  --cross-file package/crossfiles/arm-linux-gnueabihf.meson
-
-meson compile -C build
-```
-
-Locate the generated shared library:
-
-```bash
-find build -name 'libdvdcss.so*'
-```
-
-The important runtime filename is:
-
-`libdvdcss.so.2`
+The Archives of the internet might have it somewhere if you search for exactly libdvdcss.so.2
 
 ### Installing it for MiSTer DVD Player
 
