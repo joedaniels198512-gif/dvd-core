@@ -1,102 +1,139 @@
 # MiSTer DVD Player
 
-**Public beta 0.1** for SuperStation One and compatible MiSTer hardware with
+**v0.2.0 beta 1** for SuperStation One and compatible MiSTer hardware with
 an optical drive.
 
-This is an experimental DVD-Video player. It is not a finished commercial
-DVD appliance, and it is not a general video-file player (no MKV, H.264, or
-similar).
+A DVD-Video player for MiSTer / SuperStation One. It is beta software, not
+a finished commercial DVD player, and not a general video-file player
+(no MKV, H.264, or similar).
 
 by Mojojojo198512
 
 
-## What it does
+## What it is
 
-- Play a **physical DVD** from a compatible optical drive (SuperDock or
-  similar, seen by Linux as `/dev/sr0`)
-- Play **DVD-Video ISO** files from the SD card or USB
-- Follow **authored DVD menus** and navigation
-- Output over **HDMI** (MiSTer scaler) and **native CRT**
-- Support **PAL** and **NTSC** video (see testing status below)
-- **Rip a physical DVD to a USB stick** as a single `.iso`
-
-When you select the DVD-Player core, MiSTer switches to a core-specific
-Main binary (`MiSTer_DVD`) that starts the launcher automatically. Stock
-`/media/fat/MiSTer` is not replaced. No background daemon is required.
+Select **DVD Player** on MiSTer. A physical DVD already in the drive
+autoplays. Insert a disc while the core is open and it autoplays. Use
+OSD **Play ISO...** for DVD-Video ISO files from USB or SD.
 
 
-## Testing status (this beta)
+## Current primary features
 
-| Path | Status |
-|---|---|
-| PAL physical disc | Tested successfully |
-| NTSC ISO | Tested |
-| NTSC physical disc | **Not tested** |
-
-Settled playback samples on the freeze hardware:
-
-- PAL physical feature: **24.99 fps** vs 25.00 nominal, **0** new underruns
-- NTSC ISO: **29.95 fps** vs 29.97 nominal, **0** new underruns
-
-
-## Hardware
-
-Verified on **SuperStation One** (Cyclone V, dual-core Cortex-A9) with a
-working optical drive at `/dev/sr0`.
-
-You need:
-
-- SuperStation One or compatible MiSTer
-- A compatible USB optical drive / SuperDock that appears as `/dev/sr0`
-- HDMI and/or CRT as supported by your MiSTer video setup
-- For ripping: a writable USB volume mounted as `/media/usb0`,
-  `/media/usb1`, … (exFAT recommended for large discs)
+- Physical DVD playback from a compatible optical drive (`/dev/sr0`)
+- Physical disc autoplay inside the DVD Player core
+- Authored DVD navigation and menus
+- ISO playback from OSD **Play ISO...**
+- USB and SD ISO storage (USB wins when the core folder exists)
+- PAL and NTSC
+- Automatic 4:3 / 16:9 on HDMI / scaler (authored DVD IFO)
+- Manual aspect override (OSD Auto / 4:3 / 16:9)
+- Subtitles
+- Runtime audio-track switching
+- Interactive DVD stills and menus
 
 
 ## Install
 
 See **[INSTALL.md](INSTALL.md)**.
 
-**Manual (this zip):** extract the zip contents to the **root** of the
-MiSTer SD card, then **add** (do not replace your existing `MiSTer.ini`):
+Extract **`MiSTer_DVD_Player_0.2.0-beta.1.zip`** to the **root** of the
+MiSTer SD card (`/media/fat` when running), then **add** (do not replace
+your existing `MiSTer.ini`):
 
 ```
 [DVD-Player]
 main=MiSTer_DVD
 ```
 
-Save, reboot or return to MiSTer, and launch **MiSTer DVD Player**.
+You should have:
 
-**MiSTer Companion / Update All:** once the core is in those databases,
-they can add the same `MiSTer.ini` entry automatically. No installer
-script is required either way.
+```
+/media/fat/DVD_Player.rbf
+/media/fat/MiSTer_DVD
+/media/fat/DVD/bin/
+/media/fat/DVD/lib/
+/media/fat/DVD/logs/
+/media/fat/DVD/config/
+/media/fat/games/DVD-Player/
+```
+
+Do **not** replace stock `/media/fat/MiSTer` with `MiSTer_DVD`.
 
 
-## Basic controls
+## ISO storage
 
-Launcher (D-pad + Confirm / Back):
+- SD (created automatically): `/media/fat/games/DVD-Player/`
+- USB (create this folder yourself if you want USB ISOs):
+  `/games/DVD-Player/` on the USB drive  
+  Example: `/media/usb0/games/DVD-Player/Movie.iso`
 
-1. **Play Physical DVD**
-2. **DVD Library** (ISOs)
-3. **Rip DVD to USB**
+If the USB core folder exists, MiSTer uses it. Otherwise the SD folder
+is used. Empty USB core folders are not created automatically. Existing
+ISOs are never moved or copied for you.
 
-During playback (MiSTer joystick mapping for this core):
+
+## Physical drive
+
+Verified on **SuperStation One** (Cyclone V, dual-core Cortex-A9) with a
+USB optical drive / SuperDock that Linux sees as `/dev/sr0`.
+
+You need:
+
+- SuperStation One or compatible MiSTer
+- A compatible USB optical drive / SuperDock at `/dev/sr0`
+- HDMI and/or CRT as supported by your MiSTer video setup
+
+
+## Physical DVD
+
+- Select DVD Player — an already inserted DVD autoplays
+- Insert a DVD while the core is open — it autoplays
+- Eject — playback stops
+- Hold CANCEL/B — stops playback
+- The same physical disc does not instantly restart until eject/reinsert
+
+
+## ISO playback
+
+OSD **Play ISO...** opens the standard MiSTer file browser (USB-first
+core folder, then SD). The full path is passed to ARM. The ISO is not
+streamed to the FPGA. ISO → ISO and physical DVD → ISO replacement are
+supported, including filenames with spaces.
+
+
+## Aspect
+
+OSD **Aspect: Auto / 4:3 / 16:9**, default **Auto**.
+
+Authored DVD IFO `display_aspect_ratio`: `0` = 4:3, `3` = 16:9.
+HDMI / scaler follows that automatically. The native analogue CRT raster
+is not stretched; a widescreen TV may need a manual 16:9 setting.
+
+
+## Controls
+
+During playback (this core’s joystick mapping):
 
 | Control | Action |
 |---|---|
 | D-pad | Menu / highlight navigation |
 | Confirm (A) | Select |
 | Back (B) | DVD back / cancel |
-| Hold Back ~3 seconds | Return to the launcher |
+| Hold Back ~3 seconds | Stop playback |
 | Start | Play / Pause |
 | DVD Menu (X) | DVD menu |
 | L / R | Previous / next chapter |
 | Y | Subtitle toggle (where the disc supports it) |
 | Select | Next audio track |
 
-OSD (usual MiSTer OSD button): **TV Mode** (Auto / NTSC / PAL),
-**CRT** (Native / Stabilized), **A/V Sync**. HDMI users often leave CRT on
-Native. Stabilized is intended mainly for CRT.
+OSD also has **TV Mode** (Auto / NTSC / PAL), **CRT** (Native /
+Stabilized), and **A/V Sync**. HDMI users usually leave CRT on Native.
+
+
+## Logs
+
+`/media/fat/DVD/logs/player.log`  
+`/media/fat/DVD/logs/dvd_player.log`
 
 
 ## CSS-encrypted discs
@@ -104,17 +141,24 @@ Native. Stabilized is intended mainly for CRT.
 **This package does not include libdvdcss.**
 
 Unencrypted discs and ISO playback do not depend on us distributing that
-library. CSS-encrypted **physical** discs may not play or rip until you
-place a compatible `libdvdcss.so.2` yourself. Details: [INSTALL.md](INSTALL.md)
-and [LEGAL.md](LEGAL.md).
+library. Encrypted commercial **physical** discs require you to obtain
+and install libdvdcss separately. The runtime file must be named exactly
+`libdvdcss.so.2` at `/media/fat/DVD/lib/libdvdcss.so.2`. Details:
+[INSTALL.md](INSTALL.md) and [LEGAL.md](LEGAL.md).
 
 
-## Known limitations
+## Limitations
 
-See **[KNOWN_ISSUES.md](KNOWN_ISSUES.md)**. In short: public beta; NTSC
-physical discs untested; encrypted physical discs need user-supplied
-libdvdcss; ripping needs spare USB space; startup can briefly glitch
-while audio becomes the clock master.
+See **[KNOWN_ISSUES.md](KNOWN_ISSUES.md)**. In short: this is beta
+software; not every DVD is guaranteed to work; encrypted physical discs
+need user-supplied libdvdcss; native CRT does not signal 4:3 vs 16:9 to
+the television; multi-angle switching is not implemented.
+
+
+## Compatibility reports
+
+Please use the GitHub **DVD compatibility report** issue form. Do **not**
+upload commercial DVD ISOs, VOBs, decrypted disc contents, or CSS keys.
 
 
 ## Licence and source
@@ -124,7 +168,7 @@ Open-source community project. See [LEGAL.md](LEGAL.md),
 [SOURCE_INFO.md](SOURCE_INFO.md), and [LICENSES/](LICENSES/).
 
 Corresponding source for redistributed Debian binaries and FFmpeg is in
-the public-beta zip under `SOURCES/` and in this repository.
+the zip under `SOURCES/` and in this repository.
 
 
 ## Credits
@@ -132,16 +176,10 @@ the public-beta zip under `SOURCES/` and in this repository.
 [CREDITS.md](CREDITS.md)
 
 
-## Screenshots
-
-_Add screenshots here when available._
-
-
 ## Other documents
 
-- [INSTALL.md](INSTALL.md) — extract to SD root and MiSTer.ini
-- [RELEASE_NOTES_0.1.md](RELEASE_NOTES_0.1.md) — 0.1 announcement
+- [INSTALL.md](INSTALL.md)
 - [CHANGELOG.md](CHANGELOG.md)
+- [COMPATIBILITY.md](COMPATIBILITY.md)
+- [CONTRIBUTING.md](CONTRIBUTING.md)
 - [PRIVACY.md](PRIVACY.md)
-- [COMPLIANCE_PUBLIC_BETA_0.1.md](COMPLIANCE_PUBLIC_BETA_0.1.md) —
-  package contents and licence compliance (technical)

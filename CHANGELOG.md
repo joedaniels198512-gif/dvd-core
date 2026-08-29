@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.0-beta.1
+
+DVD Player core for SuperStation One / MiSTer. Beta software.
+
+- Physical DVD autoplay (insert / already inserted); eject and hold CANCEL/B stop playback
+- OSD **Play ISO...** with USB-first `/games/DVD-Player/` then SD `/media/fat/games/DVD-Player/`
+- ISO → ISO and physical → ISO replacement; filenames with spaces
+- Authored DVD menus, stills, subtitles
+- Automatic HDMI/scaler 4:3 and 16:9 from DVD IFO (`0` / `3`); manual Auto / 4:3 / 16:9
+- Runtime audio-track switching with audio clock rebase (no fixed PTS fudge);
+  hardware-confirmed: AUDIO NEXT stays in sync after a track change
+- Public names: SETNAME `DVD-Player`, RBF `DVD_Player.rbf`, Main `MiSTer_DVD`, runtime `/media/fat/DVD/`
+- No libdvdcss shipped; no old launcher UI in this package
+
 ## 0.1.0-beta
 
 First **public** beta of MiSTer DVD Player for SuperStation One / MiSTer.

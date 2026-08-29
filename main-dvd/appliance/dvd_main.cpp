@@ -21,23 +21,22 @@
 #include "file_io.h"
 
 /*
- * Appliance supervisor for MiSTer_DVD_Appliance.
+ * DVD Player supervisor for the public MiSTer_DVD Main binary.
  *
- * /tmp/dvd_appliance.pid is written by dvd_appliance after it takes an
+ * /tmp/dvd_player.pid is written by dvd_player after it takes an
  * exclusive flock. This module never flocks that file.
  *
  * Does not start or supervise /media/fat/DVD/dev/dvd_launcher.
  */
 
-#define DVD_APPLIANCE_PATH    "/media/fat/DVD_Appliance/bin/dvd_appliance"
-#define DVD_APPLIANCE_LIB_DIR "/media/fat/DVD_Appliance/lib"
+#define DVD_PLAYER_BIN        "/media/fat/DVD/bin/dvd_player"
 #define DVD_LIB_DIR           "/media/fat/DVD/lib"
-#define DVD_APPLIANCE_LOG_DIR "/media/fat/DVD_Appliance/logs"
-#define DVD_APPLIANCE_LOG     DVD_APPLIANCE_LOG_DIR "/appliance.log"
-#define DVD_APPLIANCE_PREV    DVD_APPLIANCE_LOG_DIR "/appliance.previous.log"
-#define DVD_APPLIANCE_PIDFILE "/tmp/dvd_appliance.pid"
-#define DVD_APPLIANCE_CMD_FIFO "/tmp/dvd_appliance.cmd"
-#define DVD_APPLIANCE_ISO_INDEX 0
+#define DVD_LOG_DIR           "/media/fat/DVD/logs"
+#define DVD_LOG               DVD_LOG_DIR "/dvd_player.log"
+#define DVD_LOG_PREV          DVD_LOG_DIR "/dvd_player.previous.log"
+#define DVD_PIDFILE           "/tmp/dvd_player.pid"
+#define DVD_CMD_FIFO          "/tmp/dvd_player.cmd"
+#define DVD_ISO_INDEX         0
 
 #define TERM_WAIT_SEC       8
 #define KILL_WAIT_SEC       2
@@ -80,7 +79,8 @@ static int exe_is_mister_dvd_appliance(void)
 		return 0;
 	base = strrchr(p, '/');
 	base = base ? base + 1 : p;
-	return strcasecmp(base, "MiSTer_DVD_Appliance") == 0;
+	return strcasecmp(base, "MiSTer_DVD") == 0 ||
+	       strcasecmp(base, "MiSTer_DVD_Appliance") == 0;
 }
 
 static int name_is_dvd_player(const char *n)
@@ -131,7 +131,8 @@ static int read_cmdline(pid_t pid, char *buf, size_t buflen)
 
 static int cmdline_is_appliance(const char *cmd)
 {
-	return cmd && strstr(cmd, "dvd_appliance") != NULL;
+	return cmd && (strstr(cmd, "dvd_player") != NULL ||
+	               strstr(cmd, "dvd_appliance") != NULL);
 }
 
 static int cmdline_is_player(const char *cmd)
@@ -164,7 +165,7 @@ static int owned_child_live(void)
 		if (g_launch_state == LAUNCH_STARTING && pid_is_appliance(g_child_pid))
 		{
 			g_launch_state = LAUNCH_RUNNING;
-			printf("APPLIANCE_MAIN: supervisor pid=%ld exec complete\n",
+			printf("DVD_MAIN: supervisor pid=%ld exec complete\n",
 			       (long)g_child_pid);
 		}
 		else if (g_launch_state == LAUNCH_NONE)
@@ -173,7 +174,7 @@ static int owned_child_live(void)
 	}
 	if (r == g_child_pid)
 	{
-		printf("APPLIANCE_MAIN: supervisor pid=%ld exited status=%d\n",
+		printf("DVD_MAIN: supervisor pid=%ld exited status=%d\n",
 		       (long)r, st);
 		g_owned = 0;
 		g_child_pid = -1;
@@ -182,7 +183,7 @@ static int owned_child_live(void)
 	}
 	if (r < 0)
 	{
-		printf("APPLIANCE_MAIN: waitpid pid=%ld: %s\n",
+		printf("DVD_MAIN: waitpid pid=%ld: %s\n",
 		       (long)g_child_pid, strerror(errno));
 		g_owned = 0;
 		g_child_pid = -1;
@@ -247,7 +248,7 @@ static pid_t scan_proc_appliance(void)
 
 static pid_t find_live_appliance(void)
 {
-	pid_t pid = read_pidfile(DVD_APPLIANCE_PIDFILE);
+	pid_t pid = read_pidfile(DVD_PIDFILE);
 	if (pid_is_appliance(pid))
 		return pid;
 	return scan_proc_appliance();
@@ -257,12 +258,12 @@ static void rotate_appliance_log(void)
 {
 	struct stat st;
 
-	mkdir("/media/fat/DVD_Appliance", 0755);
-	mkdir(DVD_APPLIANCE_LOG_DIR, 0755);
+	mkdir("/media/fat/DVD", 0755);
+	mkdir(DVD_LOG_DIR, 0755);
 	mkdir("/media/fat/games", 0755);
 	mkdir("/media/fat/games/DVD-Player", 0755);
-	if (stat(DVD_APPLIANCE_LOG, &st) == 0)
-		rename(DVD_APPLIANCE_LOG, DVD_APPLIANCE_PREV);
+	if (stat(DVD_LOG, &st) == 0)
+		rename(DVD_LOG, DVD_LOG_PREV);
 }
 
 static void adopt_appliance(pid_t pid, int owned)
@@ -273,7 +274,7 @@ static void adopt_appliance(pid_t pid, int owned)
 		g_launch_state = LAUNCH_RUNNING;
 	else if (g_launch_state == LAUNCH_NONE)
 		g_launch_state = LAUNCH_RUNNING;
-	printf("APPLIANCE_MAIN: using supervisor pid=%ld owned=%d state=%d\n",
+	printf("DVD_MAIN: using supervisor pid=%ld owned=%d state=%d\n",
 	       (long)pid, owned, g_launch_state);
 }
 
@@ -285,20 +286,20 @@ static int spawn_appliance(int rotate)
 
 	if (owned_child_live())
 	{
-		printf("APPLIANCE_MAIN: spawn skipped, owned pid=%ld still live\n",
+		printf("DVD_MAIN: spawn skipped, owned pid=%ld still live\n",
 		       (long)g_child_pid);
 		return 0;
 	}
 
-	if (access(DVD_APPLIANCE_PATH, X_OK) != 0)
+	if (access(DVD_PLAYER_BIN, X_OK) != 0)
 	{
-		printf("APPLIANCE_MAIN: supervisor missing: %s (%s)\n",
-		       DVD_APPLIANCE_PATH, strerror(errno));
+		printf("DVD_MAIN: supervisor missing: %s (%s)\n",
+		       DVD_PLAYER_BIN, strerror(errno));
 		return -1;
 	}
 
-	mkdir("/media/fat/DVD_Appliance", 0755);
-	mkdir(DVD_APPLIANCE_LOG_DIR, 0755);
+	mkdir("/media/fat/DVD", 0755);
+	mkdir(DVD_LOG_DIR, 0755);
 	mkdir("/media/fat/games", 0755);
 	mkdir("/media/fat/games/DVD-Player", 0755);
 	if (rotate)
@@ -307,7 +308,7 @@ static int spawn_appliance(int rotate)
 	pid = fork();
 	if (pid < 0)
 	{
-		printf("APPLIANCE_MAIN: fork failed: %s\n", strerror(errno));
+		printf("DVD_MAIN: fork failed: %s\n", strerror(errno));
 		return -1;
 	}
 	if (pid == 0)
@@ -315,14 +316,12 @@ static int spawn_appliance(int rotate)
 		int fd;
 
 		old = getenv("LD_LIBRARY_PATH");
-		/* Appliance libs first. Existing DVD/lib is a read-only
-		 * fallback (libdvdcss) and is never written. */
+		/* /media/fat/DVD/lib first. User-supplied libdvdcss may
+		 * already live here and is never written by this Main. */
 		if (old && old[0])
-			snprintf(ld, sizeof(ld), "%s:%s:%s",
-			         DVD_APPLIANCE_LIB_DIR, DVD_LIB_DIR, old);
+			snprintf(ld, sizeof(ld), "%s:%s", DVD_LIB_DIR, old);
 		else
-			snprintf(ld, sizeof(ld), "%s:%s",
-			         DVD_APPLIANCE_LIB_DIR, DVD_LIB_DIR);
+			snprintf(ld, sizeof(ld), "%s", DVD_LIB_DIR);
 		setenv("LD_LIBRARY_PATH", ld, 1);
 
 		fd = open("/dev/null", O_RDONLY);
@@ -332,7 +331,7 @@ static int spawn_appliance(int rotate)
 			if (fd != STDIN_FILENO)
 				close(fd);
 		}
-		fd = open(DVD_APPLIANCE_LOG, O_WRONLY | O_CREAT | O_APPEND, 0644);
+		fd = open(DVD_LOG, O_WRONLY | O_CREAT | O_APPEND, 0644);
 		if (fd >= 0)
 		{
 			dup2(fd, STDOUT_FILENO);
@@ -341,14 +340,14 @@ static int spawn_appliance(int rotate)
 				close(fd);
 		}
 
-		execl(DVD_APPLIANCE_PATH, DVD_APPLIANCE_PATH, (char *)NULL);
+		execl(DVD_PLAYER_BIN, DVD_PLAYER_BIN, (char *)NULL);
 		_exit(127);
 	}
 
 	g_last_start_ts = time(NULL);
 	g_launch_state = LAUNCH_STARTING;
 	adopt_appliance(pid, 1);
-	printf("APPLIANCE_MAIN: supervisor started pid=%ld (starting)\n", (long)pid);
+	printf("DVD_MAIN: supervisor started pid=%ld (starting)\n", (long)pid);
 	return 0;
 }
 
@@ -444,11 +443,11 @@ void dvd_main_stop_all(void)
 	pid = g_child_pid;
 	if (g_owned && pid > 0)
 	{
-		printf("APPLIANCE_MAIN: stopping owned supervisor pid=%ld\n", (long)pid);
+		printf("DVD_MAIN: stopping owned supervisor pid=%ld\n", (long)pid);
 		kill(pid, SIGTERM);
 		if (!wait_pid_gone(pid, TERM_WAIT_SEC))
 		{
-			printf("APPLIANCE_MAIN: SIGKILL supervisor pid=%ld\n", (long)pid);
+			printf("DVD_MAIN: SIGKILL supervisor pid=%ld\n", (long)pid);
 			kill(pid, SIGKILL);
 			wait_pid_gone(pid, KILL_WAIT_SEC);
 		}
@@ -464,11 +463,11 @@ void dvd_main_stop_all(void)
 			pid = find_live_appliance();
 		if (pid_is_appliance(pid))
 		{
-			printf("APPLIANCE_MAIN: stopping supervisor pid=%ld\n", (long)pid);
+			printf("DVD_MAIN: stopping supervisor pid=%ld\n", (long)pid);
 			kill(pid, SIGTERM);
 			if (!wait_pid_gone(pid, TERM_WAIT_SEC))
 			{
-				printf("APPLIANCE_MAIN: SIGKILL supervisor pid=%ld\n", (long)pid);
+				printf("DVD_MAIN: SIGKILL supervisor pid=%ld\n", (long)pid);
 				kill(pid, SIGKILL);
 				wait_pid_gone(pid, KILL_WAIT_SEC);
 			}
@@ -479,7 +478,7 @@ void dvd_main_stop_all(void)
 	g_child_pid = -1;
 	g_launch_state = LAUNCH_NONE;
 	orphan_sweep();
-	printf("APPLIANCE_MAIN: Appliance processes stopped\n");
+	printf("DVD_MAIN: DVD Player processes stopped\n");
 }
 
 static int appliance_running(void)
@@ -541,7 +540,7 @@ void dvd_main_on_core_ready(void)
 		g_halt_respawn = 0;
 		g_fail_count = 0;
 		g_last_start_ts = 0;
-		printf("APPLIANCE_MAIN: DVD-Player session begin\n");
+		printf("DVD_MAIN: DVD-Player session begin\n");
 	}
 
 	if (owned_child_live())
@@ -560,7 +559,7 @@ void dvd_main_on_core_ready(void)
 	}
 	g_pending_launch = 1;
 	g_launch_not_before = mono_ms() + LAUNCH_SETTLE_MS;
-	printf("APPLIANCE_MAIN: supervisor start armed (settle %d ms)\n",
+	printf("DVD_MAIN: supervisor start armed (settle %d ms)\n",
 	       LAUNCH_SETTLE_MS);
 }
 
@@ -588,7 +587,7 @@ void dvd_main_poll(void)
 		if (mono_ms() < g_launch_not_before)
 			return;
 		g_pending_launch = 0;
-		printf("APPLIANCE_MAIN: settle delay elapsed, starting supervisor\n");
+		printf("DVD_MAIN: settle delay elapsed, starting supervisor\n");
 		start_or_adopt();
 		return;
 	}
@@ -611,7 +610,7 @@ void dvd_main_poll(void)
 	if (g_halt_respawn)
 		return;
 
-	printf("APPLIANCE_MAIN: supervisor exited unexpectedly\n");
+	printf("DVD_MAIN: supervisor exited unexpectedly\n");
 	now = time(NULL);
 	if (g_last_start_ts > 0 && (now - g_last_start_ts) <= RESPAWN_WINDOW_SEC)
 		g_fail_count++;
@@ -620,13 +619,13 @@ void dvd_main_poll(void)
 
 	if (g_fail_count > RESPAWN_MAX)
 	{
-		printf("APPLIANCE_MAIN: respawn halted (%d starts in %d seconds)\n",
+		printf("DVD_MAIN: respawn halted (%d starts in %d seconds)\n",
 		       g_fail_count, RESPAWN_WINDOW_SEC);
 		g_halt_respawn = 1;
 		return;
 	}
 
-	printf("APPLIANCE_MAIN: restart %d/%d\n", g_fail_count, RESPAWN_MAX);
+	printf("DVD_MAIN: restart %d/%d\n", g_fail_count, RESPAWN_MAX);
 	spawn_appliance(0);
 }
 
@@ -644,7 +643,7 @@ static void osd_log(const char *msg)
 {
 	printf("%s", msg);
 	fflush(stdout);
-	FILE *f = fopen(DVD_APPLIANCE_LOG, "a");
+	FILE *f = fopen(DVD_LOG, "a");
 	if (f)
 	{
 		fputs(msg, f);
@@ -671,17 +670,17 @@ int dvd_appliance_handle_iso_select(const char *sel_path, int ioctl_index)
 	 * Never let this core fall through to user_io_file_tx. A DVD ISO
 	 * must stay a Linux file; FPGA upload is not acceptable.
 	 */
-	if (ioctl_index != DVD_APPLIANCE_ISO_INDEX)
+	if (ioctl_index != DVD_ISO_INDEX)
 	{
 		snprintf(msg, sizeof(msg),
-		         "APPLIANCE OSD: ignore selector index=%d (Play ISO is F0)\n",
+		         "DVD OSD: ignore selector index=%d (Play ISO is F0)\n",
 		         ioctl_index);
 		osd_log(msg);
 		return 1;
 	}
 	if (!sel_path || !sel_path[0])
 	{
-		osd_log("APPLIANCE OSD: empty ISO selection\n");
+		osd_log("DVD OSD: empty ISO selection\n");
 		return 1;
 	}
 
@@ -694,29 +693,29 @@ int dvd_appliance_handle_iso_select(const char *sel_path, int ioctl_index)
 	if (realpath(full, resolved))
 		snprintf(full, sizeof(full), "%s", resolved);
 
-	snprintf(msg, sizeof(msg), "APPLIANCE OSD: ISO selected path=%s\n", full);
+	snprintf(msg, sizeof(msg), "DVD OSD: ISO selected path=%s\n", full);
 	osd_log(msg);
 
 	if (!path_is_iso(full))
 	{
 		snprintf(msg, sizeof(msg),
-		         "APPLIANCE OSD: reject (not .iso) path=%s\n", full);
+		         "DVD OSD: reject (not .iso) path=%s\n", full);
 		osd_log(msg);
 		return 1;
 	}
 	if (stat(full, &st) != 0 || !S_ISREG(st.st_mode) || access(full, R_OK) != 0)
 	{
 		snprintf(msg, sizeof(msg),
-		         "APPLIANCE OSD: reject (not a readable file) path=%s (%s)\n",
+		         "DVD OSD: reject (not a readable file) path=%s (%s)\n",
 		         full, strerror(errno));
 		osd_log(msg);
 		return 1;
 	}
 
-	if (mkfifo(DVD_APPLIANCE_CMD_FIFO, 0666) < 0 && errno != EEXIST)
+	if (mkfifo(DVD_CMD_FIFO, 0666) < 0 && errno != EEXIST)
 	{
-		snprintf(msg, sizeof(msg), "APPLIANCE OSD: mkfifo %s: %s\n",
-		         DVD_APPLIANCE_CMD_FIFO, strerror(errno));
+		snprintf(msg, sizeof(msg), "DVD OSD: mkfifo %s: %s\n",
+		         DVD_CMD_FIFO, strerror(errno));
 		osd_log(msg);
 	}
 
@@ -724,16 +723,16 @@ int dvd_appliance_handle_iso_select(const char *sel_path, int ioctl_index)
 	if (n < 0 || n >= (int)sizeof(line))
 	{
 		snprintf(msg, sizeof(msg),
-		         "APPLIANCE OSD: path too long, not sent path=%s\n", full);
+		         "DVD OSD: path too long, not sent path=%s\n", full);
 		osd_log(msg);
 		return 1;
 	}
 
-	fd = open(DVD_APPLIANCE_CMD_FIFO, O_WRONLY | O_NONBLOCK);
+	fd = open(DVD_CMD_FIFO, O_WRONLY | O_NONBLOCK);
 	if (fd < 0)
 	{
 		snprintf(msg, sizeof(msg),
-		         "APPLIANCE OSD: cannot send to supervisor (%s). "
+		         "DVD OSD: cannot send to supervisor (%s). "
 		         "ISO was NOT transferred to FPGA.\n",
 		         strerror(errno));
 		osd_log(msg);
@@ -744,14 +743,14 @@ int dvd_appliance_handle_iso_select(const char *sel_path, int ioctl_index)
 	if (wr != n)
 	{
 		snprintf(msg, sizeof(msg),
-		         "APPLIANCE OSD: short FIFO write %d/%d (%s)\n",
+		         "DVD OSD: short FIFO write %d/%d (%s)\n",
 		         wr, n, strerror(errno));
 		osd_log(msg);
 	}
 	else
 	{
 		snprintf(msg, sizeof(msg),
-		         "APPLIANCE OSD: ISO path sent (no FPGA transfer) path=%s\n",
+		         "DVD OSD: ISO path sent (no FPGA transfer) path=%s\n",
 		         full);
 		osd_log(msg);
 	}

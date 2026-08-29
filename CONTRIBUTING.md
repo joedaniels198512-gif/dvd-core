@@ -9,9 +9,8 @@ and clear reports and small, focused changes make a big difference.
   - **Bug report** for something that is broken.
   - **DVD compatibility report** for how a specific disc behaves.
   - **Feature request** for new functionality.
-- Include a **log whenever possible**. The current build writes logs under a
-  DVD Player log directory on the SD card (the exact folder name is still being
-  finalised for release, so check what exists on your system).
+- Include a **log whenever possible**:
+  `/media/fat/DVD/logs/player.log` and `/media/fat/DVD/logs/dvd_player.log`.
 - Give **exact reproduction steps**, and note whether the problem happens every
   time and whether another DVD/ISO works.
 

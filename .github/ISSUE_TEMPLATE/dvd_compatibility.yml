@@ -180,16 +180,13 @@ body:
     attributes:
       label: Log attachment (optional)
       description: |
-        Optionally attach the player log. In the current build the log
-        directory is typically:
+        Optionally attach the player log:
 
-            /media/fat/DVD_Appliance/logs/
+            /media/fat/DVD/logs/player.log
+            /media/fat/DVD/logs/dvd_player.log
 
-        NOTE: the release folder naming is still being finalised, so this path
-        may change before the public release.
-
-        Do NOT paste or attach copyrighted disc contents (ISO / VOB / decrypted
-        DVD data).
+        Do NOT paste or attach copyrighted disc contents (ISO / VOB /
+        decrypted DVD data) or CSS keys.
       placeholder: Drag and drop the log file here, or paste relevant excerpts.
     validations:
       required: false

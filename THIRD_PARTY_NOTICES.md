@@ -1,7 +1,12 @@
-# Third-party notices — public beta 0.1
+# Third-party notices
 
-Exact versions. No CSS binary is distributed. Rip DVD to USB **is**
-distributed.
+Exact versions for redistributed components. No CSS binary is
+distributed (`libdvdcss.so.2` is not in the zip).
+
+Public **v0.2.0-beta.1** ships playback only. It does **not** include
+the historical 0.1 Rip DVD to USB helper or its `dvdbackup` /
+`genisoimage` runtime chain. Notices for those 0.1-only binaries remain
+below as the historical record.
 
 
 ## FFmpeg 6.0.1

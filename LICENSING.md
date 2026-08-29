@@ -1,9 +1,16 @@
 # Licensing map — MiSTer DVD Player
 
 This is not a single-licence repository. Licences follow the work, not a
-blanket root statement. Public beta 0.1 ships the binaries in
-`COMPLIANCE_PUBLIC_BETA_0.1.md` and `SOURCE_INFO.md`. It does **not**
-ship a `libdvdcss` binary. **Rip DVD to USB** is included.
+blanket root statement.
+
+Public **v0.2.0-beta.1** does **not** ship a rip helper, and does **not**
+ship `libdvdcss.so.2` (or any other libdvdcss binary). Encrypted
+commercial DVDs require the user to install
+`/media/fat/DVD/lib/libdvdcss.so.2` separately.
+
+Public beta 0.1 shipped the binaries in `COMPLIANCE_PUBLIC_BETA_0.1.md`
+and `SOURCE_INFO.md`. That 0.1 zip did **not** ship a `libdvdcss` binary.
+The historical 0.1 package included **Rip DVD to USB**; v0.2 does not.
 
 Frozen RC commit: `bf9197036a526e409ca22a869a6ba03e2fa65849`  
 Playback behaviour, launcher UI, and launcher font are not changed by

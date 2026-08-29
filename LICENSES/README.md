@@ -1,7 +1,8 @@
 # LICENSES — texts for components actually distributed
 
-Public beta 0.1 ships playback **and** the Rip DVD stack. It does **not**
-include a libdvdcss licence: that library is not distributed.
+Public **v0.2.0-beta.1** ships playback only. It does **not** include a
+libdvdcss licence: `libdvdcss.so.2` is not distributed. The historical
+0.1 zip also shipped a Rip DVD stack; that helper is not in v0.2.
 
 | File | Covers |
 |---|---|

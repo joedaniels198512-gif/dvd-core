@@ -30,9 +30,9 @@ done
 [ -d "$DVDREAD_DEV" ] || { echo "ERROR: missing headers: $DVDREAD_DEV"; exit 1; }
 
 mkdir -p "$OUT"
-rm -f "$OUT/dvd_appliance"
+rm -f "$OUT/dvd_player" "$OUT/dvd_appliance"
 
-echo "Building dvd_appliance..."
+echo "Building dvd_player..."
 
 "$CC" \
     -O2 \
@@ -44,7 +44,7 @@ echo "Building dvd_appliance..."
     $COMMON_FLAGS \
     -I"$HERE" \
     -I"$DVDREAD_DEV" \
-    -o "$OUT/dvd_appliance" \
+    -o "$OUT/dvd_player" \
     "$HERE/dvd_appliance.c" \
     "$DVDREAD_SO" \
     -Wl,-rpath,'$ORIGIN/../lib' \
@@ -52,7 +52,7 @@ echo "Building dvd_appliance..."
 
 echo "Checking binary for VFPv4 fused instructions..."
 
-if "$OBJDUMP" -d "$OUT/dvd_appliance" \
+if "$OBJDUMP" -d "$OUT/dvd_player" \
     | grep -E '[[:space:]](vfma|vfms|vfnma|vfnms)\.' >/dev/null
 then
     echo "ERROR: VFPv4 instruction found in binary! Refusing to deploy."
@@ -60,7 +60,7 @@ then
 fi
 
 echo "PASS: no VFPv4 fused instructions found."
-chmod +x "$OUT/dvd_appliance"
+chmod +x "$OUT/dvd_player"
 echo
-echo "Built: $OUT/dvd_appliance"
+echo "Built: $OUT/dvd_player"
 echo "Compiler: $($CC --version | head -1)"

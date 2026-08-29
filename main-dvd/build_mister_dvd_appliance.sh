@@ -139,14 +139,14 @@ if [ -d "$SRC/.git" ]; then
 fi
 
 python3 "$HERE/apply_dvd_hooks.py"
-# Replace the launcher overlay with the Appliance overlay and binary name.
-# The original apply_dvd_hooks.py still copies checkpoint dvd_main.* first.
+# Public player overlay. apply_dvd_hooks.py copies the old launcher
+# dvd_main.* first; replace it with the autoplay/ISO overlay.
 cp -f "$HERE/appliance/dvd_main.cpp" "$SRC/dvd_main.cpp"
 cp -f "$HERE/appliance/dvd_main.h" "$SRC/dvd_main.h"
 python3 "$HERE/appliance/apply_iso_hooks.py"
-perl -i -pe 's/^PRJ = MiSTer_DVD$/PRJ = MiSTer_DVD_Appliance/' "$SRC/Makefile"
-grep -q '^PRJ = MiSTer_DVD_Appliance$' "$SRC/Makefile" \
-    || die "Makefile PRJ was not set to MiSTer_DVD_Appliance"
+perl -i -pe 's/^PRJ = MiSTer_DVD_Appliance$/PRJ = MiSTer_DVD/; s/^PRJ = MiSTer$/PRJ = MiSTer_DVD/' "$SRC/Makefile"
+grep -q '^PRJ = MiSTer_DVD$' "$SRC/Makefile" \
+    || die "Makefile PRJ was not set to MiSTer_DVD"
 grep -q 'BASE.*= *arm-none-linux-gnueabihf' "$SRC/Makefile" \
     || die "Makefile BASE is not arm-none-linux-gnueabihf (refusing GCC 15 rewrite)"
 
@@ -157,7 +157,7 @@ if [ -n "$NATIVE_GCC" ] && gcc_version_ok "$NATIVE_GCC"; then
         Linux)
             info "Using native $NATIVE_GCC"
             export PATH="$(dirname "$NATIVE_GCC"):$PATH"
-            echo "Building MiSTer_DVD_Appliance (upstream $UPSTREAM) with $($NATIVE_GCC --version | head -1)"
+            echo "Building MiSTer_DVD (upstream $UPSTREAM) with $($NATIVE_GCC --version | head -1)"
             make -C "$SRC" 2>&1 | tee "$HERE/build.log"
             ;;
         *)
@@ -185,11 +185,11 @@ else
     TC=$(ensure_toolchain "$TC_HOST")
     TC_GCC="$TC/bin/${CROSS}gcc"
     [ -x "$TC_GCC" ] || die "missing $TC_GCC"
-    info "Building MiSTer_DVD_Appliance (upstream $UPSTREAM)"
+    info "Building MiSTer_DVD (upstream $UPSTREAM)"
     docker_make "$PLATFORM" "$TC" 2>&1 | tee "$HERE/build.log"
 fi
 
-BIN="$SRC/bin/MiSTer_DVD_Appliance"
+BIN="$SRC/bin/MiSTer_DVD"
 [ -f "$BIN" ] || die "missing $BIN"
 
 # Tools for gates: host binutils can inspect ARM ELF; the 10.2.1
@@ -219,6 +219,6 @@ echo "VFPv4 gate passed"
 check_glibcxx_gate "$BIN" "$READELF"
 
 mkdir -p "$HERE/bin"
-cp -f "$BIN" "$HERE/bin/MiSTer_DVD_Appliance"
-ls -l "$HERE/bin/MiSTer_DVD_Appliance"
-echo "OK $HERE/bin/MiSTer_DVD_Appliance"
+cp -f "$BIN" "$HERE/bin/MiSTer_DVD"
+ls -l "$HERE/bin/MiSTer_DVD"
+echo "OK $HERE/bin/MiSTer_DVD"

@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * dvd_appliance.c — Appliance supervisor.
+ * dvd_appliance.c — DVD Player supervisor (public binary name: dvd_player).
  *
  * A1: physical DVD autoplay with WAIT_EJECT after exit.
- * A2: OSD Play ISO via PLAY_ISO <path> on /tmp/dvd_appliance.cmd.
+ * A2: OSD Play ISO via PLAY_ISO <path> on /tmp/dvd_player.cmd.
  * A2.1: Play ISO replaces the current player (SIGTERM, wait for that pid).
  *       ISO files live in the stock SETNAME HomeDir
  *       (games/DVD-Player on USB, then SD). This process does
@@ -72,12 +72,12 @@
 #endif
 
 #define SR0_PATH        "/dev/sr0"
-#define APPLIANCE_ROOT  "/media/fat/DVD_Appliance"
-#define APPLIANCE_BIN   APPLIANCE_ROOT "/bin"
-#define APPLIANCE_LOG   APPLIANCE_ROOT "/logs"
+#define DVD_ROOT        "/media/fat/DVD"
+#define DVD_BIN         DVD_ROOT "/bin"
+#define DVD_LOG         DVD_ROOT "/logs"
 #define PLAYER_NAME     "dvd_av_threaded_test"
-#define PID_FILE        "/tmp/dvd_appliance.pid"
-#define CMD_FIFO        "/tmp/dvd_appliance.cmd"
+#define PID_FILE        "/tmp/dvd_player.pid"
+#define CMD_FIFO        "/tmp/dvd_player.cmd"
 #define POLL_US         1000000
 #define PLAY_POLL_US    100000
 #define PLAYER_TERM_SEC 8
@@ -134,7 +134,7 @@ static void write_pidfile(void)
 	if (flock(g_pid_fd, LOCK_EX | LOCK_NB) < 0) {
 		close(g_pid_fd);
 		g_pid_fd = -1;
-		fprintf(stderr, "APPLIANCE: another supervisor holds %s\n",
+		fprintf(stderr, "DVD: another supervisor holds %s\n",
 		        PID_FILE);
 		exit(1);
 	}
@@ -158,12 +158,12 @@ static void clear_pidfile(void)
 static void open_cmd_fifo(void)
 {
 	if (mkfifo(CMD_FIFO, 0666) < 0 && errno != EEXIST)
-		fprintf(stderr, "APPLIANCE: mkfifo %s: %s\n",
+		fprintf(stderr, "DVD: mkfifo %s: %s\n",
 		        CMD_FIFO, strerror(errno));
 	/* RDWR so a reader-only open does not see EOF when Main is idle. */
 	g_cmd_fd = open(CMD_FIFO, O_RDWR | O_NONBLOCK);
 	if (g_cmd_fd < 0)
-		fprintf(stderr, "APPLIANCE: open %s: %s\n",
+		fprintf(stderr, "DVD: open %s: %s\n",
 		        CMD_FIFO, strerror(errno));
 }
 
@@ -239,7 +239,7 @@ static int classify_media(void)
 
 static void player_path(char *out, size_t cap)
 {
-	snprintf(out, cap, "%s/%s", APPLIANCE_BIN, PLAYER_NAME);
+	snprintf(out, cap, "%s/%s", DVD_BIN, PLAYER_NAME);
 }
 
 static int path_is_iso(const char *p)
@@ -262,28 +262,28 @@ static int launch_player(const char *source, int is_iso)
 	player_path(player, sizeof(player));
 	if (g_child > 0) {
 		fprintf(stderr,
-		        "APPLIANCE: refuse launch — player pid=%d still alive\n",
+		        "DVD: refuse launch — player pid=%d still alive\n",
 		        (int)g_child);
 		fflush(stderr);
 		return -1;
 	}
 	if (access(player, X_OK) != 0) {
-		fprintf(stderr, "APPLIANCE: player missing %s (%s)\n",
+		fprintf(stderr, "DVD: player missing %s (%s)\n",
 		        player, strerror(errno));
 		return -1;
 	}
 
-	mkdir(APPLIANCE_LOG, 0755);
-	snprintf(logpath, sizeof(logpath), "%s/player.log", APPLIANCE_LOG);
+	mkdir(DVD_LOG, 0755);
+	snprintf(logpath, sizeof(logpath), "%s/player.log", DVD_LOG);
 
 	if (is_iso)
-		fprintf(stderr, "APPLIANCE: launching ISO path=%s\n", source);
+		fprintf(stderr, "DVD: launching ISO path=%s\n", source);
 	else
-		fprintf(stderr, "APPLIANCE: launching player %s\n", source);
+		fprintf(stderr, "DVD: launching player %s\n", source);
 	fflush(stderr);
 	pid = fork();
 	if (pid < 0) {
-		fprintf(stderr, "APPLIANCE: fork failed: %s\n", strerror(errno));
+		fprintf(stderr, "DVD: fork failed: %s\n", strerror(errno));
 		return -1;
 	}
 	if (pid == 0) {
@@ -302,7 +302,7 @@ static int launch_player(const char *source, int is_iso)
 		      "--video-advance-ms", "20",
 		      "--authored-start",
 		      (char *)NULL);
-		fprintf(stderr, "APPLIANCE: exec failed: %s\n", strerror(errno));
+		fprintf(stderr, "DVD: exec failed: %s\n", strerror(errno));
 		_exit(127);
 	}
 	g_child = pid;
@@ -317,7 +317,7 @@ static void request_player_stop(const char *why)
 		return;
 	if (g_stopping_pid == g_child)
 		return;
-	fprintf(stderr, "APPLIANCE: stopping player pid=%d\n", (int)g_child);
+	fprintf(stderr, "DVD: stopping player pid=%d\n", (int)g_child);
 	fflush(stderr);
 	kill(g_child, SIGTERM);
 	g_stopping_pid = g_child;
@@ -334,7 +334,7 @@ static int reap_player(int *status_out)
 		return 0;
 	pid = g_child;
 	if (g_stopping_pid == pid && mono_ms() >= g_stop_deadline_ms) {
-		log_line("APPLIANCE: SIGTERM timeout — SIGKILL fallback");
+		log_line("DVD: SIGTERM timeout — SIGKILL fallback");
 		kill(pid, SIGKILL);
 		g_stop_deadline_ms = mono_ms() + 2000;
 	}
@@ -344,7 +344,7 @@ static int reap_player(int *status_out)
 	if (w == pid || (w < 0 && errno != EINTR)) {
 		if (status_out)
 			*status_out = st;
-		fprintf(stderr, "APPLIANCE: player pid=%d exited status=%d\n",
+		fprintf(stderr, "DVD: player pid=%d exited status=%d\n",
 		        (int)pid, st);
 		fflush(stderr);
 		g_child = -1;
@@ -366,7 +366,7 @@ static void stop_player(void)
 	for (i = 0; i < PLAYER_TERM_SEC * 10; i++) {
 		if (waitpid(pid, &st, WNOHANG) == pid) {
 			fprintf(stderr,
-			        "APPLIANCE: player pid=%d exited status=%d\n",
+			        "DVD: player pid=%d exited status=%d\n",
 			        (int)pid, st);
 			fflush(stderr);
 			g_child = -1;
@@ -375,10 +375,10 @@ static void stop_player(void)
 		}
 		usleep(100000);
 	}
-	log_line("APPLIANCE: SIGTERM timeout — SIGKILL fallback");
+	log_line("DVD: SIGTERM timeout — SIGKILL fallback");
 	kill(pid, SIGKILL);
 	waitpid(pid, &st, 0);
-	fprintf(stderr, "APPLIANCE: player pid=%d exited status=%d\n",
+	fprintf(stderr, "DVD: player pid=%d exited status=%d\n",
 	        (int)pid, st);
 	fflush(stderr);
 	g_child = -1;
@@ -391,11 +391,11 @@ static void log_classify(int kind)
 		return;
 	g_last_kind = kind;
 	if (kind == 0)
-		log_line("APPLIANCE: no disc");
+		log_line("DVD: no disc");
 	else if (kind == 1)
-		fprintf(stderr, "APPLIANCE: DVD detected %s\n", SR0_PATH);
+		fprintf(stderr, "DVD: DVD detected %s\n", SR0_PATH);
 	else
-		log_line("APPLIANCE: unsupported media (not DVD-Video)");
+		log_line("DVD: unsupported media (not DVD-Video)");
 	fflush(stderr);
 }
 
@@ -404,12 +404,12 @@ static int start_iso(const char *path)
 	struct stat st;
 
 	if (g_child > 0) {
-		log_line("APPLIANCE: cannot start ISO while a player is still running");
+		log_line("DVD: cannot start ISO while a player is still running");
 		return -1;
 	}
 	if (!path_is_iso(path) || stat(path, &st) != 0 ||
 	    !S_ISREG(st.st_mode) || access(path, R_OK) != 0) {
-		fprintf(stderr, "APPLIANCE: ISO reject path=%s\n", path);
+		fprintf(stderr, "DVD: ISO reject path=%s\n", path);
 		fflush(stderr);
 		return -1;
 	}
@@ -421,14 +421,14 @@ static int start_iso(const char *path)
 
 static void queue_or_start_iso(const char *path)
 {
-	fprintf(stderr, "APPLIANCE: ISO request path=%s\n", path);
+	fprintf(stderr, "DVD: ISO request path=%s\n", path);
 	fflush(stderr);
 
 	snprintf(g_pending_iso, sizeof(g_pending_iso), "%s", path);
 	g_have_pending = 1;
 
 	if (g_child > 0) {
-		log_line("APPLIANCE: replacing active source with ISO");
+		log_line("DVD: replacing active source with ISO");
 		request_player_stop("ISO switch");
 		return;
 	}
@@ -449,7 +449,7 @@ static void consume_pending_iso(void)
 	snprintf(path, sizeof(path), "%s", g_pending_iso);
 	g_have_pending = 0;
 	g_pending_iso[0] = 0;
-	fprintf(stderr, "APPLIANCE: launching replacement ISO path=%s\n", path);
+	fprintf(stderr, "DVD: launching replacement ISO path=%s\n", path);
 	fflush(stderr);
 	(void)start_iso(path);
 }
@@ -457,9 +457,9 @@ static void consume_pending_iso(void)
 static void after_player_exit(int was_iso, int st)
 {
 	if (was_iso)
-		fprintf(stderr, "APPLIANCE: ISO player exited status=%d\n", st);
+		fprintf(stderr, "DVD: ISO player exited status=%d\n", st);
 	else
-		fprintf(stderr, "APPLIANCE: player exited status=%d\n", st);
+		fprintf(stderr, "DVD: player exited status=%d\n", st);
 	fflush(stderr);
 
 	if (g_have_pending) {
@@ -477,10 +477,10 @@ static void after_player_exit(int was_iso, int st)
 		if (classify_media() == 0) {
 			g_state = ST_NO_DISC;
 			g_last_kind = -1;
-			log_line("APPLIANCE: ISO idle (no physical disc)");
+			log_line("DVD: ISO idle (no physical disc)");
 		} else {
 			g_state = ST_WAIT_EJECT;
-			log_line("APPLIANCE: ISO idle; physical disc still inserted - autoplay suppressed until eject");
+			log_line("DVD: ISO idle; physical disc still inserted - autoplay suppressed until eject");
 		}
 		return;
 	}
@@ -488,10 +488,10 @@ static void after_player_exit(int was_iso, int st)
 	if (classify_media() == 0) {
 		g_state = ST_NO_DISC;
 		g_last_kind = -1;
-		log_line("APPLIANCE: disc removed - autoplay rearmed");
+		log_line("DVD: disc removed - autoplay rearmed");
 	} else {
 		g_state = ST_WAIT_EJECT;
-		log_line("APPLIANCE: suppress relaunch until eject");
+		log_line("DVD: suppress relaunch until eject");
 	}
 }
 
@@ -515,7 +515,7 @@ static void poll_iso_cmd(void)
 		if (!*p)
 			continue;
 		if (strncmp(p, "PLAY_ISO ", 9) != 0) {
-			fprintf(stderr, "APPLIANCE: ignore cmd %s\n", p);
+			fprintf(stderr, "DVD: ignore cmd %s\n", p);
 			fflush(stderr);
 			continue;
 		}
@@ -531,10 +531,10 @@ int main(void)
 {
 	struct sigaction sa;
 
-	mkdir(APPLIANCE_ROOT, 0755);
-	mkdir(APPLIANCE_BIN, 0755);
-	mkdir(APPLIANCE_LOG, 0755);
-	mkdir(APPLIANCE_ROOT "/config", 0755);
+	mkdir(DVD_ROOT, 0755);
+	mkdir(DVD_BIN, 0755);
+	mkdir(DVD_LOG, 0755);
+	mkdir(DVD_ROOT "/config", 0755);
 	mkdir("/media/fat/games", 0755);
 	mkdir("/media/fat/games/DVD-Player", 0755);
 
@@ -546,7 +546,7 @@ int main(void)
 
 	write_pidfile();
 	open_cmd_fifo();
-	log_line("APPLIANCE: supervisor start");
+	log_line("DVD: supervisor start");
 
 	while (!g_stop) {
 		int kind, st;
@@ -578,7 +578,7 @@ int main(void)
 			if (kind == 0) {
 				g_state = ST_NO_DISC;
 				g_last_kind = -1;
-				log_line("APPLIANCE: disc removed - autoplay rearmed");
+				log_line("DVD: disc removed - autoplay rearmed");
 			}
 		}
 		usleep(POLL_US);
@@ -589,7 +589,7 @@ int main(void)
 		close(g_cmd_fd);
 		g_cmd_fd = -1;
 	}
-	log_line("APPLIANCE: supervisor stop");
+	log_line("DVD: supervisor stop");
 	clear_pidfile();
 	return 0;
 }

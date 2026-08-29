@@ -7,7 +7,7 @@ place. You are responsible for complying with the laws that apply to you.
 ## What this software is
 
 MiSTer DVD Player is **unofficial, volunteer, open-source** software.
-Public beta 0.1 is an experimental community build, not a finished
+Public beta 0.2 is an experimental community build, not a finished
 commercial DVD product.
 
 It is **not** affiliated with, endorsed by, or sponsored by MiSTer,
@@ -37,11 +37,17 @@ shipped in the zip (`SOURCES/`) and kept in this repository.
 
 ## libdvdcss
 
-**This project does not distribute libdvdcss** (no `.so`, no installer
-download).
+**This project does not distribute libdvdcss.** The release zip does not
+contain `libdvdcss.so.2`, `libdvdcss.so.2.2.0`, or any other libdvdcss
+binary.
 
-libdvdread can use a user-supplied `libdvdcss.so.2` at
-`/media/fat/DVD/lib/libdvdcss.so.2` if you place one there. The official
+Encrypted commercial DVDs require you to obtain and install libdvdcss
+separately. If you choose to do that, the runtime filename and location
+this player uses are:
+
+`/media/fat/DVD/lib/libdvdcss.so.2`
+
+Unencrypted discs and ISO playback do not require it. The official
 upstream project is VideoLAN libdvdcss:
 
 https://www.videolan.org/developers/libdvdcss.html
@@ -50,15 +56,7 @@ CSS and anti-circumvention rules **vary by jurisdiction**. This document
 does not state that providing or using libdvdcss is legal or illegal
 where you live. Check local law.
 
-
-## DVD ripping
-
-The **Rip DVD to USB** feature copies a physical disc to an ISO. Use it
-only where **you have the legal right** to make that copy (for example,
-a disc you own, in a jurisdiction that allows that use).
-
-This project does not claim that DVD ripping is always lawful. Content
-on a disc remains the rights holders’ property except as the law allows.
+This v0.2.0-beta.1 package does **not** include a DVD rip helper.
 
 
 ## Patents and other rights

@@ -1,35 +1,36 @@
-# Install MiSTer DVD Player (public beta 0.1)
+# Install MiSTer DVD Player (v0.2.0 beta 1)
 
 No installer script is required. Extract the zip onto the SD card, then
-**add** one `MiSTer.ini` section. Do not move ARM binaries after extract;
-the tested layout is `/media/fat/DVD/dev/`.
+**add** one `MiSTer.ini` section.
 
 
 ## Manual install (GitHub zip)
 
 ### 1. Extract to the SD root
 
-Copy **`MiSTer_DVD_Player_0.1.0-public-beta.zip`** to the MiSTer SD card
-and extract its contents at the **root** of the FAT partition (`/media/fat`
+Copy **`MiSTer_DVD_Player_0.2.0-beta.1.zip`** to the MiSTer SD card and
+extract its contents at the **root** of the FAT partition (`/media/fat`
 when the system is running). You should have:
 
 ```
-/media/fat/MiSTer_DVD_Player.rbf
+/media/fat/DVD_Player.rbf
 /media/fat/MiSTer_DVD
-/media/fat/DVD/dev/          launcher, player, ripping tools
-/media/fat/DVD/lib/          libdvdread, libdvdnav, rip helper libraries
-/media/fat/DVD/isos/         empty folder for your ISOs (optional)
+/media/fat/DVD/bin/          dvd_player, dvd_av_threaded_test
+/media/fat/DVD/lib/          libdvdread, libdvdnav
+/media/fat/DVD/logs/
+/media/fat/DVD/config/
+/media/fat/games/DVD-Player/
 ```
 
 Licence and corresponding-source files from the zip may sit beside those
 paths; they are not required to run the player.
 
-**Do not replace** stock `/media/fat/MiSTer` with `MiSTer_DVD`. Both files
-must remain on the SD root. `MiSTer_DVD` is used only for this core.
+**Do not replace** stock `/media/fat/MiSTer` with `MiSTer_DVD`. Both
+files must remain on the SD root. `MiSTer_DVD` is used only for this
+core.
 
 If you already have a user-supplied `libdvdcss.so.2` under `DVD/lib`,
-leave that file in place. This zip does not include it and extracting
-should not be used as an excuse to delete the whole `DVD/lib` folder.
+leave that file in place. This zip does not include it.
 
 
 ### 2. Edit MiSTer.ini (add, do not replace)
@@ -37,145 +38,63 @@ should not be used as an excuse to delete the whole `DVD/lib` folder.
 Open `/media/fat/MiSTer.ini` in a text editor.
 
 **Add** this section. Do **not** overwrite or replace your existing
-`MiSTer.ini` with a new file. Keep your other settings.
+`MiSTer.ini`.
 
 ```
 [DVD-Player]
 main=MiSTer_DVD
 ```
 
-Save the file. Reboot or return to the MiSTer menu so the new core
-setting is picked up.
+Save. Reboot or return to the MiSTer menu so the new core setting is
+picked up.
 
 
-### 3. Launch DVD-Player
+### 3. Launch DVD Player
 
-From the MiSTer main menu, start **MiSTer DVD Player**
-(`MiSTer_DVD_Player.rbf`, core name `DVD-Player`).
+From the MiSTer main menu, start **DVD Player** (`DVD_Player.rbf`,
+core name `DVD-Player`).
 
-MiSTer switches to `MiSTer_DVD` for this core only. The launcher shows:
-
-- Play Physical DVD
-- DVD Library
-- Rip DVD to USB
+A physical DVD already in the drive autoplays. Use OSD **Play ISO...**
+for ISO files.
 
 
-## MiSTer Companion / Update All
+## ISO folders
 
-Once this core is in a Companion / Update All database, those tools can
-**inject** the same `[DVD-Player] main=MiSTer_DVD` entry automatically.
-You still should not replace your whole `MiSTer.ini`. Until that database
-support is available, add the block by hand as above.
+- SD (created by the package / at first run):
+  `/media/fat/games/DVD-Player/`
+- USB (create this yourself if you want USB ISOs):
+  `/games/DVD-Player/` on the USB drive  
+  Example: `/media/usb0/games/DVD-Player/Movie.iso`
 
-
-## Play Physical DVD
-
-1. Insert a DVD-Video disc in the SuperDock / optical drive (`/dev/sr0`).
-2. Confirm **Play Physical DVD**.
-
-PAL physical discs have been tested. **NTSC physical discs have not.**
-
-CSS-encrypted commercial discs need user-supplied libdvdcss (below).
-Unencrypted discs can play without it.
+MiSTer uses the USB core folder when it exists, otherwise SD. Empty USB
+core folders are not created automatically. Existing ISOs are never
+moved or copied.
 
 
-## ISO playback (DVD Library)
+## CSS-encrypted discs
 
-Put **DVD-Video `.iso` files** here:
+This package does **not** include libdvdcss (`libdvdcss.so.2` or any
+other libdvdcss binary). Unencrypted discs and ISOs do not need it.
+Encrypted commercial DVDs require you to obtain and install libdvdcss
+separately. If you do, the file must be named exactly `libdvdcss.so.2`
+at:
 
-| Location | What is scanned |
-|---|---|
-| `/media/fat/DVD/isos` | Files in that folder only |
-| `/media/usbN/` | Files at the USB root |
-| `/media/usbN/DVD` | Files plus one extra subdirectory |
-| `/media/usbN/Movies` | Files plus one extra subdirectory |
+`/media/fat/DVD/lib/libdvdcss.so.2`
 
-`usbN` means `usb0`, `usb1`, … as MiSTer mounts them under `/media`.
-
-Open **DVD Library**, pick a title, Confirm to play. NTSC ISO playback
-has been tested. Files larger than 4 GB need a filesystem that allows
-them (exFAT, not FAT32).
-
-This is not a folder of loose `.VOB` files and not an MKV library.
+See [LEGAL.md](LEGAL.md).
 
 
-## Rip DVD to USB
+## Logs
 
-Use only discs you have the legal right to copy. See [LEGAL.md](LEGAL.md).
-
-1. Insert the disc.
-2. Plug in a writable USB stick (exFAT recommended).
-3. Choose **Rip DVD to USB** and pick the USB volume.
-4. Wait. Do not remove the disc or stick until it finishes.
-
-The helper copies the disc with `dvdbackup`, then builds one DVD-Video
-ISO with `genisoimage`. Output:
-
-```
-/media/usbN/DVD/<title>.iso
-```
-
-Temporary space needed is about **twice the disc size plus 512 MB**.
-FAT32 cannot store an ISO larger than 4 GB; the ripper will refuse in
-that case. If a file with the same name already exists, the rip stops.
-
-Encrypted physical discs may fail to rip unless libdvdcss is present
-(below). Unencrypted discs can rip without it.
-
-
-## Encrypted discs (libdvdcss) — optional
-
-**libdvdcss is not included with MiSTer DVD Player.** This project does
-not ship it and does not download it.
-
-The official upstream project is **VideoLAN libdvdcss**:
-
-https://www.videolan.org/developers/libdvdcss.html
-
-Do not download random binaries from unofficial mirrors. If you choose
-to provide a compatible library, place:
-
-```
-/media/fat/DVD/lib/libdvdcss.so.2
-```
-
-Check the laws that apply to you. CSS and related rules vary by
-jurisdiction.
-
-Without that library:
-
-- Encrypted **physical** discs may not play or rip
-- Unencrypted discs remain supported
-- ISO playback does not depend on this package distributing libdvdcss
-
-An existing `libdvdcss.so.2` in that folder should be left unchanged.
-Missing CSS is not an install failure.
+- `/media/fat/DVD/logs/player.log`
+- `/media/fat/DVD/logs/dvd_player.log`
 
 
 ## Uninstall (manual)
 
-No uninstaller is shipped. To remove the core:
-
-1. Delete `/media/fat/MiSTer_DVD_Player.rbf` and `/media/fat/MiSTer_DVD`
-   (do **not** delete stock `/media/fat/MiSTer`).
-2. Remove only the `[DVD-Player]` / `main=MiSTer_DVD` block you added
-   from `MiSTer.ini`. Do not replace the whole ini file.
-3. Optionally delete `/media/fat/DVD/` if you also want to remove ISOs,
-   cache, logs, and a user-supplied `libdvdcss.so.2`.
-
-If you previously used a marked `dvd_autostart_daemon` block in
-`user-startup.sh`, delete that marked block. This beta does not need a
-daemon.
-
-
-## After install: where files live
-
-| Path | Role |
-|---|---|
-| `/media/fat/MiSTer` | Stock MiSTer Main (untouched) |
-| `/media/fat/MiSTer_DVD` | Core-specific Main for DVD-Player |
-| `/media/fat/MiSTer_DVD_Player.rbf` | FPGA core |
-| `/media/fat/DVD/dev/` | Launcher, player, rip tools |
-| `/media/fat/DVD/lib/` | libdvdread, libdvdnav; optional libdvdcss |
-| `/media/fat/DVD/isos/` | SD ISO library |
-| `/media/fat/MiSTer.ini` | add `[DVD-Player] main=MiSTer_DVD` |
+1. Delete `/media/fat/DVD_Player.rbf` and `/media/fat/MiSTer_DVD`
+2. Optionally remove `/media/fat/DVD/` (keep `DVD/lib/libdvdcss.so.2`
+   if you added it)
+3. Remove or comment `[DVD-Player] main=MiSTer_DVD` in `MiSTer.ini`
+4. Your ISOs in `games/DVD-Player/` are left alone unless you delete
+   them
