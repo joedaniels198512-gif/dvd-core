@@ -1,5 +1,16 @@
 # MiSTer DVD Player
 
+## ⬇️ Download
+
+### [Download MiSTer DVD Player v0.2.0 Beta 1](https://github.com/joedaniels198512-gif/dvd-core/releases/download/v0.2.0-beta.1/MiSTer_DVD_Player_0.2.0-beta.1.zip)
+
+**Do not use GitHub's "Code → Download ZIP" button.**
+That downloads the source repository, not the ready-to-install DVD Player package.
+
+Extract `MiSTer_DVD_Player_0.2.0-beta.1.zip` to the root of your MiSTer SD card.
+
+> **Encrypted commercial DVDs:** `libdvdcss` is not included with this project. You must source your own copy of `libdvdcss.so.2` and place it at `/media/fat/DVD/lib/libdvdcss.so.2`.
+
 **v0.2.0 beta 1** for SuperStation One and compatible MiSTer hardware with
 an optical drive.
 
