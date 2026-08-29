@@ -1,0 +1,4 @@
+# Keep blank issues enabled so unexpected reports that do not fit the three
+# structured forms still have an obvious path. No external support links are
+# configured on purpose, to keep the repository approachable.
+blank_issues_enabled: true

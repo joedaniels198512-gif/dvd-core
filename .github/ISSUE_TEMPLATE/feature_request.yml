@@ -1,0 +1,63 @@
+name: Feature request
+description: Suggest a feature or improvement for the DVD Player.
+title: "[Feature] "
+labels:
+  - feature-request
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion! Please keep requests focused so they are
+        easy to discuss.
+
+  - type: textarea
+    id: feature
+    attributes:
+      label: Requested feature
+      description: What would you like the DVD Player to do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / use case
+      description: What problem does this solve, or what are you trying to do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: How should it work from the user's point of view?
+    validations:
+      required: false
+
+  - type: dropdown
+    id: standard_dvd_feature
+    attributes:
+      label: Is this a feature found on normal DVD players?
+      description: Optional — helps set scope against typical set-top DVD behaviour.
+      options:
+        - "Yes, standard DVD player feature"
+        - "No, this goes beyond a normal DVD player"
+        - "Not sure"
+    validations:
+      required: false
+
+  - type: input
+    id: example
+    attributes:
+      label: Example DVD / use case
+      description: A concrete example that would benefit from this feature.
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else that would help.
+    validations:
+      required: false

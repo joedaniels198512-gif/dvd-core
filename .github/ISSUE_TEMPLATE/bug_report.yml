@@ -1,0 +1,152 @@
+name: Bug report
+description: Report a problem with the DVD Player.
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report.
+
+        **Please do NOT upload copyrighted material.** Do not attach DVD ISOs,
+        VOB files, decrypted disc contents, CSS keys, or any other copyrighted
+        media. Logs and screenshots are welcome and very helpful.
+
+  - type: input
+    id: version
+    attributes:
+      label: DVD Player version / build
+      description: The version or build you are running (e.g. release tag, zip name, or commit).
+      placeholder: "e.g. public beta 0.1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: hardware
+    attributes:
+      label: Hardware
+      options:
+        - SuperStation One
+        - Standard MiSTer
+        - Other MiSTer-compatible hardware
+    validations:
+      required: true
+
+  - type: dropdown
+    id: source
+    attributes:
+      label: Source
+      options:
+        - Physical DVD
+        - ISO
+    validations:
+      required: true
+
+  - type: dropdown
+    id: video_standard
+    attributes:
+      label: Video standard
+      options:
+        - PAL
+        - NTSC
+        - Unknown
+    validations:
+      required: true
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      description: Which area is affected?
+      options:
+        - Installation / startup
+        - Video
+        - Audio
+        - A/V sync
+        - DVD menus / navigation
+        - Subtitles
+        - Controller / input
+        - OSD / ISO browser
+        - Physical drive
+        - Performance
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Concise description
+      description: A short, clear summary of the problem.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: What actually happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Exact reproduction steps
+      description: Step-by-step instructions to reproduce the problem.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: every_time
+    attributes:
+      label: Does it happen every time?
+      options:
+        - "Yes, every time"
+        - "No, intermittently"
+        - "Only tried once"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: other_disc
+    attributes:
+      label: Does another DVD / ISO work?
+      options:
+        - "Yes, another disc/ISO works"
+        - "No, others fail too"
+        - "Not tested"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log attachment
+      description: |
+        Please attach the player log where relevant. In the current build the
+        log directory is typically:
+
+            /media/fat/DVD_Appliance/logs/
+
+        NOTE: the release folder naming is still being finalised, so the exact
+        log path may change before the public release. If the path above does
+        not exist on your system, please note where you found the log instead.
+
+        Do NOT paste or attach copyrighted disc contents.
+      placeholder: Drag and drop the log file here, or paste relevant excerpts.
+    validations:
+      required: false

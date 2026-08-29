@@ -1,0 +1,195 @@
+name: DVD compatibility report
+description: Report how a specific DVD title behaves with the DVD Player.
+title: "[DVD] "
+labels:
+  - disc-compatibility
+body:
+  - type: markdown
+    attributes:
+      value: |
+        DVD authoring varies a lot between titles and regions, so structured
+        compatibility data is genuinely useful. Thank you for reporting.
+
+        **Please do NOT upload copyrighted material.** Do not attach DVD ISOs,
+        VOB files, decrypted disc contents, CSS keys, or any other copyrighted
+        media. A title name, region, and description are all we need.
+
+  - type: input
+    id: title
+    attributes:
+      label: DVD title
+      description: The name of the DVD as printed on the disc/case.
+    validations:
+      required: true
+
+  - type: input
+    id: edition
+    attributes:
+      label: Edition / release (if known)
+      description: e.g. special edition, remaster, box set, catalogue number.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: region
+    attributes:
+      label: Region
+      options:
+        - Region 1
+        - Region 2
+        - Region 3
+        - Region 4
+        - Region 5
+        - Region 6
+        - Region 0 / all-region
+        - Unknown
+    validations:
+      required: true
+
+  - type: dropdown
+    id: video_standard
+    attributes:
+      label: Video standard
+      options:
+        - NTSC
+        - PAL
+        - Unknown
+    validations:
+      required: true
+
+  - type: dropdown
+    id: source
+    attributes:
+      label: Source
+      options:
+        - Physical DVD
+        - ISO
+    validations:
+      required: true
+
+  - type: dropdown
+    id: aspect
+    attributes:
+      label: Authored aspect (if known)
+      options:
+        - "4:3"
+        - "16:9"
+        - Mixed / unknown
+    validations:
+      required: false
+
+  - type: dropdown
+    id: startup
+    attributes:
+      label: Startup
+      options:
+        - Works
+        - Problems
+        - Fails
+    validations:
+      required: true
+
+  - type: dropdown
+    id: menus
+    attributes:
+      label: Menus
+      options:
+        - Works
+        - Partially works
+        - Broken
+        - No menus / unknown
+    validations:
+      required: true
+
+  - type: dropdown
+    id: playback
+    attributes:
+      label: Main feature playback
+      options:
+        - Works
+        - Partially works
+        - Broken
+    validations:
+      required: true
+
+  - type: dropdown
+    id: audio
+    attributes:
+      label: Audio
+      options:
+        - Works
+        - Problems
+    validations:
+      required: true
+
+  - type: dropdown
+    id: subtitles
+    attributes:
+      label: Subtitles
+      options:
+        - Works
+        - Problems
+        - Not tested
+    validations:
+      required: true
+
+  - type: dropdown
+    id: chapters
+    attributes:
+      label: Chapter navigation
+      options:
+        - Works
+        - Problems
+        - Not tested
+    validations:
+      required: true
+
+  - type: dropdown
+    id: multi_angle
+    attributes:
+      label: Multi-angle
+      options:
+        - Works
+        - Problems
+        - Disc does not use it
+        - Not tested
+    validations:
+      required: true
+
+  - type: dropdown
+    id: overall
+    attributes:
+      label: Overall result
+      options:
+        - Working
+        - Mostly working
+        - Broken
+    validations:
+      required: true
+
+  - type: textarea
+    id: issues
+    attributes:
+      label: Description of any issues
+      description: Describe anything that did not work as expected.
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log attachment (optional)
+      description: |
+        Optionally attach the player log. In the current build the log
+        directory is typically:
+
+            /media/fat/DVD_Appliance/logs/
+
+        NOTE: the release folder naming is still being finalised, so this path
+        may change before the public release.
+
+        Do NOT paste or attach copyrighted disc contents (ISO / VOB / decrypted
+        DVD data).
+      placeholder: Drag and drop the log file here, or paste relevant excerpts.
+    validations:
+      required: false
