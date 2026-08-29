@@ -634,11 +634,26 @@ static int path_is_iso(const char *p)
 	return dot && strcasecmp(dot, ".iso") == 0;
 }
 
+static void osd_log(const char *msg)
+{
+	printf("%s", msg);
+	fflush(stdout);
+	FILE *f = fopen(DVD_APPLIANCE_LOG, "a");
+	if (f)
+	{
+		fputs(msg, f);
+		fclose(f);
+	}
+}
+
 int dvd_appliance_handle_iso_select(const char *sel_path, int ioctl_index)
 {
-	const char *full;
-	struct stat st;
+	char full[PATH_MAX];
+	char resolved[PATH_MAX];
+	char msg[PATH_MAX + 96];
 	char line[PATH_MAX + 32];
+	const char *gp;
+	struct stat st;
 	int fd, n, wr;
 
 	if (!exe_is_mister_dvd_appliance())
@@ -652,60 +667,87 @@ int dvd_appliance_handle_iso_select(const char *sel_path, int ioctl_index)
 	 */
 	if (ioctl_index != DVD_APPLIANCE_ISO_INDEX)
 	{
-		printf("APPLIANCE OSD: ignore selector index=%d (Play ISO is F0)\n",
-		       ioctl_index);
+		snprintf(msg, sizeof(msg),
+		         "APPLIANCE OSD: ignore selector index=%d (Play ISO is F0)\n",
+		         ioctl_index);
+		osd_log(msg);
 		return 1;
 	}
 	if (!sel_path || !sel_path[0])
 	{
-		printf("APPLIANCE OSD: empty ISO selection\n");
+		osd_log("APPLIANCE OSD: empty ISO selection\n");
 		return 1;
 	}
 
-	full = getFullPath(sel_path);
-	if (!full || !full[0])
-		full = sel_path;
+	/*
+	 * Copy out of getFullPath()'s static buffer immediately. Any later
+	 * file_io call (including HomeDir / prefixGameDir) overwrites it.
+	 */
+	gp = getFullPath(sel_path);
+	snprintf(full, sizeof(full), "%s", (gp && gp[0]) ? gp : sel_path);
+	if (realpath(full, resolved))
+		snprintf(full, sizeof(full), "%s", resolved);
 
-	printf("APPLIANCE OSD: ISO selected path=%s\n", full);
+	snprintf(msg, sizeof(msg), "APPLIANCE OSD: ISO selected path=%s\n", full);
+	osd_log(msg);
 
 	if (!path_is_iso(full))
 	{
-		printf("APPLIANCE OSD: reject (not .iso) path=%s\n", full);
+		snprintf(msg, sizeof(msg),
+		         "APPLIANCE OSD: reject (not .iso) path=%s\n", full);
+		osd_log(msg);
 		return 1;
 	}
 	if (stat(full, &st) != 0 || !S_ISREG(st.st_mode) || access(full, R_OK) != 0)
 	{
-		printf("APPLIANCE OSD: reject (not a readable file) path=%s (%s)\n",
-		       full, strerror(errno));
+		snprintf(msg, sizeof(msg),
+		         "APPLIANCE OSD: reject (not a readable file) path=%s (%s)\n",
+		         full, strerror(errno));
+		osd_log(msg);
 		return 1;
 	}
 
 	if (mkfifo(DVD_APPLIANCE_CMD_FIFO, 0666) < 0 && errno != EEXIST)
-		printf("APPLIANCE OSD: mkfifo %s: %s\n",
-		       DVD_APPLIANCE_CMD_FIFO, strerror(errno));
+	{
+		snprintf(msg, sizeof(msg), "APPLIANCE OSD: mkfifo %s: %s\n",
+		         DVD_APPLIANCE_CMD_FIFO, strerror(errno));
+		osd_log(msg);
+	}
 
 	n = snprintf(line, sizeof(line), "PLAY_ISO %s\n", full);
 	if (n < 0 || n >= (int)sizeof(line))
 	{
-		printf("APPLIANCE OSD: path too long, not sent path=%s\n", full);
+		snprintf(msg, sizeof(msg),
+		         "APPLIANCE OSD: path too long, not sent path=%s\n", full);
+		osd_log(msg);
 		return 1;
 	}
 
 	fd = open(DVD_APPLIANCE_CMD_FIFO, O_WRONLY | O_NONBLOCK);
 	if (fd < 0)
 	{
-		printf("APPLIANCE OSD: cannot send to supervisor (%s). "
-		       "ISO was NOT transferred to FPGA.\n",
-		       strerror(errno));
+		snprintf(msg, sizeof(msg),
+		         "APPLIANCE OSD: cannot send to supervisor (%s). "
+		         "ISO was NOT transferred to FPGA.\n",
+		         strerror(errno));
+		osd_log(msg);
 		return 1;
 	}
 	wr = (int)write(fd, line, (size_t)n);
 	close(fd);
 	if (wr != n)
-		printf("APPLIANCE OSD: short FIFO write %d/%d (%s)\n",
-		       wr, n, strerror(errno));
+	{
+		snprintf(msg, sizeof(msg),
+		         "APPLIANCE OSD: short FIFO write %d/%d (%s)\n",
+		         wr, n, strerror(errno));
+		osd_log(msg);
+	}
 	else
-		printf("APPLIANCE OSD: ISO path sent (no FPGA transfer) path=%s\n",
-		       full);
+	{
+		snprintf(msg, sizeof(msg),
+		         "APPLIANCE OSD: ISO path sent (no FPGA transfer) path=%s\n",
+		         full);
+		osd_log(msg);
+	}
 	return 1;
 }

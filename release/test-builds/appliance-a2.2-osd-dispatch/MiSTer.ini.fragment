@@ -1,0 +1,5 @@
+; Append this block to /media/fat/MiSTer.ini.
+; Do NOT change the existing [DVD-Player] main=MiSTer_DVD mapping.
+
+[DVD-Player-Appliance]
+main=MiSTer_DVD_Appliance

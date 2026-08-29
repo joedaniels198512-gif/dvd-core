@@ -4,6 +4,10 @@
  *
  * A1: physical DVD autoplay with WAIT_EJECT after exit.
  * A2: OSD Play ISO via PLAY_ISO <path> on /tmp/dvd_appliance.cmd.
+ * A2.1: Play ISO replaces the current player (SIGTERM, wait for that pid).
+ *       ISO files live in the stock SETNAME HomeDir
+ *       (games/DVD-Player-Appliance on USB, then SD). This process does
+ *       not create USB0 shortcuts or override SelectFile.
  *
  * States:
  *   NO_DISC / IDLE
@@ -74,6 +78,7 @@
 #define PID_FILE        "/tmp/dvd_appliance.pid"
 #define CMD_FIFO        "/tmp/dvd_appliance.cmd"
 #define POLL_US         1000000
+#define PLAY_POLL_US    100000
 #define PLAYER_TERM_SEC 8
 
 enum {
@@ -91,6 +96,8 @@ static int g_state = ST_NO_DISC;
 static int g_last_kind = -1;
 static char g_pending_iso[PATH_MAX];
 static int g_have_pending;
+static pid_t g_stopping_pid = -1;
+static int64_t g_stop_deadline_ms;
 
 static void on_signal(int sig)
 {
@@ -104,6 +111,15 @@ static void log_line(const char *msg)
 {
 	fprintf(stderr, "%s\n", msg);
 	fflush(stderr);
+}
+
+static int64_t mono_ms(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+		return 0;
+	return (int64_t)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000L;
 }
 
 static void write_pidfile(void)
@@ -243,6 +259,13 @@ static int launch_player(const char *source, int is_iso)
 	char logpath[512];
 
 	player_path(player, sizeof(player));
+	if (g_child > 0) {
+		fprintf(stderr,
+		        "APPLIANCE: refuse launch — player pid=%d still alive\n",
+		        (int)g_child);
+		fflush(stderr);
+		return -1;
+	}
 	if (access(player, X_OK) != 0) {
 		fprintf(stderr, "APPLIANCE: player missing %s (%s)\n",
 		        player, strerror(errno));
@@ -282,23 +305,49 @@ static int launch_player(const char *source, int is_iso)
 		_exit(127);
 	}
 	g_child = pid;
+	g_stopping_pid = -1;
 	return 0;
+}
+
+static void request_player_stop(const char *why)
+{
+	(void)why;
+	if (g_child <= 0)
+		return;
+	if (g_stopping_pid == g_child)
+		return;
+	fprintf(stderr, "APPLIANCE: stopping player pid=%d\n", (int)g_child);
+	fflush(stderr);
+	kill(g_child, SIGTERM);
+	g_stopping_pid = g_child;
+	g_stop_deadline_ms = mono_ms() + (int64_t)PLAYER_TERM_SEC * 1000LL;
 }
 
 static int reap_player(int *status_out)
 {
 	int st = 0;
 	pid_t w;
+	pid_t pid;
 
 	if (g_child <= 0)
 		return 0;
-	w = waitpid(g_child, &st, WNOHANG);
+	pid = g_child;
+	if (g_stopping_pid == pid && mono_ms() >= g_stop_deadline_ms) {
+		log_line("APPLIANCE: SIGTERM timeout — SIGKILL fallback");
+		kill(pid, SIGKILL);
+		g_stop_deadline_ms = mono_ms() + 2000;
+	}
+	w = waitpid(pid, &st, WNOHANG);
 	if (w == 0)
 		return 0;
-	if (w == g_child || (w < 0 && errno != EINTR)) {
+	if (w == pid || (w < 0 && errno != EINTR)) {
 		if (status_out)
 			*status_out = st;
+		fprintf(stderr, "APPLIANCE: player pid=%d exited status=%d\n",
+		        (int)pid, st);
+		fflush(stderr);
 		g_child = -1;
+		g_stopping_pid = -1;
 		return 1;
 	}
 	return 0;
@@ -307,20 +356,32 @@ static int reap_player(int *status_out)
 static void stop_player(void)
 {
 	int i, st;
+	pid_t pid;
 
 	if (g_child <= 0)
 		return;
-	kill(g_child, SIGTERM);
+	pid = g_child;
+	request_player_stop("shutdown");
 	for (i = 0; i < PLAYER_TERM_SEC * 10; i++) {
-		if (waitpid(g_child, &st, WNOHANG) == g_child) {
+		if (waitpid(pid, &st, WNOHANG) == pid) {
+			fprintf(stderr,
+			        "APPLIANCE: player pid=%d exited status=%d\n",
+			        (int)pid, st);
+			fflush(stderr);
 			g_child = -1;
+			g_stopping_pid = -1;
 			return;
 		}
 		usleep(100000);
 	}
-	kill(g_child, SIGKILL);
-	waitpid(g_child, &st, 0);
+	log_line("APPLIANCE: SIGTERM timeout — SIGKILL fallback");
+	kill(pid, SIGKILL);
+	waitpid(pid, &st, 0);
+	fprintf(stderr, "APPLIANCE: player pid=%d exited status=%d\n",
+	        (int)pid, st);
+	fflush(stderr);
 	g_child = -1;
+	g_stopping_pid = -1;
 }
 
 static void log_classify(int kind)
@@ -341,6 +402,10 @@ static int start_iso(const char *path)
 {
 	struct stat st;
 
+	if (g_child > 0) {
+		log_line("APPLIANCE: cannot start ISO while a player is still running");
+		return -1;
+	}
 	if (!path_is_iso(path) || stat(path, &st) != 0 ||
 	    !S_ISREG(st.st_mode) || access(path, R_OK) != 0) {
 		fprintf(stderr, "APPLIANCE: ISO reject path=%s\n", path);
@@ -358,16 +423,17 @@ static void queue_or_start_iso(const char *path)
 	fprintf(stderr, "APPLIANCE: ISO request path=%s\n", path);
 	fflush(stderr);
 
-	if (g_state == ST_PLAYING_PHYSICAL || g_state == ST_PLAYING_ISO) {
-		snprintf(g_pending_iso, sizeof(g_pending_iso), "%s", path);
-		g_have_pending = 1;
-		fprintf(stderr,
-		        "APPLIANCE: ISO queued until current player exits path=%s\n",
-		        path);
-		fflush(stderr);
+	snprintf(g_pending_iso, sizeof(g_pending_iso), "%s", path);
+	g_have_pending = 1;
+
+	if (g_child > 0) {
+		log_line("APPLIANCE: replacing active source with ISO");
+		request_player_stop("ISO switch");
 		return;
 	}
 
+	g_have_pending = 0;
+	g_pending_iso[0] = 0;
 	(void)start_iso(path);
 }
 
@@ -377,9 +443,13 @@ static void consume_pending_iso(void)
 
 	if (!g_have_pending)
 		return;
+	if (g_child > 0)
+		return;
 	snprintf(path, sizeof(path), "%s", g_pending_iso);
 	g_have_pending = 0;
 	g_pending_iso[0] = 0;
+	fprintf(stderr, "APPLIANCE: launching replacement ISO path=%s\n", path);
+	fflush(stderr);
 	(void)start_iso(path);
 }
 
@@ -426,9 +496,9 @@ static void after_player_exit(int was_iso, int st)
 
 static void poll_iso_cmd(void)
 {
-	char buf[PATH_MAX + 64];
+	char buf[8192];
 	ssize_t n;
-	char *nl, *path;
+	char *line, *save, *path, *p;
 
 	if (g_cmd_fd < 0)
 		return;
@@ -436,20 +506,24 @@ static void poll_iso_cmd(void)
 	if (n <= 0)
 		return;
 	buf[n] = 0;
-	nl = strchr(buf, '\n');
-	if (nl)
-		*nl = 0;
-	if (strncmp(buf, "PLAY_ISO ", 9) != 0) {
-		fprintf(stderr, "APPLIANCE: ignore cmd %s\n", buf);
-		fflush(stderr);
-		return;
+	for (line = strtok_r(buf, "\n\r", &save); line;
+	     line = strtok_r(NULL, "\n\r", &save)) {
+		p = line;
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (!*p)
+			continue;
+		if (strncmp(p, "PLAY_ISO ", 9) != 0) {
+			fprintf(stderr, "APPLIANCE: ignore cmd %s\n", p);
+			fflush(stderr);
+			continue;
+		}
+		path = p + 9;
+		while (*path == ' ' || *path == '\t')
+			path++;
+		if (*path)
+			queue_or_start_iso(path);
 	}
-	path = buf + 9;
-	while (*path == ' ' || *path == '\t')
-		path++;
-	if (!path[0])
-		return;
-	queue_or_start_iso(path);
 }
 
 int main(void)
@@ -473,13 +547,16 @@ int main(void)
 
 	while (!g_stop) {
 		int kind, st;
+		int was_iso;
 
 		poll_iso_cmd();
 
 		if (g_state == ST_PLAYING_PHYSICAL || g_state == ST_PLAYING_ISO) {
-			if (reap_player(&st))
-				after_player_exit(g_state == ST_PLAYING_ISO, st);
-			usleep(200000);
+			if (reap_player(&st)) {
+				was_iso = (g_state == ST_PLAYING_ISO);
+				after_player_exit(was_iso, st);
+			}
+			usleep(PLAY_POLL_US);
 			continue;
 		}
 
@@ -487,7 +564,7 @@ int main(void)
 		log_classify(kind);
 
 		if (g_state == ST_NO_DISC) {
-			if (kind == 1) {
+			if (kind == 1 && g_child <= 0 && !g_have_pending) {
 				if (launch_player(SR0_PATH, 0) == 0)
 					g_state = ST_PLAYING_PHYSICAL;
 				else

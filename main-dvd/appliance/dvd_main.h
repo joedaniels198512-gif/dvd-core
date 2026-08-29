@@ -22,10 +22,11 @@ void dvd_main_poll(void);
 void dvd_main_stop_all(void);
 
 /*
- * OSD F0 "Play ISO..." intercept. Returns 1 if this core handled the
- * selection (path sent to dvd_appliance). Must be called BEFORE
- * user_io_file_tx() so the ISO is never copied into FPGA memory.
- * Non-Appliance binaries and other selector indexes return 0.
+ * OSD F0 "Play ISO..." intercept. Call from MENU_FILE_SELECT2 confirm
+ * (the actual SelectFile result) and from MENU_GENERIC_FILE_SELECTED
+ * (safety net before user_io_file_tx). Returns 1 if this core handled
+ * the selection. Non-Appliance binaries and other selector indexes
+ * return 0.
  */
 int dvd_appliance_handle_iso_select(const char *sel_path, int ioctl_index);
 

@@ -1,0 +1,6 @@
+Name: Appliance A2.2 OSD F0 dispatch
+Parent: A2.1 native-path-switch
+Changed: MiSTer_DVD_Appliance only
+FPGA/RBF: unchanged A2
+Player: Test 9.3.1 unchanged
+Supervisor: A2.1 unchanged
