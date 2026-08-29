@@ -110,6 +110,7 @@ assign BUTTONS = 0;
 // Must not be generic "DVD" — that name is already used by another core.
 localparam CONF_STR = {
 	"DVD-Player-Appliance;;",
+	"F0,ISO,Play ISO...;",
 	"-;",
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[2:1],TV Mode,Auto,NTSC,PAL;",
