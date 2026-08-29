@@ -105,10 +105,11 @@ assign BUTTONS = 0;
 //   OSD 0 ms keeps the hardware-approved baseline (--video-advance-ms 20).
 //   +N presents video N ms earlier vs audio; -N presents it later.
 // Canonical core identity. Field 0 becomes orig_name and default core_name
-// (/tmp/CORENAME, /tmp/RBFNAME, MiSTer.ini [DVD-Player], games/DVD-Player).
+// (/tmp/CORENAME, /tmp/RBFNAME, MiSTer.ini [DVD-Player-Appliance],
+// games/DVD-Player-Appliance). Separate from the launcher core "DVD-Player".
 // Must not be generic "DVD" — that name is already used by another core.
 localparam CONF_STR = {
-	"DVD-Player;;",
+	"DVD-Player-Appliance;;",
 	"-;",
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[2:1],TV Mode,Auto,NTSC,PAL;",

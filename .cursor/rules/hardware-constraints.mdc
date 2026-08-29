@@ -34,7 +34,13 @@ ARMv7-A, NEON + VFPv3** (⚠️ **no VFPv4 / no fused multiply-add**).
   preserving it in Git first.
 - Prefer scripts and normal source-file edits over generating source via shell
   heredocs.
-- Do **not** start a Quartus/FPGA compile unless explicitly asked — it runs under
-  Rosetta (Quartus 17.0.2, image `quartus-mister-rosetta`) and is very slow.
+- FPGA/Quartus compiles: **never** run locally. Do **not** use Docker image
+  `quartus-mister-rosetta`, `raetro/quartus` on this Mac, or any other
+  Rosetta/amd64-on-ARM Quartus. Local Rosetta compiles do not work for us.
+- When an FPGA compile is required, use **GitHub Actions only**:
+  `.github/workflows/build-core.yml` (`raetro/quartus:17.0` on `ubuntu-latest`).
+  `gh workflow run build-core.yml --ref <branch>` after the FPGA source is
+  on that remote branch. Download the `DVD.rbf` artifact. Do not start a
+  second compile while one is running.
 
 See `docs/ARCHITECTURE.md` for full details and measurements.
