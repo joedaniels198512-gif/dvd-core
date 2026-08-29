@@ -53,6 +53,36 @@ a rip.
 - NTSC physical drive behaviour is unknown until someone tests a disc
 
 
+## Parked items and future work
+
+These are known limitations that are not yet addressed and are not treated as
+release blockers on their own:
+
+- **Multi-angle runtime control** is not yet implemented/tested for release.
+  Multi-angle DVDs will still play their default angle.
+- **Short authored transition-tail truncation.** The very end of some short
+  authored transition segments can be truncated. This is parked.
+- **Progressive HDTV / deinterlacing improvements** remain future work.
+- Some **DVD submenu / highlight-interaction follow-up** remains parked.
+
+
+## Being actively worked on (status not final)
+
+> The following items are under active development on a separate release
+> branch. Their descriptions here are **placeholders** and must be updated with
+> the final, validated behaviour before public release. Do not treat the text
+> below as the final release state.
+
+- **Runtime audio-track switching:** A desync that can occur when switching
+  audio tracks during playback is currently being worked on as a release
+  blocker. Final status is not yet determined. _(Placeholder — update once the
+  fix branch is complete.)_
+- **Automatic widescreen (aspect) detection:** Aspect-ratio handling is being
+  reworked separately. The current beta behaviour should not be documented as
+  the final release behaviour. _(Placeholder — update once the aspect work is
+  validated.)_
+
+
 ## Developer / compliance note (not an end-user symptom)
 
 The launcher 8×8 glyph table has **unresolved provenance** (`font8x8
