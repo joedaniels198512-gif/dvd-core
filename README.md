@@ -31,6 +31,10 @@ OSD **Play ISO...** for DVD-Video ISO files from USB or SD.
 - Runtime audio-track switching
 - Interactive DVD stills and menus
 
+## Can it play encrypted DVDs and ISO?
+Encrypted commercial DVDs: libdvdcss is not included with this project. You must source your own copy of
+libdvdcss.so.2 and place it at /media/fat/DVD/lib/libdvdcss.so.2. to play DVDs and ISO directly
+
 
 ## Install
 
