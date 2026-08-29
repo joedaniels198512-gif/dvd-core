@@ -3372,6 +3372,7 @@ struct Player {
     int audio_swap_await_first;
     int audio_swap_source; /* 0=none 1=authored-nav 2=manual-swap */
     int dvd_aspect_wide;
+    int dvd_aspect_valid; /* 1 after first IFO 0 (4:3) or 3 (16:9) */
     int dvd_aspect_raw;
     int dvd_aspect_logged_raw;
     DVDDomain_t dvd_aspect_domain;
@@ -4953,26 +4954,56 @@ static int dvdio_detect_menu(DVDIO *d)
     return 0;
 }
 
+/* IFO video_attr.display_aspect_ratio: 0=4:3, 3=16:9. 1 and 2 reserved.
+ * Not MPEG-2 sequence-header aspect_ratio_information (where 2=4:3, 3=16:9). */
 static void dvdio_refresh_aspect(DVDIO *d)
 {
     uint8_t raw;
     int wide;
+    int valid;
     Player *p;
     const char *authored;
 
     if (!d || !d->nav)
         return;
     raw = dvdnav_get_video_aspect(d->nav);
-    wide = (raw == 2) ? 1 : 0;
-    authored = wide ? "16:9" : "4:3";
     p = d->player;
+    if (raw == 0) {
+        wide = 0;
+        valid = 1;
+        authored = "4:3";
+    } else if (raw == 3) {
+        wide = 1;
+        valid = 1;
+        authored = "16:9";
+    } else {
+        wide = (p && p->dvd_aspect_valid) ? p->dvd_aspect_wide : 0;
+        valid = 0;
+        authored = "unknown/reserved";
+    }
     if (p && p->dvd_aspect_logged_raw == (int)raw &&
         p->dvd_aspect_domain == d->domain)
         return;
-    fprintf(stderr, "DVD ASPECT: domain=%s authored=%s raw=%u\n",
-            dvd_domain_name(d->domain), authored, (unsigned)raw);
+    if (valid) {
+        fprintf(stderr, "DVD ASPECT: domain=%s authored=%s raw=%u\n",
+                dvd_domain_name(d->domain), authored, (unsigned)raw);
+    } else if (p && p->dvd_aspect_valid) {
+        fprintf(stderr,
+                "DVD ASPECT: domain=%s authored=%s raw=%u "
+                "fallback=%s (last valid authored aspect)\n",
+                dvd_domain_name(d->domain), authored, (unsigned)raw,
+                wide ? "16:9" : "4:3");
+    } else {
+        fprintf(stderr,
+                "DVD ASPECT: domain=%s authored=%s raw=%u "
+                "fallback=4:3 (no valid aspect seen)\n",
+                dvd_domain_name(d->domain), authored, (unsigned)raw);
+    }
     if (p) {
-        p->dvd_aspect_wide = wide;
+        if (valid) {
+            p->dvd_aspect_wide = wide;
+            p->dvd_aspect_valid = 1;
+        }
         p->dvd_aspect_raw = (int)raw;
         p->dvd_aspect_logged_raw = (int)raw;
         p->dvd_aspect_domain = d->domain;
