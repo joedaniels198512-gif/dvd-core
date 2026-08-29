@@ -1,0 +1,22 @@
+Corresponding source offer — MiSTer DVD Player v0.2.0-beta.2
+
+This install zip redistributes GPL-2 / GPL-3 / LGPL-2.1+ binaries.
+It does not dump full corresponding source onto the MiSTer SD card.
+
+Complete corresponding source for this release is provided as:
+
+  MiSTer_DVD_Player_0.2.0-beta.2-source.zip
+
+on the same GitHub Release as this install zip, and in the public
+repository:
+
+  https://github.com/joedaniels198512-gif/dvd-core
+
+That companion archive includes the FFmpeg 6.0.1 tarball, Debian
+source triples for libdvdread and libdvdnav, and the ARM / Main
+overlay sources used to build the player, supervisor, and Main.
+FPGA HDL corresponding source is this repository (fpga/).
+
+Licence texts required to accompany the binaries are in LICENSES/.
+
+libdvdcss is not distributed.

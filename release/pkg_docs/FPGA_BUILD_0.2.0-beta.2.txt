@@ -1,0 +1,16 @@
+DVD_Player.rbf corresponding source
+SHA-256: bb4b32252b253df15acabf8c297883a5f8e6ffb6dee156bc1b95d82a1fc3d1ac
+
+This directory is the Quartus 17.0 MiSTer DVD project (DVD.qpf).
+
+To reproduce the bitstream (do not run Quartus locally on Apple Silicon /
+Rosetta for this project):
+
+  docker run --rm -v "$PWD:/build" -w /build raetro/quartus:17.0 \
+    sh -c 'quartus_sh --flow compile DVD.qpf'
+
+The project GitHub Action is copied here as BUILD-GHA.yml
+(.github/workflows/build-core.yml).
+
+Cache and output directories (db/, incremental_db/, output_files/) are
+intentionally omitted from this source archive.
