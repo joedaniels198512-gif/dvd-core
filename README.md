@@ -9,7 +9,112 @@ That downloads the source repository, not the ready-to-install DVD Player packag
 
 Extract `MiSTer_DVD_Player_0.2.0-beta.2.zip` to the root of your MiSTer SD card.
 
-> **Encrypted commercial DVDs:** `libdvdcss` is not included with this project. You must source your own copy of `libdvdcss.so.2` and place it at `/media/fat/DVD/lib/libdvdcss.so.2`.
+> ## Encrypted commercial DVDs / libdvdcss
+
+`libdvdcss` is **not included** with MiSTer DVD Player.
+
+Many commercial DVDs use CSS encryption. To play these discs, you may need to provide your own copy of:
+
+`libdvdcss.so.2`
+
+The MiSTer / SuperStation One requires a **32-bit ARM hard-float Linux (`armhf`)** build. A Windows, macOS, x86 Linux, or ARM64 build will not work.
+
+### Where to get libdvdcss
+
+libdvdcss is maintained by VideoLAN:
+
+https://www.videolan.org/developers/libdvdcss.html
+
+Official source releases:
+
+https://download.videolan.org/libdvdcss/
+
+At the time of writing, the current release is:
+
+`libdvdcss-1.6.0.tar.xz`
+
+VideoLAN supplies the source code rather than a MiSTer-specific binary, so you will normally need to build it for `arm-linux-gnueabihf`.
+
+### Building libdvdcss for MiSTer
+
+The easiest way is from a Debian or Ubuntu Linux machine or VM.
+
+Install the ARM hard-float compiler and build tools:
+
+```bash
+sudo apt update
+sudo apt install -y \
+  gcc-arm-linux-gnueabihf \
+  g++-arm-linux-gnueabihf \
+  meson \
+  ninja-build \
+  pkg-config \
+  xz-utils \
+  wget
+```
+
+Download the official source:
+
+```bash
+wget https://download.videolan.org/libdvdcss/1.6.0/libdvdcss-1.6.0.tar.xz
+tar -xf libdvdcss-1.6.0.tar.xz
+cd libdvdcss-1.6.0
+```
+
+Build it for 32-bit ARM hard-float Linux:
+
+```bash
+meson setup build \
+  --cross-file package/crossfiles/arm-linux-gnueabihf.meson
+
+meson compile -C build
+```
+
+Locate the generated shared library:
+
+```bash
+find build -name 'libdvdcss.so*'
+```
+
+The important runtime filename is:
+
+`libdvdcss.so.2`
+
+### Installing it for MiSTer DVD Player
+
+Place the library here:
+
+`/media/fat/DVD/lib/libdvdcss.so.2`
+
+If your build produces a versioned file such as:
+
+`libdvdcss.so.2.x.x`
+
+copy the versioned file into the same directory and create a symlink named `libdvdcss.so.2`.
+
+For example:
+
+```bash
+cp libdvdcss.so.2.x.x /media/fat/DVD/lib/
+cd /media/fat/DVD/lib
+ln -sf libdvdcss.so.2.x.x libdvdcss.so.2
+```
+
+The important path that DVD Player must be able to open is:
+
+`/media/fat/DVD/lib/libdvdcss.so.2`
+
+### DVD Ripper
+
+For the separate DVD Ripper utility, place it here instead:
+
+`/media/fat/DVD-Ripper/lib/libdvdcss.so.2`
+
+### Important
+
+MiSTer DVD Player does not distribute, download, or install libdvdcss.
+
+Please check the laws that apply where you live before using software that circumvents DVD copy protection.
 
 **v0.2.0 beta 2** for SuperStation One and compatible MiSTer hardware with
 an optical drive.
@@ -17,8 +122,6 @@ an optical drive.
 A DVD-Video player for MiSTer / SuperStation One. It is beta software, not
 a finished commercial DVD player, and not a general video-file player
 (no MKV, H.264, or similar).
-
-by Mojojojo198512
 
 
 ## What it is
