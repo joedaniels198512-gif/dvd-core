@@ -109,7 +109,7 @@ main=MiSTer_DVD
 You should have:
 
 ```
-/media/fat/DVD_Player.rbf
+/media/fat/_Other/DVD_Player.rbf
 /media/fat/MiSTer_DVD
 /media/fat/DVD/bin/
 /media/fat/DVD/lib/
