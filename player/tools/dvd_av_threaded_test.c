@@ -32,7 +32,7 @@
  *   audio  — AC-3 + swr + MrAudio; publishes hardware audio clock
  *   video  — MPEG-2 parser/decode + swscale + mailbox; follows audio clock
  *
- * Queues: audio 32 pkts (~1 s AC-3), video soft 2560 / hard 4096.
+ * Queue experiment: audio 128 pkts (~4 s AC-3), video soft 2560 / hard 4096.
  * Video HOL escape may use 2560–4096 when aq is low. Packets are not dropped.
  *
  * libdvdnav/custom AVIO run only on the demux thread (the AVIO callback is
@@ -41,6 +41,9 @@
  */
 
 #define _GNU_SOURCE
+
+#include "subtitle_blend_cache.h"
+#include "player_cpu_affinity.h"
 
 #include <dvdnav/dvdnav.h>
 #include <dvdnav/dvdnav_events.h>
@@ -122,7 +125,7 @@ enum {
     THR_CLOCK
 };
 
-#define AUDIO_Q_CAP     32
+#define AUDIO_Q_CAP     128
 #define VIDEO_Q_SOFT_CAP 2560
 #define VIDEO_Q_HARD_CAP 4096
 #define VIDEO_Q_CAP     VIDEO_Q_SOFT_CAP
@@ -2981,6 +2984,7 @@ struct Player {
     int subtitle_dvdnav_enabled;  /* authored SPRM2 display-on */
     int subtitle_enabled;         /* effective compose gate */
     AVFrame *yuv_sub_scratch;
+    SubtitleBlendCache subtitle_cache;
     int yuv_sub_algo_logged;
     int yuv_hli_algo_logged;
     int yuv_meta_logged;
@@ -3218,6 +3222,8 @@ struct Player {
         int cur;       /* index into plane[], -1 if none presented */
         int last_slot; /* last enqueued slot, -1 none */
         MsubDecoded plane[MSUB_Q_CAP];
+        MsubDecoded staging; /* demux-owned; never read by the presenter */
+        unsigned decode_epoch; /* protected by mu; invalidates staged SPUs */
         unsigned long q_drop;
         int64_t max_ahead_us;
         int saw_chg_colcon;
@@ -4203,6 +4209,10 @@ static void navq_destroy(Player *p)
     }
     free(p->msub.acc);
     p->msub.acc = NULL;
+    free(p->msub.staging.idx);
+    p->msub.staging.idx = NULL;
+    free(p->msub.staging.runs);
+    p->msub.staging.runs = NULL;
     if (p->pause.inited) {
         pthread_mutex_destroy(&p->pause.mu);
         pthread_cond_destroy(&p->pause.cv);
@@ -5733,16 +5743,16 @@ static int movie_sub_ensure_bufs(Player *p)
         if (!p->msub.acc)
             return -1;
     }
-    for (i = 0; i < MSUB_Q_CAP; i++) {
-        if (!p->msub.plane[i].idx) {
-            p->msub.plane[i].idx = malloc(SPU_IDX_MAX);
-            if (!p->msub.plane[i].idx)
+    for (i = 0; i <= MSUB_Q_CAP; i++) {
+        MsubDecoded *s = i == MSUB_Q_CAP ? &p->msub.staging : &p->msub.plane[i];
+        if (!s->idx) {
+            s->idx = malloc(SPU_IDX_MAX);
+            if (!s->idx)
                 return -1;
         }
-        if (!p->msub.plane[i].runs) {
-            p->msub.plane[i].runs = malloc((size_t)MSUB_RUN_MAX *
-                                           sizeof(MsubRun));
-            if (!p->msub.plane[i].runs)
+        if (!s->runs) {
+            s->runs = malloc((size_t)MSUB_RUN_MAX * sizeof(MsubRun));
+            if (!s->runs)
                 return -1;
         }
     }
@@ -5790,6 +5800,7 @@ static void movie_sub_q_flush(Player *p)
 {
     int i;
 
+    p->msub.decode_epoch++;
     for (i = 0; i < MSUB_Q_CAP; i++)
         p->msub.plane[i].occupied = 0;
     p->msub.cur = -1;
@@ -6508,7 +6519,8 @@ static void movie_sub_sync_present(Player *p, int64_t now_us)
         movie_sub_clear_current(p, now_us, aclk);
 }
 
-static void movie_sub_log_enqueue(Player *p, const MsubDecoded *s, int64_t aclk)
+static void movie_sub_log_enqueue(Player *p, const MsubDecoded *s, int64_t aclk,
+                                   int depth)
 {
     int64_t ahead = 0;
 
@@ -6520,7 +6532,7 @@ static void movie_sub_log_enqueue(Player *p, const MsubDecoded *s, int64_t aclk)
             " q=%d/%d first_contr=%u/%u/%u/%u source=%s\n",
             s->id, s->packet_pts_us, s->first_start_delay_us, s->from_us,
             s->final_stop_delay_us, s->until_us, s->w, s->h, s->x, s->y,
-            s->evt_n, aclk, movie_sub_q_depth(p), MSUB_Q_CAP,
+            s->evt_n, aclk, depth, MSUB_Q_CAP,
             s->first_alpha[0] & 0xf, s->first_alpha[1] & 0xf,
             s->first_alpha[2] & 0xf, s->first_alpha[3] & 0xf,
             s->first_contr_src ? "SET_CONTR" : "default{0,0,0,0}");
@@ -6529,6 +6541,54 @@ static void movie_sub_log_enqueue(Player *p, const MsubDecoded *s, int64_t aclk)
         ahead = s->from_us - aclk;
     if (ahead > p->msub.max_ahead_us)
         p->msub.max_ahead_us = ahead;
+}
+
+/* Publish only a complete private decode. No bitmap work or logging under mu.
+ * Recycle the free slot's storage back to the demux-owned staging plane. */
+static int movie_sub_publish_decoded(Player *p, MsubDecoded *s,
+                                      unsigned epoch, unsigned nav_gen,
+                                      int64_t *aclk_out, int *depth_out,
+                                      int64_t *wait_us, int64_t *hold_us)
+{
+    int slot, i, ret = 0;
+    uint8_t *keep_idx;
+    MsubRun *keep_runs;
+    int64_t t0 = av_gettime_relative(), t1;
+
+    pthread_mutex_lock(&p->msub.mu);
+    t1 = av_gettime_relative();
+    *wait_us = t1 - t0;
+    *aclk_out = clock_read(&p->clock, NULL, NULL);
+    if (epoch != p->msub.decode_epoch || nav_gen != player_nav_gen(p))
+        goto done;
+    slot = movie_sub_slot_free_index(p);
+    if (slot < 0) {
+        for (i = 0; i < MSUB_Q_CAP; i++) {
+            if (i != p->msub.cur &&
+                movie_sub_slot_expired(&p->msub.plane[i], *aclk_out))
+                movie_sub_slot_release(&p->msub.plane[i]);
+        }
+        slot = movie_sub_slot_free_index(p);
+    }
+    if (slot < 0) {
+        p->msub.q_drop++;
+        ret = -1;
+        goto done;
+    }
+    keep_idx = p->msub.plane[slot].idx;
+    keep_runs = p->msub.plane[slot].runs;
+    p->msub.plane[slot] = *s;
+    p->msub.plane[slot].occupied = 1;
+    s->idx = keep_idx;
+    s->runs = keep_runs;
+    p->msub.last_slot = slot;
+    movie_sub_snapshot_decoded(p, &p->msub.plane[slot]);
+    *depth_out = movie_sub_q_depth(p);
+    ret = 1;
+done:
+    *hold_us = av_gettime_relative() - t1;
+    pthread_mutex_unlock(&p->msub.mu);
+    return ret;
 }
 
 static int movie_sub_decode_unit(Player *p, const uint8_t *buf, int buf_size,
@@ -6546,6 +6606,8 @@ static int movie_sub_decode_unit(Player *p, const uint8_t *buf, int buf_size,
     int saw_chg = 0, evt_n = 0, chg_n = 0;
     MsubEvt evts[MSUB_EVT_MAX];
     MsubChg chgs[MSUB_CHG_MAX];
+    unsigned decode_epoch, decode_nav_gen;
+    int decode_pes_id, decode_logical, decode_physical;
 
     if (buf_size < 10 || AV_RB16(buf) == 0)
         return -1;
@@ -6555,6 +6617,14 @@ static int movie_sub_decode_unit(Player *p, const uint8_t *buf, int buf_size,
     cmd_pos = AV_RB16(buf + 2);
     if (cmd_pos < 4 || cmd_pos > buf_size - 4)
         return -1;
+
+    pthread_mutex_lock(&p->msub.mu);
+    decode_epoch = p->msub.decode_epoch;
+    decode_nav_gen = player_nav_gen(p);
+    decode_pes_id = p->msub.pes_id;
+    decode_logical = p->msub.logical;
+    decode_physical = p->msub.chosen_physical;
+    pthread_mutex_unlock(&p->msub.mu);
 
     spu_id = ++p->msub.spu_seq;
     memset(evts, 0, sizeof(evts));
@@ -6654,36 +6724,16 @@ static int movie_sub_decode_unit(Player *p, const uint8_t *buf, int buf_size,
         w = x2 - x1 + 1;
         h = y2 - y1 + 1;
         if (w > 0 && h > 1 && w <= FB_W && h <= FB_H) {
-            MsubDecoded *s;
+            MsubDecoded *s = &p->msub.staging;
             uint8_t *keep_idx;
             MsubRun *keep_runs;
-            int slot, i;
+            int published, depth = 0;
             int64_t aclk, start_delay, stop_delay;
+            int64_t decode_t0, decode_us, publish_wait_us, publish_hold_us;
 
             if (movie_sub_ensure_bufs(p) < 0)
                 return -1;
-            pthread_mutex_lock(&p->msub.mu);
-            aclk = clock_read(&p->clock, NULL, NULL);
-            slot = movie_sub_slot_free_index(p);
-            if (slot < 0) {
-                for (i = 0; i < MSUB_Q_CAP; i++) {
-                    if (i == p->msub.cur)
-                        continue;
-                    if (movie_sub_slot_expired(&p->msub.plane[i], aclk))
-                        movie_sub_slot_release(&p->msub.plane[i]);
-                }
-                slot = movie_sub_slot_free_index(p);
-            }
-            if (slot < 0) {
-                p->msub.q_drop++;
-                pthread_mutex_unlock(&p->msub.mu);
-                fprintf(stderr,
-                        "SPU DROP id=%u q_full=%d aclk=%" PRId64
-                        " start would be pts=%" PRId64 "\n",
-                        spu_id, MSUB_Q_CAP, aclk, packet_pts_us);
-                return -1;
-            }
-            s = &p->msub.plane[slot];
+            decode_t0 = av_gettime_relative();
             keep_idx = s->idx;
             keep_runs = s->runs;
             memset(s, 0, sizeof(*s));
@@ -6694,7 +6744,6 @@ static int movie_sub_decode_unit(Player *p, const uint8_t *buf, int buf_size,
                 menu_spu_decode_rle(s->idx + w, w * 2, w, h / 2,
                                     buf, offset2, buf_size) < 0) {
                 movie_sub_slot_release(s);
-                pthread_mutex_unlock(&p->msub.mu);
                 return -1;
             }
             start_delay = (first_start_date >= 0)
@@ -6706,9 +6755,9 @@ static int movie_sub_decode_unit(Player *p, const uint8_t *buf, int buf_size,
             s->id = spu_id;
             s->valid = 1;
             s->forced = forced;
-            s->pes_id = p->msub.pes_id;
-            s->logical = p->msub.logical;
-            s->chosen_physical = p->msub.chosen_physical;
+            s->pes_id = decode_pes_id;
+            s->logical = decode_logical;
+            s->chosen_physical = decode_physical;
             s->x = x1;
             s->y = y1;
             s->w = w;
@@ -6741,11 +6790,9 @@ static int movie_sub_decode_unit(Player *p, const uint8_t *buf, int buf_size,
             movie_sub_crop_ever_visible(s);
             movie_sub_build_runs(s, s->w, s->h);
             movie_sub_count_vis_runs(s);
-            s->occupied = 1;
-            p->msub.last_slot = slot;
-            movie_sub_snapshot_decoded(p, s);
+            decode_us = av_gettime_relative() - decode_t0;
+            /* Diagnostic output can block too; keep it outside the queue lock. */
             movie_sub_log_timeline(s);
-            movie_sub_log_enqueue(p, s, aclk);
             if (p->msub.decoded_spus < MSUB_DAREA_LOG) {
                 fprintf(stderr,
                         "SPU CROP: authored DAREA %dx%d @ (%d,%d) "
@@ -6760,7 +6807,23 @@ static int movie_sub_decode_unit(Player *p, const uint8_t *buf, int buf_size,
                         s->run_n, s->vis_run_n,
                         s->run_overflow ? "yes" : "no");
             }
-            pthread_mutex_unlock(&p->msub.mu);
+            published = movie_sub_publish_decoded(p, s, decode_epoch, decode_nav_gen,
+                                                   &aclk, &depth,
+                                                   &publish_wait_us, &publish_hold_us);
+            fprintf(stderr, "SUBTITLE DECODE: id=%u decode_us=%" PRId64
+                    " publish_wait_us=%" PRId64 " publish_hold_us=%" PRId64
+                    " published=%d\n", spu_id, decode_us, publish_wait_us,
+                    publish_hold_us, published);
+            if (!published) {
+                fprintf(stderr, "SPU DROP id=%u obsolete decode after reset\n", spu_id);
+                return 0;
+            }
+            if (published < 0) {
+                fprintf(stderr, "SPU DROP id=%u q_full=%d aclk=%" PRId64 "\n",
+                        spu_id, MSUB_Q_CAP, aclk);
+                return -1;
+            }
+            movie_sub_log_enqueue(p, s, aclk, depth);
             p->msub.decoded_spus++;
             p->msub.bbox_w_sum += (unsigned)(s->w > 0 ? s->w : 0);
             p->msub.bbox_h_sum += (unsigned)(s->h > 0 ? s->h : 0);
@@ -7679,6 +7742,12 @@ static int movie_sub_overlay_yuv(Player *p, AVFrame *dst, int64_t pvpts_us,
     idx = p->msub.idx;
     movie_sub_state_at(p, pvpts_us, color, alpha, &chg);
     movie_sub_note_state(p, 1, color, alpha, chg, pvpts_us);
+    if (!chg) {
+        uint32_t palette[4];
+        for (int code = 0; code < 4; code++)
+            palette[code] = clut[color[code] & 15];
+        subtitle_cache_prepare(&p->subtitle_cache, palette, alpha);
+    }
     max_h = player_active_h(p);
     if (dst->height > 0 && dst->height < max_h)
         max_h = dst->height;
@@ -7743,7 +7812,11 @@ static int movie_sub_overlay_yuv(Player *p, AVFrame *dst, int64_t pvpts_us,
                 len = ax1 - ax0 + 1;
                 if (a8 >= 255)
                     memset(yline + ax0, (uint8_t)ys, (size_t)len);
-                else {
+                else if (!chg) {
+                    const uint8_t *lut = p->subtitle_cache.luma[code];
+                    for (int px = ax0; px <= ax1; px++)
+                        yline[px] = lut[yline[px]];
+                } else {
                     int px;
 
                     for (px = ax0; px <= ax1; px++)
@@ -7775,6 +7848,17 @@ static int movie_sub_overlay_yuv(Player *p, AVFrame *dst, int64_t pvpts_us,
             for (cx = cx0; cx <= cx1; cx++) {
                 int dy, dx, a_sum = 0, cb_wsum = 0, cr_wsum = 0;
                 uint8_t *up, *vp;
+
+                /* Interior blocks with uniform palette/alpha use one lookup;
+                 * partial edge blocks and CHG_COLCON retain the original path. */
+                if (!chg && cx * 2 + 1 < FB_W &&
+                    (dst->width <= 0 || cx * 2 + 1 < dst->width) &&
+                    y * 2 + 1 < max_h &&
+                    subtitle_cache_chroma(&p->subtitle_cache, idx, w, h,
+                        cx * 2 - x0, y * 2 - y0,
+                        dst->data[1] + (size_t)y * dst->linesize[1] + cx,
+                        dst->data[2] + (size_t)y * dst->linesize[2] + cx))
+                    continue;
 
                 for (dy = 0; dy < 2; dy++) {
                     int py = y * 2 + dy;
@@ -7951,27 +8035,25 @@ static int menu_overlay_composite_yuv(Player *p, AVFrame *dst, int frame_menu,
     return 1;
 }
 
-static int fpga_yuv_present_planes(Player *p, AVFrame *frame, uint8_t *slot,
+static int fpga_yuv_prepare_planes(Player *p, AVFrame *frame, const AVFrame **prepared,
                                    int64_t vpts_us, int frame_menu,
                                    int *sub_active, int64_t *sub_blend_us,
-                                   int64_t *copy_us, int64_t *scratch_copy_us,
+                                   int64_t *scratch_copy_us,
                                    int64_t *compose_us)
 {
     const AVFrame *src = frame;
-    int64_t t0, t1, t_copy1, t_comp = 0;
+    int64_t t0, t_copy1, t_comp = 0;
     int blended = 0;
 
     if (sub_active)
         *sub_active = 0;
     if (sub_blend_us)
         *sub_blend_us = 0;
-    if (copy_us)
-        *copy_us = 0;
     if (scratch_copy_us)
         *scratch_copy_us = 0;
     if (compose_us)
         *compose_us = 0;
-    if (!p || !frame || !slot)
+    if (!p || !frame || !prepared)
         return -1;
 
     /*
@@ -8036,12 +8118,30 @@ static int fpga_yuv_present_planes(Player *p, AVFrame *frame, uint8_t *slot,
         }
     }
 
+    *prepared = src;
+    return 0;
+}
+
+/* Legacy/menu callers retain preparation after the ownership wait. */
+static int fpga_yuv_present_planes(Player *p, AVFrame *frame, uint8_t *slot,
+                                   int64_t vpts_us, int frame_menu,
+                                   int *sub_active, int64_t *sub_blend_us,
+                                   int64_t *copy_us, int64_t *scratch_copy_us,
+                                   int64_t *compose_us)
+{
+    const AVFrame *src;
+    int64_t t0;
+    if (copy_us)
+        *copy_us = 0;
+    if (fpga_yuv_prepare_planes(p, frame, &src, vpts_us, frame_menu,
+                               sub_active, sub_blend_us, scratch_copy_us,
+                               compose_us) < 0)
+        return -1;
     t0 = av_gettime_relative();
     if (copy_yuv420_to_slot(slot, src, player_active_h(p)) < 0)
         return -1;
-    t1 = av_gettime_relative();
     if (copy_us)
-        *copy_us = t1 - t0;
+        *copy_us = av_gettime_relative() - t0;
     return 0;
 }
 
@@ -10217,10 +10317,10 @@ static void snapshot_available_cpus(Player *p)
     p->sched_input_cpu = -1;
 }
 
-static void note_unpinned_cpu(const char *name, int *got_cpu)
+static void note_inherited_cpu(const char *name, int *got_cpu)
 {
     *got_cpu = read_sched_cpu();
-    dbg("sched: %s unpinned (sched_getcpu=%d)\n", name, *got_cpu);
+    dbg("sched: %s inherits player affinity (sched_getcpu=%d)\n", name, *got_cpu);
 }
 
 static unsigned dvd_std_to_fpga_src(DvdVideoStd std)
@@ -10275,7 +10375,7 @@ static void *input_thread(void *opaque)
     int64_t t0 = av_gettime_relative();
 
     memset(&pad, 0, sizeof(pad));
-    note_unpinned_cpu("input", &p->sched_input_cpu);
+    note_inherited_cpu("input", &p->sched_input_cpu);
     fprintf(stderr, "DVD menu navigation: enabled\n");
     fprintf(stderr, "Hold CANCEL/B 3000 ms to return to launcher.\n");
     fprintf(stderr,
@@ -10993,7 +11093,7 @@ static void *audio_thread(void *opaque)
     int64_t first_pts_us = AV_NOPTS_VALUE;
     unsigned clock_epoch = 0;
 
-    note_unpinned_cpu("audio", &p->sched_audio_cpu);
+    note_inherited_cpu("audio", &p->sched_audio_cpu);
 
     memset(&mr, 0, sizeof(mr));
     mr.wr_fd = -1;
@@ -13724,6 +13824,8 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
     int skip_sws = p->perf_present_no_convert &&
                    (p->iso_warm_presents >= ISO_WARM_PRESENTS);
 
+    if (frame_nav_gen != player_nav_gen(p))
+        return 1;
     if (player_accept_video_frame(p, frame, NULL) < 0)
         return -1;
 
@@ -13752,7 +13854,7 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
     if (p->rendered == 0) {
         int64_t T0 = frame_duration_us(p);
         dbg("\n=== VIDEO CONSUMER (YUV queue → direct DDR sws) ===\n"
-            "Path: queue pop → stale-check → ACK wait → "
+            "Path: queue pop → stale-check → "
             "%s → barrier → PTS +2ms → mailbox\n"
             "Video pipeline: BUFFERED YUV producer / direct-DDR sws "
             "consumer\n"
@@ -13763,11 +13865,11 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
             "sws CPU: %s\n",
             p->fpga_yuv420
                 ? (p->fpga_yuv420_subtitles
-                       ? "cached-YUV subtitle compose (if ON) + plane copy"
-                       : "copy YUV planes to DDR")
+                       ? "cached-YUV movie subtitle prepare → ACK wait → plane copy"
+                       : "ACK wait → copy YUV planes to DDR")
                 : p->perf_present_no_convert
-                ? "warmup sws then skip convert"
-                : "sws YUV DIRECT DDR",
+                ? "ACK wait → warmup sws then skip convert"
+                : "ACK wait → sws YUV DIRECT DDR",
             T0 / 1000.0,
             T0 > 0 ? (EARLY_SLACK_US - T0) / 1000.0 : 0.0,
             p->initial_skip_req, p->initial_skip_req == 1 ? "" : "s",
@@ -13790,6 +13892,30 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
 
     int64_t prev_mbox_us = p->last_present_end_us;
     int64_t cycle_t0 = av_gettime_relative();
+    int sub_active = 0;
+    int64_t sub_blend_us = 0;
+    int64_t sub_scratch_us = 0;
+    int64_t sub_compose_us = 0;
+    int64_t sub_prepare_us = 0;
+    const AVFrame *prepared = NULL;
+    int prepared_subtitles = __atomic_load_n(&p->subtitle_enabled, __ATOMIC_RELAXED);
+    /* Work only in cached RAM while the previous display request is in flight.
+     * Do not choose or touch the next DDR buffer until after its ACK. */
+    if (p->fpga_yuv420 && !skip_clock && !frame_menu && !p->in_menu &&
+        !p->interactive_still) {
+        int64_t prepare_t0 = av_gettime_relative();
+        int ret;
+        phase_sws_enter(p);
+        ret = fpga_yuv_prepare_planes(p, frame, &prepared, vpts_us, frame_menu,
+                                     &sub_active, &sub_blend_us,
+                                     &sub_scratch_us, &sub_compose_us);
+        phase_sws_leave(p);
+        sub_prepare_us = av_gettime_relative() - prepare_t0;
+        if (ret < 0) {
+            player_abort(p);
+            return -1;
+        }
+    }
     int64_t ack_wait_us = 0;
     int ack_instant = 0;
     int ack_waited = 0;
@@ -13828,19 +13954,30 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
     int64_t c0 = av_gettime_relative();
     int64_t sws_wall = 0;
     int64_t cpu1 = -1;
-    int sub_active = 0;
-    int64_t sub_blend_us = 0;
-    int64_t sub_scratch_us = 0;
-    int64_t sub_compose_us = 0;
 
     if (p->fpga_yuv420) {
         int64_t copy_us = 0;
 
         log_yuv_frame_meta_once(p, frame);
         phase_sws_enter(p);
-        if (fpga_yuv_present_planes(p, frame, dst_data[0], vpts_us, frame_menu,
+        int copy_ret;
+        if (prepared && frame_nav_gen != player_nav_gen(p)) {
+            phase_sws_leave(p);
+            return 1;
+        }
+        if (prepared && prepared_subtitles ==
+                __atomic_load_n(&p->subtitle_enabled, __ATOMIC_RELAXED)) {
+            int64_t copy_t0 = av_gettime_relative();
+            copy_ret = copy_yuv420_to_slot(dst_data[0], prepared, player_active_h(p));
+            copy_us = av_gettime_relative() - copy_t0;
+        } else {
+            /* An on/off toggle during the wait must not display the old state. */
+            copy_ret = fpga_yuv_present_planes(p, frame, dst_data[0], vpts_us, frame_menu,
                                     &sub_active, &sub_blend_us, &copy_us,
-                                    &sub_scratch_us, &sub_compose_us) < 0) {
+                                    &sub_scratch_us, &sub_compose_us);
+        }
+        if (copy_ret < 0) {
+            phase_sws_leave(p);
             fprintf(stderr, "FAIL: FPGA YUV420 plane copy\n");
             player_abort(p);
             return -1;
@@ -14076,6 +14213,12 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
 
     if (!p->perf_present_no_convert && !skip_clock && p->rendered > 0 &&
         (p->rendered % PRESENT_PERF_INTERVAL) == 0) {
+        if (p->fpga_yuv420)
+            fprintf(stderr, "SUBTITLE PRESENT: active=%d prepare_before_ack_us=%" PRId64
+                    " scratch_copy_us=%" PRId64 " compose_us=%" PRId64
+                    " display_copy_us=%" PRId64 " ack_wait_us=%" PRId64 "\n",
+                    sub_active, sub_prepare_us, sub_scratch_us, sub_compose_us,
+                    sws_wall, ack_wait_us);
         log_present_perf(p, vpts_us, pvpts_us, decision_aclk, decision_delta,
                          ack_wait_us, ack_instant, sws_wall, post_sws_wait_us,
                          p->last_path.cycle_us,
@@ -14117,7 +14260,7 @@ static void *present_thread(void *opaque)
     unsigned seen_gen;
     unsigned menu_hold_gen = 0;
 
-    note_unpinned_cpu("present", &p->sched_present_cpu);
+    note_inherited_cpu("present", &p->sched_present_cpu);
 
     menu_hold = av_frame_alloc();
     prefill_wait(p);
@@ -14695,7 +14838,7 @@ static void *video_thread(void *opaque)
     int timed = 0;
     int ready_logged = 0;
 
-    note_unpinned_cpu("video", &p->sched_video_cpu);
+    note_inherited_cpu("video", &p->sched_video_cpu);
 
     p->present_vbl = -1;
     p->first_genuine_pts = AV_NOPTS_VALUE;
@@ -15661,12 +15804,24 @@ int main(int argc, char **argv)
     navq_init(&p);
     movie_sub_recompute_enabled(&p, "startup");
     d.player = &p;
+    if (p.buffered_yuv && p.fpga_yuv420) {
+        cpu_set_t before, after;
+
+        if (player_allow_configured_cpus(&before, &after) < 0) {
+            fprintf(stderr, "WARNING: could not restore player CPU affinity: %s\n",
+                    strerror(errno));
+        } else {
+            fprintf(stderr, "SCHED: player CPU eligibility %d -> %d CPUs "
+                    "before worker creation (launcher unchanged)\n",
+                    CPU_COUNT(&before), CPU_COUNT(&after));
+        }
+    }
     snapshot_available_cpus(&p);
     if (g_debug_stats) {
         fprintf(stderr, "CPUs online %d / configured %d, process affinity: ",
                 p.ncpu_onln, p.ncpu_conf);
         print_cpu_mask(p.cpu_aff_mask);
-        fprintf(stderr, "  (all player threads unpinned)\n");
+        fprintf(stderr, "  (workers inherit this mask)\n");
     }
     if (pktq_init(&p.aq, AUDIO_Q_CAP) < 0 ||
         pktq_init(&p.vq, VIDEO_Q_HARD_CAP) < 0)
@@ -15847,9 +16002,9 @@ int main(int argc, char **argv)
         }
         if (p.uncapped_bench) {
             if (p.video_started && p.sched_demux_cpu < 0)
-                note_unpinned_cpu("demux", &p.sched_demux_cpu);
+                note_inherited_cpu("demux", &p.sched_demux_cpu);
         } else if (p.audio_started && p.video_started && p.sched_demux_cpu < 0) {
-            note_unpinned_cpu("demux", &p.sched_demux_cpu);
+            note_inherited_cpu("demux", &p.sched_demux_cpu);
         }
 
         if (p.uncapped_bench && p.ai >= 0 && pkt->stream_index == p.ai) {
@@ -16162,10 +16317,10 @@ int main(int argc, char **argv)
         print_cpu_mask(p.cpu_aff_mask);
         fprintf(stderr, "]\n");
         fprintf(stderr,
-                "Video affinity:             unpinned  sched_getcpu=%d\n"
+                "Video affinity:             player mask  sched_getcpu=%d\n"
                 "Audio affinity:             not started (benchmark)\n"
-                "Input affinity:             unpinned  sched_getcpu=%d\n"
-                "Demux affinity:             unpinned  sched_getcpu=%d\n",
+                "Input affinity:             player mask  sched_getcpu=%d\n"
+                "Demux affinity:             player mask  sched_getcpu=%d\n",
                 p.sched_video_cpu, p.sched_input_cpu, p.sched_demux_cpu);
         }
     }
@@ -16540,11 +16695,11 @@ int main(int argc, char **argv)
         print_cpu_mask(p.cpu_aff_mask);
         fprintf(stderr, "]\n");
         fprintf(stderr,
-                "Video affinity:             unpinned  sched_getcpu=%d\n"
-                "Audio affinity:             unpinned  sched_getcpu=%d\n"
-                "Present affinity:           unpinned  sched_getcpu=%d\n"
-                "Input affinity:             unpinned  sched_getcpu=%d\n"
-                "Demux affinity:             unpinned  sched_getcpu=%d\n"
+                "Video affinity:             player mask  sched_getcpu=%d\n"
+                "Audio affinity:             player mask  sched_getcpu=%d\n"
+                "Present affinity:           player mask  sched_getcpu=%d\n"
+                "Input affinity:             player mask  sched_getcpu=%d\n"
+                "Demux affinity:             player mask  sched_getcpu=%d\n"
                 "Controller events:          %lu  (print-only, no dvdnav yet)\n",
                 p.sched_video_cpu, p.sched_audio_cpu, p.sched_present_cpu,
                 p.sched_input_cpu, p.sched_demux_cpu, p.ctrl_events);
